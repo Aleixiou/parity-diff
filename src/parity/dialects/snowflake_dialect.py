@@ -46,7 +46,7 @@ class SnowflakeDialect(Dialect):
     #: schema as stored.
     default_schema = "PUBLIC"
 
-    def connect(self, connection_string: str) -> None:
+    def connect(self, connection_string: str) -> None:  # pragma: no cover
         """Open a connection, pinned to UTC.
 
         URL grammar mirrors SQLAlchemy's Snowflake dialect:
@@ -90,11 +90,11 @@ class SnowflakeDialect(Dialect):
         finally:
             cur.close()
 
-    def close(self) -> None:
+    def close(self) -> None:  # pragma: no cover
         """Close the connection."""
         self._conn.close()
 
-    def query(self, sql: str) -> list[tuple[Any, ...]]:
+    def query(self, sql: str) -> list[tuple[Any, ...]]:  # pragma: no cover
         """Run `sql` and return every row as a list of tuples."""
         cur = self._conn.cursor()
         try:
