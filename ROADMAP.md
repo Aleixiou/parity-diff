@@ -17,7 +17,7 @@ identifier matching across engines. `pip install parity-diff`, MIT.
 
 | | |
 |---|---|
-| Tests | 345; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests skip unless `PARITY_TEST_SNOWFLAKE` points at a real account, so they never run in CI — verified live by hand instead |
+| Tests | 360; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests skip unless `PARITY_TEST_SNOWFLAKE` points at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
 | Coverage | 96%, with a 95% floor enforced in CI (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
 | CI | ruff, `mypy --strict`, PostgreSQL 16 and 18 + MySQL 8 service containers, Python 3.10 and 3.13, Windows, a DuckDB-only install |
 | Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data. Snowflake verified live: hash constant, a 5,000-row full-table checksum matching DuckDB byte-for-byte, and every planted-difference check |
