@@ -12,6 +12,16 @@ import pytest
 
 from parity.dialects.base import get_dialect
 
+#: Multiplier for Hypothesis example counts. `PARITY_DEEP=20 pytest` runs the
+#: generative suites twenty times deeper - the repeatable "make sure there is no
+#: abnormality" hunt for the identical check, without changing the fast default.
+DEEP = max(1, int(os.environ.get("PARITY_DEEP", "1")))
+
+
+def deep_examples(n: int) -> int:
+    """Scale a Hypothesis `max_examples` by the PARITY_DEEP factor (default 1)."""
+    return n * DEEP
+
 #: CLAUDE.md section 7 documents a Docker container on port 55432. A native
 #: install on 5432 is equally valid, so the endpoint is configurable.
 PG_URL = os.environ.get(

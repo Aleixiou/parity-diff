@@ -21,6 +21,7 @@ import pytest
 
 pytest.importorskip("hypothesis")
 
+from conftest import deep_examples
 from fakes import DictTable, FakeDialect, SyntheticTable
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
@@ -90,7 +91,7 @@ def _kinds(result) -> list[tuple[int, str]]:
 # ---------------------------------------------------------------------------
 
 
-@settings(max_examples=500)
+@settings(max_examples=deep_examples(500))
 @given(
     data=_table(text=_FULL),
     bisection_factor=st.integers(min_value=2, max_value=64),
@@ -168,7 +169,7 @@ def test_the_identical_check_is_deterministic(data):
 # ---------------------------------------------------------------------------
 
 
-@settings(max_examples=600)
+@settings(max_examples=deep_examples(600))
 @given(data=_table(text=_SAFE, min_rows=1), seed=st.randoms(use_true_random=False), newval=_SAFE)
 def test_a_single_planted_change_is_never_called_identical(data, seed, newval):
     """Take an identical pair, apply exactly one change - alter a cell, delete a

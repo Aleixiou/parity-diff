@@ -164,6 +164,19 @@ reason next to it rather than being switched off globally.
 PostgreSQL-backed tests read `PARITY_TEST_PG` and skip cleanly when nothing is
 listening, so the suite is useful with only DuckDB installed.
 
+The generative suites hunt for the one failure that matters most — a real
+difference reported as identical. To run that hunt deeper (many more generated
+cases per property, at the cost of time), scale it with `PARITY_DEEP`:
+
+```bash
+PARITY_DEEP=20 pytest tests/test_identical.py tests/test_properties.py
+```
+
+The default of `1` keeps the everyday suite fast; the deep run is the repeatable
+"make sure there is no abnormality" check on the identical guarantee. A dozen
+seeds at `PARITY_DEEP=6` have turned up nothing — but the point is that anyone
+can re-run it.
+
 ## Scope
 
 Before proposing a feature, check it against the question the tool exists to

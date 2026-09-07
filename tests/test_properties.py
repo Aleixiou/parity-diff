@@ -22,6 +22,7 @@ import pytest
 # dependency must not look like a broken build.
 pytest.importorskip("hypothesis")
 
+from conftest import deep_examples
 from fakes import DictTable, FakeDialect
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -81,7 +82,7 @@ def _kinds(result) -> list[tuple[int, str]]:
 # ---------------------------------------------------------------------------
 
 
-@settings(max_examples=400)
+@settings(max_examples=deep_examples(400))
 @given(a=_table, b=_table)
 def test_diff_matches_a_brute_force_oracle(a, b):
     """For any two tables, parity's result equals comparing every row directly.
