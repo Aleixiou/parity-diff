@@ -21,6 +21,10 @@ with the caveat that 0.x means the CLI surface may still move.
   key, and a real `uuid`-typed key — and for an edge-value table (bigint
   min/max, `Infinity`/`-Infinity`/`NaN`, a 12-digit decimal, an astral-plane
   emoji, an empty string, and an all-NULL row). All agree; no false difference.
+- **Direct MySQL ↔ PostgreSQL identical coverage** (`tests/test_mysql_postgres.py`):
+  the commonest migration pair, previously tested only transitively through
+  DuckDB. Identical data built by each engine reads identical with zero
+  download; a planted change is found exactly.
 
 ## 0.2.2 — 2026-09-07
 
