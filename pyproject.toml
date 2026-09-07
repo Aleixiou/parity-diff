@@ -38,6 +38,9 @@ duckdb = ["duckdb>=1.0"]
 postgres = ["psycopg[binary]>=3.1"]
 mysql = ["mysql-connector-python>=8.0"]
 snowflake = ["snowflake-connector-python>=3.0"]
+# Draft, not yet in `all`: the BigQuery dialect is unverified against a live
+# instance, so it stays opt-in until a live encoding run passes (§8).
+bigquery = ["google-cloud-bigquery>=3.0"]
 all = [
     "duckdb>=1.0", "psycopg[binary]>=3.1",
     "mysql-connector-python>=8.0", "snowflake-connector-python>=3.0",
@@ -69,6 +72,7 @@ markers = [
     "mysql: requires a reachable MySQL server",
     "duckdb: requires the duckdb driver",
     "snowflake: requires a reachable Snowflake account (PARITY_TEST_SNOWFLAKE)",
+    "bigquery: requires a reachable BigQuery project (PARITY_TEST_BIGQUERY)",
 ]
 
 [tool.ruff]
@@ -111,6 +115,7 @@ ignore = [
 "src/parity/dialects/postgres_dialect.py" = ["S608"]
 "src/parity/dialects/mysql_dialect.py" = ["S608"]
 "src/parity/dialects/snowflake_dialect.py" = ["S608"]
+"src/parity/dialects/bigquery_dialect.py" = ["S608"]
 # proof.py is kept close to the original author's script so it stays readable
 # next to the findings it produced; its terse one-line style is deliberate.
 "demo/proof.py" = ["E401", "E402", "E701", "E702", "B007", "S311", "S608"]

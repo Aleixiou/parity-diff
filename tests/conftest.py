@@ -102,6 +102,29 @@ def _snowflake_available() -> tuple[bool, str]:
     return True, ""
 
 
+#: BigQuery, if one is configured. Like Snowflake there is no local instance and
+#: no free CI project, so this is opt-in via an env var and skips otherwise -
+#: it never runs in CI, only when someone points it at a real project. The URL
+#: is `bigquery://<project>/<default_dataset>`; auth is Application Default
+#: Credentials (no password in the URL).
+BIGQUERY_URL = os.environ.get("PARITY_TEST_BIGQUERY", "")
+
+
+def _bigquery_available() -> tuple[bool, str]:
+    """Can we reach BigQuery? Returns (yes/no, why not)."""
+    if not BIGQUERY_URL:
+        return False, "PARITY_TEST_BIGQUERY is not set"
+    try:
+        import google.cloud.bigquery  # noqa: F401 - importing it is the probe
+    except ImportError:  # pragma: no cover - depends on install extras
+        return False, "google-cloud-bigquery is not installed"
+    try:
+        get_dialect(BIGQUERY_URL, side="A").close()
+    except Exception as exc:  # pragma: no cover - depends on the project
+        return False, f"no BigQuery at the configured URL: {type(exc).__name__}"
+    return True, ""
+
+
 def _duckdb_available() -> tuple[bool, str]:
     """Is the duckdb driver installed? Returns (yes/no, why not)."""
     try:
@@ -136,6 +159,15 @@ def snowflake_url() -> str:
     if not ok:
         pytest.skip(why)
     return SNOWFLAKE_URL
+
+
+@pytest.fixture(scope="session")
+def bigquery_url() -> str:
+    """The BigQuery endpoint, or skip if none is configured/reachable."""
+    ok, why = _bigquery_available()
+    if not ok:
+        pytest.skip(why)
+    return BIGQUERY_URL
 
 
 @pytest.fixture(scope="session")
@@ -176,4 +208,9 @@ def open_mysql(url: str, side: str = "A", float_scale: int = 6):
 
 def open_snowflake(url: str, side: str = "A", float_scale: int = 6):
     """Open a UTC-pinned Snowflake dialect (DRAFT - see snowflake_dialect.py)."""
+    return get_dialect(url, side=side, float_scale=float_scale)
+
+
+def open_bigquery(url: str, side: str = "A", float_scale: int = 6):
+    """Open a BigQuery dialect (DRAFT - see bigquery_dialect.py)."""
     return get_dialect(url, side=side, float_scale=float_scale)
