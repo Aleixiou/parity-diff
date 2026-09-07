@@ -143,3 +143,65 @@ def test_identical_across_engines_by_key_type(pg, duck, name):
         f"{[(d.key, d.kind, d.columns) for d in result.diffs[:3]]}"
     )
     assert result.stats.rows_downloaded == 0
+
+
+def test_a_representation_change_across_engines_reads_identical(pg_url, tmp_path):
+    """The migration scenario: the same values stored with *different declared
+    types* on each engine - integer vs bigint, numeric(12,2) vs double,
+    varchar vs text - must still read identical end to end. Storing a value a
+    different way is not changing it; the diff must not mistake it for one.
+    """
+    import psycopg
+
+    n = 2_000
+    schema = f"{PG_SCHEMA}_repr"
+    pg_sql = f"""
+        create table {schema}.repr as
+        select i::bigint                                      as id,
+               (i / 100.0)::numeric(12,2)                     as amount,
+               ('r' || i::text)::varchar(50)                  as name,
+               (timestamp '2024-01-01 00:00:00'
+                    + (i % 86400) * interval '1 second')      as ts
+        from generate_series(1, {n}) as s(i)
+    """
+    duck_sql = f"""
+        create table repr as
+        select i::integer                                    as id,
+               (i / 100.0)::double                           as amount,
+               ('r' || i::varchar)                           as name,
+               (timestamp '2024-01-01 00:00:00'
+                    + (i % 86400) * interval '1 second')      as ts
+        from generate_series(1, {n}) as s(i)
+    """
+    con = psycopg.connect(pg_url, autocommit=True)
+    try:
+        con.execute(f"drop schema if exists {schema} cascade")
+        con.execute(f"create schema {schema}")
+        con.execute(pg_sql)
+    finally:
+        con.close()
+    path = str(tmp_path / "repr.duckdb")
+    dcon = duckdb_write(path)
+    try:
+        dcon.execute(duck_sql)
+    finally:
+        dcon.close()
+
+    a = open_pg(pg_url, side="A")
+    b = open_duckdb(path, side="B")
+    try:
+        result = diff(a, b, f"{schema}.repr", "main.repr", "id")
+    finally:
+        a.close()
+        b.close()
+        con = psycopg.connect(pg_url, autocommit=True)
+        try:
+            con.execute(f"drop schema if exists {schema} cascade")
+        finally:
+            con.close()
+
+    assert result.identical, (
+        "a pure representation change was reported as a data difference: "
+        f"{[(d.key, d.columns) for d in result.diffs[:5]]}"
+    )
+    assert result.stats.rows_downloaded == 0
