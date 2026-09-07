@@ -15,6 +15,12 @@ with the caveat that 0.x means the CLI surface may still move.
   order, deterministic across runs, and zero-download at 200k rows; and a
   single planted change (altered cell, deleted row, inserted row) is never
   smoothed to a match. No abnormality found so far.
+- **Live cross-engine identical coverage widened** (`tests/test_identical_live.py`,
+  PostgreSQL ↔ DuckDB): identical tables report identical with zero download for
+  the *hashed* key paths the core suite didn't reach — a text key, a composite
+  key, and a real `uuid`-typed key — and for an edge-value table (bigint
+  min/max, `Infinity`/`-Infinity`/`NaN`, a 12-digit decimal, an astral-plane
+  emoji, an empty string, and an all-NULL row). All agree; no false difference.
 
 ## 0.2.2 — 2026-09-07
 
