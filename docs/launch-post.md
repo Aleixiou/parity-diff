@@ -17,7 +17,7 @@ warehouse volumes.
 
 So I built [`parity`](https://github.com/Aleixiou/parity-diff): point it at a table
 in each of two engines, and it tells you exactly which rows and columns differ —
-without moving the data out of either one. PostgreSQL, DuckDB and MySQL today.
+without moving the data out of either one. PostgreSQL, DuckDB, MySQL, and Snowflake today.
 
 ```bash
 pip install "parity-diff[all]"
@@ -193,7 +193,7 @@ run found it in ninety seconds.
 
 ---
 
-`parity` is MIT, `pip install parity-diff`, PostgreSQL, DuckDB and MySQL. Adding
+`parity` is MIT, `pip install parity-diff`, PostgreSQL, DuckDB, MySQL, and Snowflake. Adding
 an engine is one file of about eighty lines — MySQL was the first added after
 release, and it was exactly that — the bisection knows nothing about
 SQL and the dialects know nothing about bisection, and there's a test that fails

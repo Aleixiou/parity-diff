@@ -400,7 +400,7 @@ for anyone who genuinely wants every row and has the memory for it.
 
 ## 5. Architecture
 
-The whole tool ships in `src/parity/` — dialects, engine and CLI — with 290
+The whole tool ships in `src/parity/` — dialects, engine and CLI — with 345
 tests, `demo/proof.py` as the end-to-end proof, and `demo/benchmark.py` as the
 10M-row one. Read the code before rewriting any of it: several decisions below
 encode findings that were expensive to discover.

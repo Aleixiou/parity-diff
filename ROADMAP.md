@@ -11,15 +11,16 @@ document, because it makes a reader distrust the accurate ones.
 
 ## Where it is
 
-**v0.2.0 released** (2026-09-06): PostgreSQL, DuckDB, MySQL, plus
-non-integer and composite keys. `pip install parity-diff`, MIT.
+**v0.2.2 released** (2026-09-07): PostgreSQL, DuckDB, MySQL, and **Snowflake**
+— the first warehouse — plus non-integer/composite keys and case-insensitive
+identifier matching across engines. `pip install parity-diff`, MIT.
 
 | | |
 |---|---|
-| Tests | 312, zero skipped against live PostgreSQL, DuckDB and MySQL |
-| Coverage | 99%, with a 95% floor enforced in CI |
+| Tests | 345; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests skip unless `PARITY_TEST_SNOWFLAKE` points at a real account, so they never run in CI — verified live by hand instead |
+| Coverage | 96%, with a 95% floor enforced in CI (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
 | CI | ruff, `mypy --strict`, PostgreSQL 16 and 18 + MySQL 8 service containers, Python 3.10 and 3.13, Windows, a DuckDB-only install |
-| Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data |
+| Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data. Snowflake verified live: hash constant, a 5,000-row full-table checksum matching DuckDB byte-for-byte, and every planted-difference check |
 
 Every test plants a difference and asserts the tool finds exactly it. That rule
 is the reason this project can be trusted at all, and it is not negotiable — see
@@ -29,23 +30,32 @@ is the reason this project can be trusted at all, and it is not negotiable — s
 
 Ordered by how much it would change who can use this.
 
-### 1. A warehouse dialect — the only thing that matters commercially
+### 0. Validation — the actual bottleneck now
 
-PostgreSQL, DuckDB and MySQL are all OLTP or embedded. None is where migration
-budgets live. Snowflake, BigQuery, Databricks and Redshift are, and the tool
-cannot connect to any of them yet. MySQL (added after release) proved the
-dialect is ~80 lines and that a new engine needs no change to the core;
-repeating that against a warehouse is the highest-value work left.
+The first warehouse is shipped, so the tool can finally serve the market it was
+built for — and it has essentially no users. Every item below is speculative
+until someone with a real migration says which one they need. The highest-value
+move is not code: it is posting the launch (see `docs/outreach.md`, now that a
+warehouse exists) and letting the replies pick the next dialect. Building the
+wrong three engines is exactly how the predecessor's maintenance grew expensive.
 
-A dialect is roughly 70–85 lines. `CONTRIBUTING.md` has the contract and the
-six traps that will bite. It is not done until `tests/test_encoding.py` passes
-against the real engine — an unverified dialect on a tool whose whole claim is
-that it does not lie is worse than no dialect.
+### 1. Snowflake — done (v0.2.2)
 
-### 2. More engine coverage beyond the first one
+The first warehouse. Verified live against a real account, which is the bar:
+the hash constant agrees, a 5,000-row full-table checksum matches DuckDB byte
+for byte, and every planted-difference check passes. It also forced the one
+thing the docs could not predict — case-insensitive identifier matching, since
+Snowflake upper-cases what PostgreSQL and DuckDB lower-case. Proof that the
+dialect abstraction holds against a warehouse, not just OLTP engines.
 
-`data-diff` shipped extras for twelve engines. Every one of them is a table
-someone cannot currently compare.
+### 2. The next warehouse — BigQuery, then Redshift / Databricks
+
+BigQuery is the most likely next request and the strongest addition to a
+launch. A dialect is roughly 70–85 lines (`CONTRIBUTING.md` has the contract and
+the traps), and — as Snowflake showed — it is not done until it passes against
+the *real* engine, which is where the one unforeseeable quirk always surfaces.
+`data-diff` shipped extras for twelve engines; every one is a table someone
+cannot currently compare. Pick the next by demand, not by guess.
 
 ### 3. Sampling mode
 
