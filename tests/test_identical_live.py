@@ -339,3 +339,44 @@ def test_a_same_content_swap_in_one_bucket_is_caught_live(pg_url, tmp_path):
         (2500, "only_in_a"),
         (2501, "only_in_b"),
     ]
+
+
+@pytest.mark.parametrize("rows,queries", [(0, 2), (1, 4)])
+def test_degenerate_identical_tables_across_engines(pg_url, tmp_path, rows, queries):
+    """The degenerate sizes where off-by-ones hide: an empty table costs two
+    queries (key_stats only, nothing to bisect) and a one-row table costs four
+    (2 key_stats + 2 checksums), both identical and both moving zero rows."""
+    import psycopg
+
+    select = f"select i::bigint as id, ('v' || i::text) as note from generate_series(1, {rows}) as s(i)"
+    schema = f"{PG_SCHEMA}_degen"
+    con = psycopg.connect(pg_url, autocommit=True)
+    try:
+        con.execute(f"drop schema if exists {schema} cascade")
+        con.execute(f"create schema {schema}")
+        con.execute(f"create table {schema}.t as {select}")
+    finally:
+        con.close()
+    path = str(tmp_path / "degen.duckdb")
+    dcon = duckdb_write(path)
+    try:
+        dcon.execute(f"create table t as {select}")
+    finally:
+        dcon.close()
+
+    a = open_pg(pg_url, side="A")
+    b = open_duckdb(path, side="B")
+    try:
+        result = diff(a, b, f"{schema}.t", "main.t", "id")
+    finally:
+        a.close()
+        b.close()
+        con = psycopg.connect(pg_url, autocommit=True)
+        try:
+            con.execute(f"drop schema if exists {schema} cascade")
+        finally:
+            con.close()
+
+    assert result.identical
+    assert result.stats.rows_downloaded == 0
+    assert result.stats.queries == queries
