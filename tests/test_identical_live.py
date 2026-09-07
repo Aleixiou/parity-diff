@@ -16,6 +16,8 @@ Skips cleanly without PostgreSQL.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from conftest import PG_SCHEMA, duckdb_write, open_duckdb, open_pg
 
@@ -205,3 +207,30 @@ def test_a_representation_change_across_engines_reads_identical(pg_url, tmp_path
         f"{[(d.key, d.columns) for d in result.diffs[:5]]}"
     )
     assert result.stats.rows_downloaded == 0
+
+
+def test_a_hashed_key_table_still_finds_a_planted_difference(pg, tmp_path):
+    """The other half of the promise: the identical check on a hashed key must
+    never MISS a real difference either. Plant one changed row in a text-keyed
+    copy and confirm the walk reports exactly it, keyed by the real text
+    identity - never by the 60-bit bucket hash, which could collide.
+    """
+    path = str(tmp_path / "text_key_perturbed.duckdb")
+    con = duckdb_write(path)
+    try:
+        con.execute(f"create table text_key as {TABLES['text_key'][1]}")
+        # md5('1234') is the uid of the row generated for i = 1234.
+        con.execute("update text_key set amount = amount + 0.01 where uid = md5('1234')")
+    finally:
+        con.close()
+
+    b = open_duckdb(path, side="B")
+    try:
+        result = diff(pg, b, f"{SCHEMA}.text_key", "main.text_key", "uid")
+    finally:
+        b.close()
+
+    # The same md5 the engines compute, for cross-engine agreement not security.
+    uid = hashlib.md5(b"1234", usedforsecurity=False).hexdigest()
+    assert [(d.key, d.kind) for d in result.diffs] == [(uid, "different")]
+    assert result.diffs[0].columns == ["amount"]
