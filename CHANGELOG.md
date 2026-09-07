@@ -7,29 +7,33 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ### Internal
 
-- **The identical check is under a dedicated stress campaign.**
-  `tests/test_identical.py` hunts the one failure that matters most — a real
-  difference reported as identical — at high volume against the in-memory
-  dialect: identical tables stay identical under every fan-out/threshold and
-  with hostile data (separators, NULs, full Unicode), independent of column
-  order, deterministic across runs, and zero-download at 200k rows; and a
-  single planted change (altered cell, deleted row, inserted row) is never
-  smoothed to a match. No abnormality found so far.
-- **Live cross-engine identical coverage widened** (`tests/test_identical_live.py`,
-  PostgreSQL ↔ DuckDB): identical tables report identical with zero download for
-  the *hashed* key paths the core suite didn't reach — a text key, a composite
-  key, and a real `uuid`-typed key — and for an edge-value table (bigint
-  min/max, `Infinity`/`-Infinity`/`NaN`, a 12-digit decimal, an astral-plane
-  emoji, an empty string, and an all-NULL row). All agree; no false difference.
-- **Direct MySQL ↔ PostgreSQL identical coverage** (`tests/test_mysql_postgres.py`):
-  the commonest migration pair, previously tested only transitively through
-  DuckDB. Identical data built by each engine reads identical with zero
-  download; a planted change is found exactly.
-- **Wide tables and the 0.2.1 bug, live.** A 120-column table (past
-  PostgreSQL's 100-argument `concat_ws` limit, forcing the nested-concat tree)
-  reads identical across engines; and the same-content insert+delete that used
-  to cancel to a false "identical" before 0.2.1 is reproduced across two real
-  engines and confirmed caught — the strongest guard on that fix.
+A dedicated campaign to harden the **identical check** — a false match being the
+one unforgivable failure for a diff tool — added ~20 tests across every angle it
+could be attacked from. No abnormality was found.
+
+- **Offline logic** (`tests/test_identical.py`): at high volume against the
+  in-memory dialect, identical tables stay identical under every
+  fan-out/threshold and with hostile data (the field separator, NULs, full
+  Unicode), independent of column order, deterministic across runs, and
+  zero-download at 200k rows; and a single planted change (cell, delete, insert)
+  is never smoothed to a match, always matching a brute-force oracle.
+- **Live cross-engine** (`tests/test_identical_live.py`, `test_mysql_postgres.py`):
+  identical reads identical with zero download for the *hashed* key paths (text,
+  composite, and a real `uuid`-typed key); for an edge-value table (bigint
+  min/max, `Infinity`/`-Infinity`/`NaN`, a 12-digit decimal, astral-plane emoji,
+  empty string, all-NULL row); for a *representation change* (the same values
+  typed as integer↔bigint, numeric↔double, varchar↔text); for a 120-column table
+  that forces PostgreSQL's nested-`concat_ws` tree; and directly between MySQL
+  and PostgreSQL, the pair previously covered only through DuckDB. The exact
+  0.2.1 same-content insert+delete bug is reproduced across two real engines and
+  confirmed caught — the strongest guard on that fix.
+- **A repeatable deep hunt.** `PARITY_DEEP=20 pytest tests/test_identical.py
+  tests/test_properties.py` scales the oracle and the false-identical hunter far
+  past their fast defaults; ~33,000 generated cases across a dozen seeds turned
+  up nothing, and anyone can re-run it. Documented in `CONTRIBUTING.md`.
+- `CONTRIBUTING.md` records the Snowflake findings (no bit-cast/`CONV` for the
+  hash, `NUMBER` split by scale, engine-specific identifier case-folding) as
+  traps for the next warehouse dialect.
 
 ## 0.2.2 — 2026-09-07
 
