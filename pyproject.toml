@@ -3,7 +3,7 @@
 # PyPI by an empty project. The import name, the CLI command and the repo are
 # all still `parity`: `pip install parity-diff` gives you `parity ...`.
 name = "parity-diff"
-version = "0.2.1"
+version = "0.2.2"
 description = "Prove two tables in two different database engines hold the same data - without moving the data out of either engine."
 readme = "README.md"
 license = "MIT"
