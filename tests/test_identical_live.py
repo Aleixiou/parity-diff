@@ -287,3 +287,55 @@ def test_a_very_wide_table_reads_identical_across_engines(pg_url, tmp_path):
     assert same.stats.rows_downloaded == 0
     assert [(d.key, d.kind) for d in changed.diffs] == [(321, "different")]
     assert changed.diffs[0].columns == ["c50"]
+
+
+def test_a_same_content_swap_in_one_bucket_is_caught_live(pg_url, tmp_path):
+    """The exact 0.2.1 bug, reproduced across two real engines.
+
+    Every row carries identical non-key content, and one side holds key 2500
+    while the other holds the adjacent key 2501 - a delete and an insert of the
+    same content in the same bucket. Before the key was folded into each
+    bucket's checksum the counts balanced and the content sums matched, so both
+    rows vanished: a false "identical". They must both be found.
+    """
+    import psycopg
+
+    # Shared keys are 1..5000 except {2500, 2501}; PostgreSQL adds 2500, DuckDB
+    # adds 2501. Identical content everywhere, so only the key distinguishes them.
+    body = "1.00::decimal(12,2) as amount, 'x' as status"
+    pg_select = f"select i::bigint as id, {body} from generate_series(1,5000) as s(i) where i <> 2501"
+    duck_select = f"select i::bigint as id, {body} from generate_series(1,5000) as s(i) where i <> 2500"
+    schema = f"{PG_SCHEMA}_swap"
+
+    con = psycopg.connect(pg_url, autocommit=True)
+    try:
+        con.execute(f"drop schema if exists {schema} cascade")
+        con.execute(f"create schema {schema}")
+        con.execute(f"create table {schema}.swap as {pg_select}")
+    finally:
+        con.close()
+    path = str(tmp_path / "swap.duckdb")
+    dcon = duckdb_write(path)
+    try:
+        dcon.execute(f"create table swap as {duck_select}")
+    finally:
+        dcon.close()
+
+    a = open_pg(pg_url, side="A")
+    b = open_duckdb(path, side="B")
+    try:
+        result = diff(a, b, f"{schema}.swap", "main.swap", "id")
+    finally:
+        a.close()
+        b.close()
+        con = psycopg.connect(pg_url, autocommit=True)
+        try:
+            con.execute(f"drop schema if exists {schema} cascade")
+        finally:
+            con.close()
+
+    assert not result.identical, "a same-content insert+delete cancelled to a false match"
+    assert [(d.key, d.kind) for d in result.diffs] == [
+        (2500, "only_in_a"),
+        (2501, "only_in_b"),
+    ]

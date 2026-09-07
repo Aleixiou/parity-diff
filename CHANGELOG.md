@@ -25,6 +25,11 @@ with the caveat that 0.x means the CLI surface may still move.
   the commonest migration pair, previously tested only transitively through
   DuckDB. Identical data built by each engine reads identical with zero
   download; a planted change is found exactly.
+- **Wide tables and the 0.2.1 bug, live.** A 120-column table (past
+  PostgreSQL's 100-argument `concat_ws` limit, forcing the nested-concat tree)
+  reads identical across engines; and the same-content insert+delete that used
+  to cancel to a false "identical" before 0.2.1 is reproduced across two real
+  engines and confirmed caught — the strongest guard on that fix.
 
 ## 0.2.2 — 2026-09-07
 
