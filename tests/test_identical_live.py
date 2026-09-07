@@ -234,3 +234,56 @@ def test_a_hashed_key_table_still_finds_a_planted_difference(pg, tmp_path):
     uid = hashlib.md5(b"1234", usedforsecurity=False).hexdigest()
     assert [(d.key, d.kind) for d in result.diffs] == [(uid, "different")]
     assert result.diffs[0].columns == ["amount"]
+
+
+def test_a_very_wide_table_reads_identical_across_engines(pg_url, tmp_path):
+    """A table with more columns than PostgreSQL's 100-argument `concat_ws`
+    limit forces `row_text` to build a nested tree of `concat_ws` calls. The two
+    engines must build the *same* tree over the same values, or an identical
+    wide table - an ordinary denormalised fact table - would report every row as
+    different. Also plants one change to prove the wide path finds a real one.
+    """
+    import psycopg
+
+    ncols = 120  # over PostgreSQL's 99-argument concat_ws limit
+    cols = ", ".join(f"('v' || (i + {n})::varchar) as c{n}" for n in range(ncols))
+    select = f"select i::bigint as id, {cols} from generate_series(1, 500) as s(i)"
+    schema = f"{PG_SCHEMA}_wide"
+
+    con = psycopg.connect(pg_url, autocommit=True)
+    try:
+        con.execute(f"drop schema if exists {schema} cascade")
+        con.execute(f"create schema {schema}")
+        con.execute(f"create table {schema}.wide as {select}")
+    finally:
+        con.close()
+    path = str(tmp_path / "wide.duckdb")
+    dcon = duckdb_write(path)
+    try:
+        dcon.execute(f"create table wide as {select}")
+        dcon.execute("create table wide_p as select * from wide")
+        dcon.execute("update wide_p set c50 = 'CHANGED' where id = 321")
+    finally:
+        dcon.close()
+
+    a = open_pg(pg_url, side="A")
+    b = open_duckdb(path, side="B")
+    try:
+        same = diff(a, b, f"{schema}.wide", "main.wide", "id")
+        changed = diff(a, b, f"{schema}.wide", "main.wide_p", "id")
+    finally:
+        a.close()
+        b.close()
+        con = psycopg.connect(pg_url, autocommit=True)
+        try:
+            con.execute(f"drop schema if exists {schema} cascade")
+        finally:
+            con.close()
+
+    assert same.identical, (
+        "a 120-column identical table reported differences - the nested "
+        f"concat_ws trees disagree: {[(d.key, d.columns) for d in same.diffs[:3]]}"
+    )
+    assert same.stats.rows_downloaded == 0
+    assert [(d.key, d.kind) for d in changed.diffs] == [(321, "different")]
+    assert changed.diffs[0].columns == ["c50"]
