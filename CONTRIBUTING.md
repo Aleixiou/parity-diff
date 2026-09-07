@@ -97,6 +97,34 @@ MySQL, added after v0.1.0, turned up two more that a warehouse dialect may hit:
    sentinel silently became `N`. Build such bytes from `CHAR`/hex, not a
    literal, and verify by hashing rather than by reading the SQL.
 
+Snowflake, the first warehouse (v0.2.2), added three more — the sort a warehouse
+is especially likely to spring:
+
+9. **Your engine may have neither a bit-cast nor `CONV` to reach 60 bits.**
+   Snowflake had no `bit(60)::bigint` and no `conv(hex,16,10)`. What it did have
+   is `md5_number_upper64(x)`, the top 64 bits of the digest as a number, and
+   `floor(that / 16)` drops the low 4 to land on the same 60-bit prefix - the
+   fourth distinct path to `648541476951500027`. Find your engine's own route;
+   the constant is the contract, not the SQL that reaches it.
+
+10. **Integers and decimals may share one type name.** Snowflake reports both as
+    `NUMBER` and only `numeric_scale` (0 = integer) tells them apart, so its
+    `columns()` reads the scale instead of trusting `data_type`. Trust the type
+    name and an integer key renders as `42.000000` and never matches another
+    engine's `42`. If your engine collapses numeric types like this, override
+    `columns()`.
+
+11. **Identifier case-folding is the engine's, and it is not universal.**
+    Snowflake upper-cases unquoted identifiers where PostgreSQL and DuckDB
+    lower-case them. The engine matches keys and columns case-insensitively for
+    exactly this reason (`_fold_columns`), but the *table* name is looked up in
+    the case the engine stored, so `--a-table orders` against a Snowflake
+    `ORDERS` fails with a near-miss hint. And some warehouses (Snowflake among
+    them) offer only READ COMMITTED, so unlike PostgreSQL the walk cannot be
+    pinned to one snapshot - a real limitation to document, not hide. None of
+    these three showed up in the docs; they surfaced only against a live
+    account, which is why the rule below is not negotiable.
+
 ### Proving it works
 
 A dialect is not done until `tests/test_encoding.py` passes against it. That
