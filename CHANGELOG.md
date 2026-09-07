@@ -3,6 +3,19 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
+## Unreleased
+
+### Internal
+
+- **The identical check is under a dedicated stress campaign.**
+  `tests/test_identical.py` hunts the one failure that matters most — a real
+  difference reported as identical — at high volume against the in-memory
+  dialect: identical tables stay identical under every fan-out/threshold and
+  with hostile data (separators, NULs, full Unicode), independent of column
+  order, deterministic across runs, and zero-download at 200k rows; and a
+  single planted change (altered cell, deleted row, inserted row) is never
+  smoothed to a match. No abnormality found so far.
+
 ## 0.2.2 — 2026-09-07
 
 ### Added
