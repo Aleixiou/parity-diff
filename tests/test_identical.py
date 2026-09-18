@@ -32,9 +32,7 @@ from parity.types import Column, LogicalType
 # Hostile text: full Unicode, control characters, even NUL - the fake is pure
 # Python, so the point is that identical *bytes* stay identical however ugly.
 # Surrogates are excluded only because they have no encoding at all.
-_FULL = st.text(
-    alphabet=st.characters(blacklist_categories=("Cs",)), max_size=18
-)
+_FULL = st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=18)
 # The same, minus the field separator, for tests that plant a difference.
 _SAFE = st.text(
     alphabet=st.characters(blacklist_characters="\x1f", blacklist_categories=("Cs",)),
@@ -51,9 +49,7 @@ def _table(text=_SAFE, min_rows=0, max_cols=6):
         """Draw one (columns, rows) pair for the strategy above."""
         ncols = draw(st.integers(min_value=1, max_value=max_cols))
         cols = [Column(f"c{i}", LogicalType.STRING, "varchar") for i in range(ncols)]
-        keys = draw(
-            st.lists(_KEY, unique=True, min_size=min_rows, max_size=30)
-        )
+        keys = draw(st.lists(_KEY, unique=True, min_size=min_rows, max_size=30))
         rows = {k: tuple(draw(text) for _ in range(ncols)) for k in keys}
         return cols, rows
 
@@ -97,13 +93,19 @@ def _kinds(result) -> list[tuple[int, str]]:
     bisection_factor=st.integers(min_value=2, max_value=64),
     threshold=st.integers(min_value=1, max_value=100),
 )
-def test_identical_tables_are_identical_under_every_knob(data, bisection_factor, threshold):
+def test_identical_tables_are_identical_under_every_knob(
+    data, bisection_factor, threshold
+):
     """A table against itself: identical, no diffs, zero rows moved - for any
     fan-out and threshold, and even with separators and NULs in the data."""
     cols, rows = data
     result = _run(
-        cols, rows, cols, dict(rows),
-        bisection_factor=bisection_factor, threshold=threshold,
+        cols,
+        rows,
+        cols,
+        dict(rows),
+        bisection_factor=bisection_factor,
+        threshold=threshold,
     )
     assert result.identical
     assert result.diffs == []
@@ -138,7 +140,10 @@ def test_identical_is_independent_of_column_order(data, perm):
 
 
 @settings(max_examples=100, deadline=None)  # large-table walks are legitimately slow
-@given(n=st.integers(min_value=1, max_value=200_000), bf=st.integers(min_value=2, max_value=64))
+@given(
+    n=st.integers(min_value=1, max_value=200_000),
+    bf=st.integers(min_value=2, max_value=64),
+)
 def test_identical_at_scale_downloads_nothing(n, bf):
     """Two identical generated tables of up to 200k rows: still zero download,
     and the query count stays tiny (a logarithmic walk that never recurses)."""
@@ -170,7 +175,11 @@ def test_the_identical_check_is_deterministic(data):
 
 
 @settings(max_examples=deep_examples(600))
-@given(data=_table(text=_SAFE, min_rows=1), seed=st.randoms(use_true_random=False), newval=_SAFE)
+@given(
+    data=_table(text=_SAFE, min_rows=1),
+    seed=st.randoms(use_true_random=False),
+    newval=_SAFE,
+)
 def test_a_single_planted_change_is_never_called_identical(data, seed, newval):
     """Take an identical pair, apply exactly one change - alter a cell, delete a
     row, or insert a row - and assert the walk never reports identical and finds

@@ -132,9 +132,7 @@ def _key_order(key: int | str) -> tuple[int, int | str]:
     return (1, key) if isinstance(key, str) else (0, key)
 
 
-def _fold_columns(
-    columns: list[Column], side: str, table: str
-) -> dict[str, Column]:
+def _fold_columns(columns: list[Column], side: str, table: str) -> dict[str, Column]:
     """Index a side's columns by case-folded name, for cross-engine matching.
 
     Two engines fold unquoted identifiers to different cases, so a column is
@@ -247,7 +245,8 @@ def _select_columns(
     excluded = {e.casefold() for e in exclude}
 
     unknown_exclude = [
-        e for e in dict.fromkeys(exclude)
+        e
+        for e in dict.fromkeys(exclude)
         if e.casefold() not in cols_a and e.casefold() not in cols_b
     ]
     if unknown_exclude:
@@ -282,9 +281,7 @@ def _select_columns(
                 f"--columns named columns present on only one side: {one_side}"
             )
         if dropped:
-            raise ValueError(
-                f"--columns and --exclude both name: {dropped}"
-            )
+            raise ValueError(f"--columns and --exclude both name: {dropped}")
         shared = [f for f in shared if f in set(req)]
 
     for side, cols, only in (
@@ -330,7 +327,11 @@ def _select_columns(
 
     unknown = sorted(
         {cols_a[f].name for f in shared if cols_a[f].logical_type is LogicalType.UNKNOWN}
-        | {cols_a[f].name for f in shared if cols_b[f].logical_type is LogicalType.UNKNOWN}
+        | {
+            cols_a[f].name
+            for f in shared
+            if cols_b[f].logical_type is LogicalType.UNKNOWN
+        }
     )
     if unknown:
         warnings.append(
@@ -376,9 +377,10 @@ def diff(
     # Order matters: context managers exit in reverse, so `_cancel_on_interrupt`
     # must be the *inner* one. The pool's own exit blocks waiting for its
     # threads, so cancelling has to happen before that, not after.
-    with ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="parity"
-    ) as pool, _cancel_on_interrupt(a, b):
+    with (
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="parity") as pool,
+        _cancel_on_interrupt(a, b),
+    ):
 
         def both(
             fn_name: str,
@@ -405,14 +407,10 @@ def diff(
         # users read as "how much work did this cost".
         stats.queries -= 2
 
-        key_a, key_b = _resolve_key(
-            key, cols_a, cols_b, a_table, b_table, warnings
-        )
+        key_a, key_b = _resolve_key(key, cols_a, cols_b, a_table, b_table, warnings)
         key_folds = {c.name.casefold() for c in key_a.columns}
 
-        shared = _select_columns(
-            cols_a, cols_b, key_folds, columns, exclude, warnings
-        )
+        shared = _select_columns(cols_a, cols_b, key_folds, columns, exclude, warnings)
         a_cols = [cols_a[f] for f in shared]
         b_cols = [cols_b[f] for f in shared]
 
@@ -485,8 +483,19 @@ def diff(
                     stats.queries += 2
                     if cs_a.get(0, EMPTY) != cs_b.get(0, EMPTY):
                         _compare_rows(
-                            pool, a, b, a_table, b_table, key_a, key_b,
-                            a_cols, b_cols, s_lo, s_hi, diffs, stats,
+                            pool,
+                            a,
+                            b,
+                            a_table,
+                            b_table,
+                            key_a,
+                            key_b,
+                            a_cols,
+                            b_cols,
+                            s_lo,
+                            s_hi,
+                            diffs,
+                            stats,
                         )
                     continue
 
@@ -501,8 +510,7 @@ def diff(
                 stats.queries += 2
 
                 differing = [
-                    i for i in range(n)
-                    if cs_a.get(i, EMPTY) != cs_b.get(i, EMPTY)
+                    i for i in range(n) if cs_a.get(i, EMPTY) != cs_b.get(i, EMPTY)
                 ]
                 for position, i in enumerate(differing):
                     # The limit has to be honoured inside the level too. A
@@ -516,8 +524,19 @@ def diff(
                     b_lo_i, b_hi_i = bucket_bounds(i, s_lo, s_hi, n)
                     if max(va[0], vb[0]) <= threshold or b_hi_i - b_lo_i <= 1:
                         _compare_rows(
-                            pool, a, b, a_table, b_table, key_a, key_b,
-                            a_cols, b_cols, b_lo_i, b_hi_i, diffs, stats,
+                            pool,
+                            a,
+                            b,
+                            a_table,
+                            b_table,
+                            key_a,
+                            key_b,
+                            a_cols,
+                            b_cols,
+                            b_lo_i,
+                            b_hi_i,
+                            diffs,
+                            stats,
                         )
                     else:
                         queue.append((b_lo_i, b_hi_i))
@@ -540,8 +559,12 @@ def diff(
 
     stats.seconds = time.perf_counter() - started
     return DiffResult(
-        diffs, stats, a_cols, warnings,
-        truncated=truncated, float_scale=a.float_scale,
+        diffs,
+        stats,
+        a_cols,
+        warnings,
+        truncated=truncated,
+        float_scale=a.float_scale,
     )
 
 
@@ -582,7 +605,9 @@ def _compare_rows(
         ra, rb = rows_a.get(k), rows_b.get(k)
         if ra is None:
             diffs.append(
-                RowDiff(k, "only_in_b", names, {}, dict(zip(names, rb or (), strict=True)))
+                RowDiff(
+                    k, "only_in_b", names, {}, dict(zip(names, rb or (), strict=True))
+                )
             )
         elif rb is None:
             diffs.append(
@@ -592,7 +617,9 @@ def _compare_rows(
             changed = [n for n, x, y in zip(names, ra, rb, strict=True) if x != y]
             diffs.append(
                 RowDiff(
-                    k, "different", changed,
+                    k,
+                    "different",
+                    changed,
                     {n: v for n, v in zip(names, ra, strict=True) if n in changed},
                     {n: v for n, v in zip(names, rb, strict=True) if n in changed},
                 )

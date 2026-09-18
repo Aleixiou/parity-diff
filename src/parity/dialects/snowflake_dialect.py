@@ -69,6 +69,7 @@ class SnowflakeDialect(Dialect):
             """First value of a query parameter, or None."""
             values = params.get(key)
             return values[0] if values else None
+
         if schema:
             self.default_schema = schema
 

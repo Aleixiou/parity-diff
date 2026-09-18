@@ -81,8 +81,11 @@ class MySQLDialect(Dialect):
         try:
             thread_id = int(self._conn.connection_id or 0)
             admin = mysql.connector.connect(
-                host=self._host, port=self._port, user=self._user,
-                password=self._password, connection_timeout=5,
+                host=self._host,
+                port=self._port,
+                user=self._user,
+                password=self._password,
+                connection_timeout=5,
             )
             try:
                 c = admin.cursor()
@@ -216,8 +219,15 @@ def map_type_mysql(raw: str) -> LogicalType:
     """
     t = raw.lower().split("(")[0].strip()
     if t in {
-        "int", "integer", "bigint", "smallint", "mediumint", "tinyint",
-        "int unsigned", "bigint unsigned", "year",
+        "int",
+        "integer",
+        "bigint",
+        "smallint",
+        "mediumint",
+        "tinyint",
+        "int unsigned",
+        "bigint unsigned",
+        "year",
     }:
         return LogicalType.INTEGER
     if t in {"decimal", "numeric", "dec", "fixed"}:
@@ -231,8 +241,14 @@ def map_type_mysql(raw: str) -> LogicalType:
     if t in {"datetime", "timestamp"}:
         return LogicalType.TIMESTAMP
     if t in {
-        "char", "varchar", "text", "tinytext", "mediumtext", "longtext",
-        "enum", "set",
+        "char",
+        "varchar",
+        "text",
+        "tinytext",
+        "mediumtext",
+        "longtext",
+        "enum",
+        "set",
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN

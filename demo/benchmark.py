@@ -35,13 +35,15 @@ def expected_planted(n: int) -> list[tuple[int, str]]:
     speed would happily report a fast wrong answer.
     """
     keys = plant_keys(n)
-    return sorted([
-        (keys["null_trap"], "different"),      # NULL -> ''
-        (keys["deleted"], "only_in_b"),        # deleted from A
-        (keys["changed"], "different"),        # amount moved
-        (keys["bool_trap"], "different"),      # FALSE -> NULL
-        (keys["extra"], "only_in_a"),          # inserted into A
-    ])
+    return sorted(
+        [
+            (keys["null_trap"], "different"),  # NULL -> ''
+            (keys["deleted"], "only_in_b"),  # deleted from A
+            (keys["changed"], "different"),  # amount moved
+            (keys["bool_trap"], "different"),  # FALSE -> NULL
+            (keys["extra"], "only_in_a"),  # inserted into A
+        ]
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,15 +63,21 @@ def main(argv: list[str] | None = None) -> int:
     b = get_dialect(f"duckdb:///{args.duckdb}", side="B")
     try:
         rows = a.query(f"select count(*) from {TABLE}")[0][0]
-        print(f"postgres {TABLE}: {rows:,} rows   duckdb {TABLE}: "
-              f"{b.query(f'select count(*) from {TABLE}')[0][0]:,} rows")
+        print(
+            f"postgres {TABLE}: {rows:,} rows   duckdb {TABLE}: "
+            f"{b.query(f'select count(*) from {TABLE}')[0][0]:,} rows"
+        )
         print()
 
         results = []
         for run in range(args.repeat):
             started = time.perf_counter()
             result = diff(
-                a, b, f"public.{TABLE}", f"main.{TABLE}", args.key,
+                a,
+                b,
+                f"public.{TABLE}",
+                f"main.{TABLE}",
+                args.key,
                 bisection_factor=args.bisection_factor,
                 threshold=args.threshold,
             )
@@ -91,7 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         if result.diffs:
             print()
             for d in result.diffs:
-                detail = f"  columns: {', '.join(d.columns)}" if d.kind == "different" else ""
+                detail = (
+                    f"  columns: {', '.join(d.columns)}" if d.kind == "different" else ""
+                )
                 print(f"    {d.kind:<11} id {d.key:>12,}{detail}")
         for w in result.warnings:
             print(f"    ! {w}")
@@ -120,11 +130,17 @@ def main(argv: list[str] | None = None) -> int:
                     f"\n  (counts wildly off usually means the dataset was "
                     f"rebuilt or clobbered - rerun demo/generate.py)"
                 )
-            null_trap = next(d for d in result.diffs if d.key == plant_keys(
-                result.stats.rows_compared_b)["null_trap"])
+            null_trap = next(
+                d
+                for d in result.diffs
+                if d.key == plant_keys(result.stats.rows_compared_b)["null_trap"]
+            )
             assert null_trap.columns == ["note"], null_trap.columns
-            bool_trap = next(d for d in result.diffs if d.key == plant_keys(
-                result.stats.rows_compared_b)["bool_trap"])
+            bool_trap = next(
+                d
+                for d in result.diffs
+                if d.key == plant_keys(result.stats.rows_compared_b)["bool_trap"]
+            )
             assert bool_trap.columns == ["is_refunded"], bool_trap.columns
             moveable = result.stats.rows_compared_a + result.stats.rows_compared_b
             pct = 100 * result.stats.rows_downloaded / moveable
@@ -145,8 +161,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"downloaded {pct:.2f}% of the data; expected well under 1% "
                     f"at this scale"
                 )
-            print("\nOK  found exactly the planted differences, "
-                  f"including NULL vs '' and FALSE vs NULL, moving {pct:.4f}% of the rows")
+            print(
+                "\nOK  found exactly the planted differences, "
+                f"including NULL vs '' and FALSE vs NULL, moving {pct:.4f}% of the rows"
+            )
     finally:
         a.close()
         b.close()

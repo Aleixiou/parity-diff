@@ -69,13 +69,13 @@ def _rand_string(rng: random.Random) -> str:
     """A random string drawn from a deliberately hostile alphabet."""
     palette = (
         "abcABC012 "
-        "héllo wörld"          # accented latin
-        "日本語한국어"            # CJK
+        "héllo wörld"  # accented latin
+        "日本語한국어"  # CJK
         "\U0001f389\U0001f600"  # emoji (astral plane)
-        "éñ"        # combining marks
-        "‏‮"          # RTL / override controls
-        "\x1f"                  # the field separator, as real data
-        "\t\r\n"                # whitespace controls
+        "éñ"  # combining marks
+        "‏‮"  # RTL / override controls
+        "\x1f"  # the field separator, as real data
+        "\t\r\n"  # whitespace controls
     )
     length = rng.randint(0, 24)
     chars = [rng.choice(palette) for _ in range(length)]
@@ -115,17 +115,41 @@ def _adversarial_rows() -> list[tuple]:
     """
     return [
         ("", 0, Decimal("0.000000"), False, dt.date(1970, 1, 1), dt.datetime(2024, 1, 1)),
-        ("\x1f", 1, Decimal("1.500000"), True, dt.date(2024, 2, 29),
-         dt.datetime(2024, 2, 29, 13, 4, 5, 123456)),
+        (
+            "\x1f",
+            1,
+            Decimal("1.500000"),
+            True,
+            dt.date(2024, 2, 29),
+            dt.datetime(2024, 2, 29, 13, 4, 5, 123456),
+        ),
         # The sentinel spelled as genuine string data - both engines must still
         # agree on how they render it, whatever the diff logic later makes of it.
         ("\\N", -1, Decimal("-0.125000"), None, None, None),
-        ("O'Brien \"x\"", 9223372036854775807, Decimal("123456789.987654"),
-         True, dt.date(9999, 12, 31), dt.datetime(9999, 12, 31, 23, 59, 59, 999999)),
-        (None, -9223372036854775808, None, False, dt.date(1, 1, 1),
-         dt.datetime(1, 1, 1, 0, 0, 0)),
-        ("héllo 日本語 \U0001f389", None, Decimal("-99999999999999.999999"),
-         None, dt.date(2000, 1, 1), None),
+        (
+            'O\'Brien "x"',
+            9223372036854775807,
+            Decimal("123456789.987654"),
+            True,
+            dt.date(9999, 12, 31),
+            dt.datetime(9999, 12, 31, 23, 59, 59, 999999),
+        ),
+        (
+            None,
+            -9223372036854775808,
+            None,
+            False,
+            dt.date(1, 1, 1),
+            dt.datetime(1, 1, 1, 0, 0, 0),
+        ),
+        (
+            "héllo 日本語 \U0001f389",
+            None,
+            Decimal("-99999999999999.999999"),
+            None,
+            dt.date(2000, 1, 1),
+            None,
+        ),
     ]
 
 
@@ -134,14 +158,16 @@ def _rows() -> list[tuple]:
     rng = random.Random(SEED)
     rows = list(_adversarial_rows())
     for _ in range(N_RANDOM):
-        rows.append((
-            _rand_string(rng) if rng.random() > 0.1 else None,
-            rng.randint(-(2**63), 2**63 - 1) if rng.random() > 0.1 else None,
-            _rand_decimal(rng) if rng.random() > 0.1 else None,
-            rng.choice([True, False]) if rng.random() > 0.1 else None,
-            _rand_timestamp(rng).date() if rng.random() > 0.1 else None,
-            _rand_timestamp(rng) if rng.random() > 0.1 else None,
-        ))
+        rows.append(
+            (
+                _rand_string(rng) if rng.random() > 0.1 else None,
+                rng.randint(-(2**63), 2**63 - 1) if rng.random() > 0.1 else None,
+                _rand_decimal(rng) if rng.random() > 0.1 else None,
+                rng.choice([True, False]) if rng.random() > 0.1 else None,
+                _rand_timestamp(rng).date() if rng.random() > 0.1 else None,
+                _rand_timestamp(rng) if rng.random() > 0.1 else None,
+            )
+        )
     return rows
 
 
@@ -335,9 +361,7 @@ def test_a_single_planted_change_in_fuzzed_data_is_found(pg_fuzz, tmp_path):
 
     perturbed = open_duckdb(path, side="B")
     try:
-        result = diff(
-            pg_fuzz, perturbed, _qualified(pg_fuzz), f"main.{FUZZ_TABLE}", "id"
-        )
+        result = diff(pg_fuzz, perturbed, _qualified(pg_fuzz), f"main.{FUZZ_TABLE}", "id")
         assert [(d.key, d.kind) for d in result.diffs] == [(victim, "different")], (
             f"expected exactly row {victim} to differ, got "
             f"{[(d.key, d.kind) for d in result.diffs]}"

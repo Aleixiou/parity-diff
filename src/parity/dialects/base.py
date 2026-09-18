@@ -27,7 +27,9 @@ from parity.types import Column, KeySpec, KeyStats, LogicalType
 # Field separator inside a row's canonical text. Unit Separator (0x1f) is
 # chosen because it effectively never appears in warehouse string data;
 # `chr(31)` is spelled the same way in every engine we support.
-SEPARATOR_SQL = "chr(31)"  # default; a dialect overrides `separator_sql` if its spelling differs
+SEPARATOR_SQL = (
+    "chr(31)"  # default; a dialect overrides `separator_sql` if its spelling differs
+)
 NULL_SENTINEL = "\\N"
 
 # Number of MD5 hex characters folded into the row hash. 15 nibbles = 60 bits.
@@ -331,13 +333,10 @@ class Dialect(ABC):
         missing = [n for n in names if n not in found]
         if missing:
             raise self._err(
-                f"key column(s) {missing} not in {table}. "
-                f"Columns are: {sorted(found)}"
+                f"key column(s) {missing} not in {table}. Columns are: {sorted(found)}"
             )
         cols = tuple(found[n] for n in names)
-        hashed = not (
-            len(cols) == 1 and cols[0].logical_type is LogicalType.INTEGER
-        )
+        hashed = not (len(cols) == 1 and cols[0].logical_type is LogicalType.INTEGER)
         return KeySpec(cols, hashed)
 
     def key_bucket(self, key: KeySpec) -> str:
@@ -393,9 +392,7 @@ class Dialect(ABC):
         if lo is None:
             return KeyStats(None, None, int(rows), 0, int(non_null))
         try:
-            return KeyStats(
-                int(lo), int(hi), int(rows), int(distinct), int(non_null)
-            )
+            return KeyStats(int(lo), int(hi), int(rows), int(distinct), int(non_null))
         except (TypeError, ValueError) as exc:  # pragma: no cover - see below
             # Only reachable if a dialect's `key_bucket` returned something
             # non-integer; the engine hashes any non-integer key before we get
@@ -595,9 +592,21 @@ def map_type(raw: str) -> LogicalType:
     """Map an engine's type name onto a logical category."""
     t = raw.lower().split("(")[0].strip()
     if t in {
-        "int", "int2", "int4", "int8", "integer", "bigint", "smallint",
-        "tinyint", "hugeint", "utinyint", "usmallint", "uinteger", "ubigint",
-        "serial", "bigserial",
+        "int",
+        "int2",
+        "int4",
+        "int8",
+        "integer",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "hugeint",
+        "utinyint",
+        "usmallint",
+        "uinteger",
+        "ubigint",
+        "serial",
+        "bigserial",
     }:
         return LogicalType.INTEGER
     if t in {"decimal", "numeric"}:
@@ -611,8 +620,14 @@ def map_type(raw: str) -> LogicalType:
     if t.startswith(("timestamp", "datetime")):
         return LogicalType.TIMESTAMP
     if t in {
-        "text", "varchar", "char", "bpchar", "character varying",
-        "character", "string", "uuid",
+        "text",
+        "varchar",
+        "char",
+        "bpchar",
+        "character varying",
+        "character",
+        "string",
+        "uuid",
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN

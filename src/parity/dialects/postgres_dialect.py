@@ -157,7 +157,9 @@ class PostgresDialect(Dialect):
         60 bits, not 64: at 64 PostgreSQL's bit-to-bigint cast wraps negative
         and the two engines stop agreeing.
         """
-        return f"(('x' || substr(md5({text_expr}), 1, {HASH_HEX_CHARS}))::bit(60)::bigint)"
+        return (
+            f"(('x' || substr(md5({text_expr}), 1, {HASH_HEX_CHARS}))::bit(60)::bigint)"
+        )
 
     def int_div(self, numerator: str, denominator: str) -> str:
         """Exact integer division, truncating toward zero."""
@@ -177,4 +179,3 @@ class PostgresDialect(Dialect):
         """Sum row hashes without overflowing, and return 0 for an empty group."""
         # numeric is arbitrary precision: cannot overflow no matter the row count.
         return f"coalesce(sum(({expr})::numeric), 0)"
-

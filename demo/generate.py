@@ -149,7 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         "--plant", action="store_true", help="apply the planted differences to side A"
     )
     parser.add_argument(
-        "--index", action="store_true",
+        "--index",
+        action="store_true",
         help="add a unique index on the key column (measured to be irrelevant)",
     )
     parser.add_argument(

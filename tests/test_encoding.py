@@ -330,7 +330,9 @@ def test_row_hash_is_a_positive_60_bit_integer(pg, duck):
 def test_documented_hash_constant(pg, duck):
     """CLAUDE.md section 4.1 pins this number. If it moves, the docs are wrong."""
     for dialect in (pg, duck):
-        got = dialect.query(f"select {dialect.hash_expr(chr(39) + 'abc' + chr(39))}")[0][0]
+        got = dialect.query(f"select {dialect.hash_expr(chr(39) + 'abc' + chr(39))}")[0][
+            0
+        ]
         assert int(got) == 648541476951500027, f"side {dialect.side} produced {got}"
 
 
@@ -419,7 +421,9 @@ def test_null_boolean_is_not_equal_to_false(pg, duck):
     # And in the other direction, so neither dialect can regress alone.
     assert _normalized(duck, "enc_boolean", 3) != _normalized(pg, "enc_boolean", 2)
     # TRUE must still be unaffected by the fix.
-    assert _normalized(pg, "enc_boolean", 1) == _normalized(duck, "enc_boolean", 1) == "true"
+    assert (
+        _normalized(pg, "enc_boolean", 1) == _normalized(duck, "enc_boolean", 1) == "true"
+    )
 
 
 @pytest.mark.postgres
@@ -731,7 +735,9 @@ def test_the_bucket_expression_always_widens_before_multiplying():
         (PostgresDialect(), "numeric"),
     ):
         for hi in (10**9, 2**62):
-            bucket = dialect._segment_sql("t", _int_key(), cols, 0, hi, 32).split(" as seg")[0]
+            bucket = dialect._segment_sql("t", _int_key(), cols, 0, hi, 32).split(
+                " as seg"
+            )[0]
             assert widener in bucket, (
                 f"{dialect.name} did not widen the key offset for hi={hi}: {bucket}"
             )
@@ -888,9 +894,7 @@ def test_non_finite_floats_render_identically(pg, duck):
 def test_non_finite_floats_are_still_distinguishable(pg, duck):
     """The negative control: rendering them as tokens must not make them all
     equal to each other, or to a finite value."""
-    tokens = {
-        row_id: _normalized(pg, "enc_float", row_id) for row_id in (1, 5, 6, 7)
-    }
+    tokens = {row_id: _normalized(pg, "enc_float", row_id) for row_id in (1, 5, 6, 7)}
     assert len(set(tokens.values())) == 4, tokens
     # And across engines, in both directions.
     assert _normalized(pg, "enc_float", 5) != _normalized(duck, "enc_float", 6)
@@ -945,7 +949,9 @@ def test_a_column_whose_name_needs_quoting_round_trips(tmp_path):
     def make(path: str, value: str) -> str:
         """Build a small fixture database and return its path."""
         con = duckdb_write(path)
-        con.execute(f'create table t (id bigint, "Mixed Case" varchar, "{weird.replace(chr(34), chr(34) * 2)}" varchar)')
+        con.execute(
+            f'create table t (id bigint, "Mixed Case" varchar, "{weird.replace(chr(34), chr(34) * 2)}" varchar)'
+        )
         con.execute(f"insert into t values (1, 'x', '{value}')")
         con.close()
         return path
@@ -1122,9 +1128,11 @@ def test_a_narrow_table_still_renders_exactly_one_flat_concat():
     for n in (1, 2, 10, MAX_CONCAT_ARGS):
         text = d.row_text(_wide_columns(n))
         assert text.count("concat_ws") == 1, f"{n} columns should not nest"
-        expected = "concat_ws(chr(31), " + ", ".join(
-            d.normalize(c) for c in _wide_columns(n)
-        ) + ")"
+        expected = (
+            "concat_ws(chr(31), "
+            + ", ".join(d.normalize(c) for c in _wide_columns(n))
+            + ")"
+        )
         assert text == expected
 
 
@@ -1170,7 +1178,9 @@ def test_nesting_produces_byte_identical_text_to_a_flat_call(tmp_path):
 
 
 @pytest.mark.postgres
-def test_a_table_wider_than_the_postgres_argument_limit_compares(pg, duck, pg_url, tmp_path):
+def test_a_table_wider_than_the_postgres_argument_limit_compares(
+    pg, duck, pg_url, tmp_path
+):
     """PostgreSQL's max_function_args is 100 and fixed at compile time, so a
     flat concat over a 150-column table raised "cannot pass more than 100
     arguments". DuckDB accepted the same table happily, making the failure
@@ -1226,7 +1236,9 @@ def test_unicode_table_and_column_names_round_trip(tmp_path):
     def make(path: str, value: str) -> str:
         """Build a small fixture database and return its path."""
         con = duckdb_write(path)
-        con.execute('create table "ünïcode" (id bigint, "日本語" varchar, "café" varchar)')
+        con.execute(
+            'create table "ünïcode" (id bigint, "日本語" varchar, "café" varchar)'
+        )
         con.execute(f"insert into \"ünïcode\" values (1, 'あ', 'x'), (2, '{value}', 'y')")
         con.close()
         return path
@@ -1395,30 +1407,59 @@ def test_a_connection_error_names_the_side_exactly_once(tmp_path):
 # --------------------------------------------------------------------------
 
 _INT, _DEC, _FLT, _STR, _BOOL = (
-    LogicalType.INTEGER, LogicalType.DECIMAL, LogicalType.FLOAT,
-    LogicalType.STRING, LogicalType.BOOLEAN,
+    LogicalType.INTEGER,
+    LogicalType.DECIMAL,
+    LogicalType.FLOAT,
+    LogicalType.STRING,
+    LogicalType.BOOLEAN,
 )
 
 REPR_CASES = [
     # label, (ddl_a, value_a, logical_a), (ddl_b, value_b, logical_b), same
     ("integer width", ("integer", "42", _INT), ("bigint", "42", _INT), True),
-    ("decimal scale", ("decimal(12,2)", "1.50", _DEC), ("decimal(20,4)", "1.5", _DEC), True),
+    (
+        "decimal scale",
+        ("decimal(12,2)", "1.50", _DEC),
+        ("decimal(20,4)", "1.5", _DEC),
+        True,
+    ),
     ("decimal vs double", ("decimal(12,2)", "1.50", _DEC), ("double", "1.5", _FLT), True),
-    ("negative decimal padding", ("decimal(6,3)", "-0.1", _DEC), ("double", "-0.1", _FLT), True),
+    (
+        "negative decimal padding",
+        ("decimal(6,3)", "-0.1", _DEC),
+        ("double", "-0.1", _FLT),
+        True,
+    ),
     # Absorbed *and dangerous*: a genuine difference below the 6-place float
     # scale is invisible. Documented in CLAUDE.md 4.2; --float-scale exposes it.
-    ("difference below float scale", ("decimal(20,10)", "1.0000000100", _DEC),
-                                      ("decimal(20,10)", "1.0000000200", _DEC), True),
-
+    (
+        "difference below float scale",
+        ("decimal(20,10)", "1.0000000100", _DEC),
+        ("decimal(20,10)", "1.0000000200", _DEC),
+        True,
+    ),
     # Flagged: byte-level value differences, even when a human might call the
     # information "the same".
-    ("boolean vs integer flag", ("boolean", "true", _BOOL), ("integer", "1", _INT), False),
-    ("difference within float scale", ("decimal(20,10)", "1.0000010000", _DEC),
-                                       ("decimal(20,10)", "1.0000020000", _DEC), False),
+    (
+        "boolean vs integer flag",
+        ("boolean", "true", _BOOL),
+        ("integer", "1", _INT),
+        False,
+    ),
+    (
+        "difference within float scale",
+        ("decimal(20,10)", "1.0000010000", _DEC),
+        ("decimal(20,10)", "1.0000020000", _DEC),
+        False,
+    ),
     ("trailing whitespace", ("varchar", "'hi '", _STR), ("varchar", "'hi'", _STR), False),
     ("case fold", ("varchar", "'YES'", _STR), ("varchar", "'yes'", _STR), False),
-    ("json key order", ("varchar", "'{\"a\":1,\"b\":2}'", _STR),
-                        ("varchar", "'{\"b\":2,\"a\":1}'", _STR), False),
+    (
+        "json key order",
+        ("varchar", '\'{"a":1,"b":2}\'', _STR),
+        ("varchar", '\'{"b":2,"a":1}\'', _STR),
+        False,
+    ),
     ("null vs empty string", ("varchar", "NULL", _STR), ("varchar", "''", _STR), False),
 ]
 
@@ -1470,4 +1511,6 @@ def test_representation_table_covers_both_verdicts():
     a test that proves the tool absorbs everything, which is the opposite of
     what it must do."""
     verdicts = {same for _, _, _, same in REPR_CASES}
-    assert verdicts == {True, False}, "the contract table needs both same and different cases"
+    assert verdicts == {True, False}, (
+        "the contract table needs both same and different cases"
+    )

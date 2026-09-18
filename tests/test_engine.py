@@ -128,7 +128,9 @@ def test_single_changed_row_in_a_million_is_found():
     # Change `amount` only: keep the generated `status` so exactly one column
     # moves and the report can be checked column by column.
     changed = {key: ("999.99", SyntheticTable(1)._generated(key)[1])}
-    result, a, b = run(SyntheticTable(1_000_000), SyntheticTable(1_000_000, changed=changed))
+    result, a, b = run(
+        SyntheticTable(1_000_000), SyntheticTable(1_000_000, changed=changed)
+    )
 
     assert kinds(result) == [(key, "different")]
     d = result.diffs[0]
@@ -164,7 +166,10 @@ def test_all_four_difference_kinds_at_once():
     )
     b_table = SyntheticTable(
         200_000,
-        changed={13: ("1.00", "\\N"), 120_455: ("0.01", "status-2")},  # ... NULL, and a changed value
+        changed={
+            13: ("1.00", "\\N"),
+            120_455: ("0.01", "status-2"),
+        },  # ... NULL, and a changed value
     )
     result, _, _ = run(a_table, b_table)
 
@@ -217,7 +222,9 @@ def test_no_false_positives_on_a_dense_run_of_differences():
 @pytest.mark.parametrize("n", [10_000, 100_000, 1_000_000, 10_000_000])
 def test_query_count_grows_logarithmically_not_linearly(n: int):
     """One changed row, tables from 10k to 10M. Queries must barely move."""
-    result, _, _ = run(SyntheticTable(n), SyntheticTable(n, changed={n // 3: ("0.00", "x")}))
+    result, _, _ = run(
+        SyntheticTable(n), SyntheticTable(n, changed={n // 3: ("0.00", "x")})
+    )
     assert len(result.diffs) == 1
     assert result.stats.queries <= 24, (
         f"{n:,} rows took {result.stats.queries} queries; a logarithmic walk "
@@ -228,7 +235,9 @@ def test_query_count_grows_logarithmically_not_linearly(n: int):
 def test_rows_downloaded_stays_a_tiny_fraction_of_the_table():
     """Finding one row must not drag the table across the network."""
     n = 1_000_000
-    result, _, _ = run(SyntheticTable(n), SyntheticTable(n, changed={500_001: ("0.00", "x")}))
+    result, _, _ = run(
+        SyntheticTable(n), SyntheticTable(n, changed={500_001: ("0.00", "x")})
+    )
     fraction = result.stats.rows_downloaded / n
     assert fraction < 0.01, f"downloaded {fraction:.2%} of the table"
 
@@ -253,8 +262,12 @@ def test_bisection_factor_changes_the_shape_of_the_walk():
     """A wider fan-out means fewer levels, and must not change the answer."""
     n = 500_000
     changed = {n // 2: ("0.00", "x")}
-    wide, _, _ = run(SyntheticTable(n), SyntheticTable(n, changed=changed), bisection_factor=256)
-    narrow, _, _ = run(SyntheticTable(n), SyntheticTable(n, changed=changed), bisection_factor=2)
+    wide, _, _ = run(
+        SyntheticTable(n), SyntheticTable(n, changed=changed), bisection_factor=256
+    )
+    narrow, _, _ = run(
+        SyntheticTable(n), SyntheticTable(n, changed=changed), bisection_factor=2
+    )
 
     assert len(wide.diffs) == len(narrow.diffs) == 1
     # A wider fan-out means fewer levels, so fewer round trips.
@@ -276,13 +289,17 @@ def test_two_empty_tables_match():
 
 def test_an_empty_side_reports_every_row_as_only_in_the_other():
     """A dropped table is every row missing, not an error."""
-    result, _, _ = run(DictTable(COLS, {1: ("1.00", "a"), 2: ("2.00", "b")}), DictTable(COLS, {}))
+    result, _, _ = run(
+        DictTable(COLS, {1: ("1.00", "a"), 2: ("2.00", "b")}), DictTable(COLS, {})
+    )
     assert kinds(result) == [(1, "only_in_a"), (2, "only_in_a")]
 
 
 def test_a_single_row_table():
     """The smallest possible comparison still narrows to the changed column."""
-    result, _, _ = run(DictTable(COLS, {5: ("1.00", "a")}), DictTable(COLS, {5: ("1.00", "b")}))
+    result, _, _ = run(
+        DictTable(COLS, {5: ("1.00", "a")}), DictTable(COLS, {5: ("1.00", "b")})
+    )
     assert kinds(result) == [(5, "different")]
     assert result.diffs[0].columns == ["status"]
 
@@ -290,7 +307,9 @@ def test_a_single_row_table():
 def test_negative_and_zero_keys_are_handled():
     """Keys below zero are ordinary; the bucket arithmetic must not assume otherwise."""
     a_table = DictTable(COLS, {-100: ("1.00", "a"), 0: ("2.00", "b"), 100: ("3.00", "c")})
-    b_table = DictTable(COLS, {-100: ("1.00", "a"), 0: ("2.00", "CHANGED"), 100: ("3.00", "c")})
+    b_table = DictTable(
+        COLS, {-100: ("1.00", "a"), 0: ("2.00", "CHANGED"), 100: ("3.00", "c")}
+    )
     result, _, _ = run(a_table, b_table)
     assert kinds(result) == [(0, "different")]
 
@@ -315,6 +334,7 @@ def test_an_empty_bucket_on_one_side_only_is_not_treated_as_a_match():
 
 def test_duplicate_keys_are_refused():
     """A non-unique key is refused rather than answered wrongly."""
+
     class Dupes(DictTable):
         def key_stats(self):
             """Report more rows than distinct keys, as a duplicated key would."""
@@ -530,9 +550,7 @@ def test_unmapped_types_are_flagged():
     """A type nobody mapped is compared as raw text, and the report says so."""
     a_cols = [Column("payload", LogicalType.UNKNOWN, "json")]
     b_cols = [Column("payload", LogicalType.UNKNOWN, "json")]
-    result, _, _ = run(
-        DictTable(a_cols, {1: ("{}",)}), DictTable(b_cols, {1: ("{}",)})
-    )
+    result, _, _ = run(DictTable(a_cols, {1: ("{}",)}), DictTable(b_cols, {1: ("{}",)}))
     assert any("unmapped types" in w and "payload" in w for w in result.warnings)
 
 
@@ -614,6 +632,7 @@ def test_an_interrupt_cancels_both_sides_and_propagates():
     explicit cancel the pool's shutdown then waits for those queries - which on
     the long diff someone actually wants to abort is the entire problem.
     """
+
     class Interrupting(FakeDialect):
         def __init__(self, *args, raise_on_checksums=False, **kwargs):
             """Record whether cancel was called, so the test can assert on it."""
@@ -644,6 +663,7 @@ def test_an_interrupt_cancels_both_sides_and_propagates():
 
 def test_a_failing_cancel_does_not_replace_the_real_error():
     """Diagnosing an interrupt must never lose the interrupt."""
+
     class Broken(FakeDialect):
         def cancel(self):
             """Record the cancellation instead of performing one."""
@@ -757,8 +777,9 @@ def test_a_timezone_aware_column_against_a_naive_one_is_flagged():
     # DuckDB reports the same thing in upper case.
     result, _, _ = run(
         DictTable(naive, {1: ("x",)}),
-        DictTable([Column("ts", LogicalType.TIMESTAMP, "TIMESTAMP WITH TIME ZONE")],
-                  {1: ("x",)}),
+        DictTable(
+            [Column("ts", LogicalType.TIMESTAMP, "TIMESTAMP WITH TIME ZONE")], {1: ("x",)}
+        ),
     )
     assert any("timezone-aware on side B" in w for w in result.warnings)
 
@@ -828,6 +849,7 @@ def test_a_bucket_collision_cannot_merge_two_rows():
     and fetches both behave as if there is one bucket, which is the worst case
     a real collision could ever produce.
     """
+
     class TotalCollision(FakeDialect):
         """A dialect in which every key hashes to bucket zero."""
 
@@ -908,8 +930,8 @@ def test_columns_and_key_match_across_engines_that_fold_case_differently():
     no usable key - the headline comparison this tool exists for.
     """
     rows = {1: ("10", "ok"), 2: ("20", "paid"), 3: ("30", "void")}
-    upper = _cased(["AMOUNT", "STATUS"], rows, "ID", "A")   # Snowflake-style
-    lower = _cased(["amount", "status"], rows, "id", "B")   # Postgres-style
+    upper = _cased(["AMOUNT", "STATUS"], rows, "ID", "A")  # Snowflake-style
+    lower = _cased(["amount", "status"], rows, "id", "B")  # Postgres-style
 
     # Identical data, differently-cased identifiers -> identical, zero download.
     same = diff(upper, lower, "t", "t", "id")
@@ -929,8 +951,10 @@ def test_two_columns_differing_only_in_case_are_refused():
     """A table with `Col` and `col` cannot be folded unambiguously, so parity
     refuses it with a clear message rather than silently dropping one.
     """
-    cols = [Column("Amount", LogicalType.STRING, "varchar"),
-            Column("amount", LogicalType.STRING, "varchar")]
+    cols = [
+        Column("Amount", LogicalType.STRING, "varchar"),
+        Column("amount", LogicalType.STRING, "varchar"),
+    ]
     a = FakeDialect(DictTable(cols, {1: ("a", "b")}), side="A")
     b = FakeDialect(DictTable(list(COLS), {1: ("a", "b")}), side="B")
     with pytest.raises(ValueError, match="differ only in case"):

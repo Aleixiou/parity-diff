@@ -56,9 +56,9 @@ def test_normalize_renders_each_logical_type():
         LogicalType.INTEGER: 'cast("c" as varchar)',
         LogicalType.DECIMAL: 'cast(cast("c" as number(38,6)) as varchar)',
         LogicalType.FLOAT: 'cast(cast("c" as number(38,6)) as varchar)',
-        LogicalType.BOOLEAN: 'case when "c" then \'true\' when not "c" then \'false\' end',
-        LogicalType.DATE: 'to_char("c", \'YYYY-MM-DD\')',
-        LogicalType.TIMESTAMP: 'to_char("c", \'YYYY-MM-DD HH24:MI:SS.FF6\')',
+        LogicalType.BOOLEAN: "case when \"c\" then 'true' when not \"c\" then 'false' end",
+        LogicalType.DATE: "to_char(\"c\", 'YYYY-MM-DD')",
+        LogicalType.TIMESTAMP: "to_char(\"c\", 'YYYY-MM-DD HH24:MI:SS.FF6')",
         LogicalType.STRING: 'cast("c" as varchar)',
         LogicalType.UNKNOWN: 'cast("c" as varchar)',
     }
@@ -72,7 +72,9 @@ def test_map_type_splits_number_by_scale_and_maps_the_rest():
     assert map_type_snowflake("NUMBER", 0) is LogicalType.INTEGER
     assert map_type_snowflake("NUMBER(38,0)", 0) is LogicalType.INTEGER
     assert map_type_snowflake("NUMBER", 2) is LogicalType.DECIMAL
-    assert map_type_snowflake("NUMBER", None) is LogicalType.DECIMAL  # no scale -> not integer
+    assert (
+        map_type_snowflake("NUMBER", None) is LogicalType.DECIMAL
+    )  # no scale -> not integer
     assert map_type_snowflake("DECIMAL", 6) is LogicalType.DECIMAL
     assert map_type_snowflake("INT", 0) is LogicalType.INTEGER
     assert map_type_snowflake("FLOAT", None) is LogicalType.FLOAT

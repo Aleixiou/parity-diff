@@ -67,42 +67,58 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--b", required=True, metavar="CONN", help="side B connection string")
     d.add_argument("--b-table", required=True, metavar="TABLE", help="side B table")
     d.add_argument(
-        "--key", required=True, metavar="COL[,COL...]",
+        "--key",
+        required=True,
+        metavar="COL[,COL...]",
         help="the column(s) that identify a row. One integer column is used "
-             "directly; a uuid, a text key or several columns together are "
-             "hashed so the key space can be bisected, and rows are still "
-             "reported by their real key.",
+        "directly; a uuid, a text key or several columns together are "
+        "hashed so the key space can be bisected, and rows are still "
+        "reported by their real key.",
     )
     d.add_argument(
-        "--columns", metavar="a,b,c",
+        "--columns",
+        metavar="a,b,c",
         help="compare only these columns (default: every column both sides share)",
     )
     d.add_argument("--exclude", metavar="x,y", help="skip these columns")
     d.add_argument(
-        "--bisection-factor", type=int, default=32, metavar="N",
+        "--bisection-factor",
+        type=int,
+        default=32,
+        metavar="N",
         help="key-range buckets per level (default: 32)",
     )
     d.add_argument(
-        "--threshold", type=int, default=10_000, metavar="N",
+        "--threshold",
+        type=int,
+        default=10_000,
+        metavar="N",
         help="stop bisecting and download once a differing range holds at most "
-             "N rows (default: 10000)",
+        "N rows (default: 10000)",
     )
     d.add_argument(
-        "--float-scale", type=int, default=6, metavar="N",
+        "--float-scale",
+        type=int,
+        default=6,
+        metavar="N",
         help="decimal places at which floats and decimals are compared "
-             "(default: 6). Both sides always use the same value.",
+        "(default: 6). Both sides always use the same value.",
     )
     d.add_argument(
-        "--max-diffs", type=int, default=DEFAULT_MAX_DIFFS, metavar="N",
+        "--max-diffs",
+        type=int,
+        default=DEFAULT_MAX_DIFFS,
+        metavar="N",
         help=f"stop after N differences (default: {DEFAULT_MAX_DIFFS:,}; 0 for "
-             f"no limit). The result is then explicitly marked partial - it "
-             f"does not mean the rest matched. The default exists because each "
-             f"difference costs memory, so two tables that share nothing would "
-             f"otherwise exhaust it rather than answering.",
+        f"no limit). The result is then explicitly marked partial - it "
+        f"does not mean the rest matched. The default exists because each "
+        f"difference costs memory, so two tables that share nothing would "
+        f"otherwise exhaust it rather than answering.",
     )
     d.add_argument("--json", action="store_true", help="machine-readable output")
     d.add_argument(
-        "--quiet", action="store_true",
+        "--quiet",
+        action="store_true",
         help="print nothing; rely on the exit code",
     )
     return parser
@@ -207,8 +223,7 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         )
     elif result.diffs:
         headline = (
-            f"{sym['bad']} {_plural(len(result.diffs), 'difference')} "
-            f"in {total:,} rows"
+            f"{sym['bad']} {_plural(len(result.diffs), 'difference')} in {total:,} rows"
         )
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
@@ -355,7 +370,8 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
         a = get_dialect(args.a, side="A", float_scale=args.float_scale)
         b = get_dialect(args.b, side="B", float_scale=args.float_scale)
         result = diff(
-            a, b,
+            a,
+            b,
             a_table=args.a_table,
             b_table=args.b_table,
             # Comma-separated for composite keys; a single name is just a

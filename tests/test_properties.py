@@ -107,7 +107,9 @@ def test_result_is_invariant_to_the_tuning_knobs(a, b, bisection_factor, thresho
     Fan-out and download-threshold are performance dials. If either changes
     *which* rows are reported, the walk is wrong.
     """
-    assert _kinds(_run(a, b, bisection_factor=bisection_factor, threshold=threshold)) == _oracle(a, b)
+    assert _kinds(
+        _run(a, b, bisection_factor=bisection_factor, threshold=threshold)
+    ) == _oracle(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +175,7 @@ def test_excluding_every_differing_column_yields_identical(a, b):
     """Metamorphic: a diff driven only by column values disappears when those
     columns are excluded. Only key-presence differences can remain."""
     result = _run(a, b, exclude=["a", "b"])
-    presence_only = sorted(
-        (k, kind) for k, kind in _oracle(a, b) if kind != "different"
-    )
+    presence_only = sorted((k, kind) for k, kind in _oracle(a, b) if kind != "different")
     assert _kinds(result) == presence_only
 
 

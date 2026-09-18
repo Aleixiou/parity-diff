@@ -162,4 +162,3 @@ class DuckDBDialect(Dialect):
         """Sum row hashes without overflowing, and return 0 for an empty group."""
         # DECIMAL(38,0) holds sums far beyond any realistic row count * 2^60.
         return f"coalesce(sum(cast(({expr}) as decimal(38,0))), 0)"
-

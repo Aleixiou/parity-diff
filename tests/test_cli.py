@@ -100,9 +100,17 @@ def diff_args(a: str, b: str, *extra: str) -> list[str]:
     """The argument list for a diff between two DuckDB files."""
     return [
         "diff",
-        "--a", f"duckdb:///{a}", "--a-table", "main.orders",
-        "--b", f"duckdb:///{b}", "--b-table", "main.orders",
-        "--key", "id", *extra,
+        "--a",
+        f"duckdb:///{a}",
+        "--a-table",
+        "main.orders",
+        "--b",
+        f"duckdb:///{b}",
+        "--b-table",
+        "main.orders",
+        "--key",
+        "id",
+        *extra,
     ]
 
 
@@ -150,9 +158,16 @@ def test_an_unknown_table_names_the_side(base):
     """A wrong table name says which of the two sides was wrong."""
     code, out, err = run_cli(
         "diff",
-        "--a", f"duckdb:///{base}", "--a-table", "main.orders",
-        "--b", f"duckdb:///{base}", "--b-table", "main.nope",
-        "--key", "id",
+        "--a",
+        f"duckdb:///{base}",
+        "--a-table",
+        "main.orders",
+        "--b",
+        f"duckdb:///{base}",
+        "--b-table",
+        "main.nope",
+        "--key",
+        "id",
     )
     assert code == EXIT_ERROR
     assert "side B" in err and "nope" in err
@@ -202,9 +217,16 @@ def test_an_unsupported_scheme_exits_two(base):
     """An engine nobody wrote a dialect for is an error, not a difference."""
     code, out, err = run_cli(
         "diff",
-        "--a", "mysql://user@host/db", "--a-table", "t",
-        "--b", f"duckdb:///{base}", "--b-table", "main.orders",
-        "--key", "id",
+        "--a",
+        "mysql://user@host/db",
+        "--a-table",
+        "t",
+        "--b",
+        f"duckdb:///{base}",
+        "--b-table",
+        "main.orders",
+        "--key",
+        "id",
     )
     assert code == EXIT_ERROR
     assert "mysql" in err
@@ -323,7 +345,10 @@ def test_json_lists_the_columns_actually_compared(base):
     code, out, _ = run_cli(*diff_args(base, base, "--exclude", "note,status", "--json"))
     payload = json.loads(out)
     assert payload["columns_compared"] == [
-        "amount", "created_at", "customer_id", "is_refunded"
+        "amount",
+        "created_at",
+        "customer_id",
+        "is_refunded",
     ]
 
 
@@ -493,7 +518,8 @@ def test_output_survives_a_legacy_codepage_stream():
     from parity.types import Column, DiffResult, DiffStats, LogicalType
 
     result = DiffResult(
-        diffs=[], stats=DiffStats(rows_compared_a=10, rows_compared_b=10),
+        diffs=[],
+        stats=DiffStats(rows_compared_a=10, rows_compared_b=10),
         columns=[Column("x", LogicalType.STRING, "varchar")],
     )
     buffer = _io.TextIOWrapper(_io.BytesIO(), encoding="cp1252", newline="")
@@ -511,7 +537,8 @@ def test_unicode_glyphs_are_used_when_the_stream_can_encode_them():
     from parity.types import Column, DiffResult, DiffStats, LogicalType
 
     result = DiffResult(
-        diffs=[], stats=DiffStats(rows_compared_a=10, rows_compared_b=10),
+        diffs=[],
+        stats=DiffStats(rows_compared_a=10, rows_compared_b=10),
         columns=[Column("x", LogicalType.STRING, "varchar")],
     )
     buffer = _io.TextIOWrapper(_io.BytesIO(), encoding="utf-8", newline="")
@@ -593,8 +620,6 @@ def test_max_diffs_zero_means_no_limit(base, tmp_path):
     con.execute("update orders set status = 'CHANGED'")
     con.close()
 
-    payload = json.loads(
-        run_cli(*diff_args(base, path, "--max-diffs", "0", "--json"))[1]
-    )
+    payload = json.loads(run_cli(*diff_args(base, path, "--max-diffs", "0", "--json"))[1])
     assert payload["difference_count"] == 5_000
     assert payload["truncated"] is False

@@ -218,9 +218,9 @@ def test_a_boolean_against_a_tinyint_is_flagged_not_hidden(mysql_url, tmp_path):
     b = open_duckdb(duck_path, side="B")
     try:
         result = diff(a, b, "flags", "main.flags", "id")
-        assert any(
-            "flag" in w and "tinyint" in w.lower() for w in result.warnings
-        ), result.warnings
+        assert any("flag" in w and "tinyint" in w.lower() for w in result.warnings), (
+            result.warnings
+        )
     finally:
         a.close()
         b.close()

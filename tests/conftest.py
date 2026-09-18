@@ -22,6 +22,7 @@ def deep_examples(n: int) -> int:
     """Scale a Hypothesis `max_examples` by the PARITY_DEEP factor (default 1)."""
     return n * DEEP
 
+
 #: CLAUDE.md section 7 documents a Docker container on port 55432. A native
 #: install on 5432 is equally valid, so the endpoint is configurable.
 PG_URL = os.environ.get(
@@ -67,10 +68,12 @@ def _mysql_available() -> tuple[bool, str]:
 
         u = urlparse(MYSQL_URL)
         mysql.connector.connect(
-            host=u.hostname or "127.0.0.1", port=u.port or 3306,
+            host=u.hostname or "127.0.0.1",
+            port=u.port or 3306,
             user=unquote(u.username) if u.username else None,
             password=unquote(u.password) if u.password else None,
-            database=u.path.lstrip("/") or None, connection_timeout=5,
+            database=u.path.lstrip("/") or None,
+            connection_timeout=5,
         ).close()
     except Exception as exc:  # pragma: no cover - depends on local services
         return False, f"no MySQL at {MYSQL_URL}: {type(exc).__name__}"
