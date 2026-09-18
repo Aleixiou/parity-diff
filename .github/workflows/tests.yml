@@ -24,7 +24,11 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -e ".[all]" mypy ruff
+      - name: install
+        # ruff is pinned: an unpinned formatter would turn any upstream style
+        # change into a red build on an unrelated PR. Bump it deliberately, in
+        # a commit that reformats the tree with the new version.
+        run: pip install -e ".[all]" mypy ruff==0.16.6
 
       - name: ruff
         run: ruff check src tests demo

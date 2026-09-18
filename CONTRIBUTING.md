@@ -146,11 +146,15 @@ That discipline is what caught the boolean NULL bug in point 3 above.
 ## Running the checks
 
 ```bash
-pip install -e ".[all]" pytest mypy ruff
+pip install -e ".[all]" pytest mypy ruff==0.16.6
 pytest
 ruff check src tests demo
+ruff format --check src tests demo
 mypy src/parity --strict --ignore-missing-imports
 ```
+
+The ruff version is pinned to the one CI uses, so `ruff format` here produces
+exactly what `ruff format --check` there demands.
 
 CI runs the static checks first, because they take seconds where the test
 matrix takes minutes. `mypy --strict` is what turns "type hints everywhere"
