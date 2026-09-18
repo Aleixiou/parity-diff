@@ -29,6 +29,12 @@ jobs:
       - name: ruff
         run: ruff check src tests demo
 
+      - name: ruff format
+        # `ruff check` never enforced layout, so the formatter drifted until 20
+        # of 27 files would have been reformatted - enough that a contributor
+        # running it would bury their own change in the diff.
+        run: ruff format --check src tests demo
+
       - name: mypy --strict
         # CLAUDE.md section 6 promises type hints everywhere. Strict is what
         # makes that a fact rather than an aspiration.
