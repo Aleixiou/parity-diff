@@ -143,6 +143,48 @@ tokens `Infinity`, `-Infinity`, `NaN`. Note PostgreSQL cannot detect NaN with
 test must be `c = 'NaN'::float8`. DECIMAL needs no guard — PostgreSQL `numeric`
 renders NaN as text on its own and DuckDB `DECIMAL` cannot hold one.
 
+**A DECIMAL too wide for the rendering cast must raise, never clamp**
+(verified 2026-11-02 against MySQL 8.0.42, PostgreSQL 18.4, DuckDB 1.5.5 and
+live BigQuery; `tests/test_decimal_range.py`). MySQL's `CAST(x AS
+DECIMAL(p,s))` does not fail when `x` does not fit: inside a SELECT, in every
+sql_mode including `''` and the strict default, it returns the type's maximum
+and leaves only warning 1264. MySQL used to render DECIMAL as
+`decimal(38,6)`, so every value of 1e32 or more became
+`99999999999999999999999999999999.999999` (negatives the mirror image): 1e32
+and 5e40 on MySQL, against a PostgreSQL `numeric` or a DuckDB `decimal(38,6)`
+really holding that maximum, diffed as **identical** - a false match,
+reproduced end to end MySQL↔PostgreSQL, MySQL↔DuckDB and MySQL↔MySQL. At
+`--float-scale 20` the same cast clamped from 1e18. The MySQL DECIMAL
+expression is now
+
+```
+case when abs(c) > 9…9.9…9            -- 10^(65-s) - 10^-s: decimal(65,s)'s maximum
+     then cast(uuid_to_bin(concat('parity: DECIMAL value ', c, ' in column …')) as char)
+     else cast(cast(c as decimal(65,s)) as char) end
+```
+
+- Widening 38 → 65 (MySQL's maximum) renders values up to 65 - s integer
+  digits exactly. The text never depended on the cast's precision, so every
+  value the old cast held renders byte-identically - verified at scales 0, 6,
+  20 and 30 - and **no checksum moves**.
+- The guard is exact: no MySQL DECIMAL has more than 65 digits, and a value
+  could only round across the bound with 66. So it fires on exactly the
+  values the cast would clamp.
+- `UUID_TO_BIN` of a non-UUID raises error 1411 even in a SELECT (most errors
+  there are downgraded to warnings) and quotes its argument, cut at 128
+  characters - hence the value first. `MySQLDialect.query` re-raises it as an
+  error naming the side, the column and the exact value.
+- MySQL's DECIMAL scale tops out at 30; above it the dialect refuses before any
+  query, naming side and column.
+
+The other engines do not clamp. DuckDB's `decimal(38,s)` cast raises `value is
+out of range` (and DuckDB columns hold at most 38 digits anyway). PostgreSQL's
+`round(numeric, s)` is exact at any magnitude (it caps the scale at 16,383,
+past any stored value's scale). BigQuery's `ROUND` raises `numeric overflow`
+when rounding carries past NUMERIC's or BIGNUMERIC's maximum, and its `FORMAT`
+prints NUMERIC exactly. Snowflake, by its documentation only, raises "Numeric
+value out of range" when a cast to `number(38,s)` does not fit.
+
 **FLOAT canonical form** (verified 2026-11-02 against PostgreSQL 18.4, DuckDB
 1.5.5, MySQL 8.0.42 and live BigQuery; `tests/test_float_canonical.py`,
 `demo/float_agreement.py`). The definition is the Python function

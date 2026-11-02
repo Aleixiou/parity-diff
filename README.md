@@ -246,6 +246,12 @@ stated plainly rather than buried.
   stops with an error naming the value rather than rounding it approximately.
   (This replaces the old DuckDB-only limit of 1e32, which PostgreSQL did not
   share.)
+- **DECIMAL values too wide to render at the float scale are refused**, never
+  rounded or clamped. The limit is the engine's widest decimal minus the
+  scale: on MySQL 65 − s integer digits (59 at the default scale; MySQL also
+  caps `--float-scale` at 30 for DECIMAL columns), on DuckDB 38 − s, on
+  BigQuery the column type's own range. PostgreSQL has no limit. The error
+  names the side, the column and the value.
 - **Snowflake FLOAT columns are not verified** against that canonical form —
   no account was available when it was defined — and every run comparing one
   prints a warning saying so. Snowflake DECIMAL columns are unaffected.

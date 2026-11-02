@@ -33,6 +33,21 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ### Fixed
 
+- **A MySQL DECIMAL value of 1e32 or more can no longer compare equal to a
+  different one.** MySQL rendered DECIMAL through `CAST(c AS DECIMAL(38,6))`,
+  and inside a SELECT MySQL does not raise when a value does not fit — in
+  every sql_mode it returns the type's maximum and leaves a warning. So every
+  value from 1e32 up rendered `99999999999999999999999999999999.999999`: 1e32
+  and 5e40 on MySQL diffed as identical to each other, and to a PostgreSQL or
+  DuckDB row really holding that maximum (reproduced end to end against all
+  three; at `--float-scale 20` the clamp started at 1e18). The cast is now
+  `DECIMAL(65,s)`, MySQL's widest, so values up to 65 − s integer digits
+  render exactly; past that a guard raises error 1411 through `UUID_TO_BIN`,
+  re-raised as an error naming the side, the column and the value. MySQL's
+  maximum DECIMAL scale, 30, is refused up front for DECIMAL columns. Text for
+  every value the old cast could hold is byte-identical, so no checksum moves.
+  DuckDB, PostgreSQL and BigQuery were checked for the same bug and do not
+  clamp: they raise, or render exactly.
 - **FLOAT columns now render identically on every verified engine, and a real
   change at the last compared decimal can no longer be hidden.** PostgreSQL
   rendered a double through `float8::numeric` (15 significant digits) and

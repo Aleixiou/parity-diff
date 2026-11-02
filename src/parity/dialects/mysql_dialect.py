@@ -21,6 +21,7 @@ each of which the encoding tests verify, are:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -32,6 +33,16 @@ from parity.dialects.base import (
     sql_literal,
 )
 from parity.types import Column, LogicalType
+
+#: MySQL's widest DECIMAL: 65 significant digits, at most 30 after the point.
+#: A DECIMAL column can never hold more, which is what makes the out-of-range
+#: guard in `_decimal_text` exact.
+MYSQL_MAX_DECIMAL_DIGITS = 65
+MYSQL_MAX_DECIMAL_SCALE = 30
+
+#: Leads the text a too-wide DECIMAL raises with, so `query` can recognise it.
+DECIMAL_RANGE_MARKER = "parity: DECIMAL value "
+_DECIMAL_RANGE_ERROR = re.compile(r"'(" + re.escape(DECIMAL_RANGE_MARKER) + r".*)' for")
 
 
 class MySQLDialect(Dialect):
@@ -109,10 +120,27 @@ class MySQLDialect(Dialect):
 
     def query(self, sql: str) -> list[tuple[Any, ...]]:
         """Run `sql` and return every row as a list of tuples."""
+        import mysql.connector
+
         cur = self._conn.cursor()
         try:
             cur.execute(sql)
             return list(cur.fetchall())
+        except mysql.connector.Error as exc:
+            # The out-of-range DECIMAL guard (`_decimal_text`) raises through
+            # UUID_TO_BIN; say what actually happened, and on which side.
+            found = _DECIMAL_RANGE_ERROR.search(str(exc))
+            if found is None:
+                raise
+            s = self.float_scale
+            raise self._err(
+                f"{found.group(1)} does not fit DECIMAL({MYSQL_MAX_DECIMAL_DIGITS},"
+                f"{s}), the widest type MySQL can render it in at float_scale {s}. "
+                "MySQL would clamp it to that type's maximum without an error, "
+                "so two different values could compare equal; the comparison is "
+                "refused instead. A smaller --float-scale leaves more integer "
+                "digits."
+            ) from exc
         finally:
             cur.close()
 
@@ -159,8 +187,9 @@ class MySQLDialect(Dialect):
     def normalize(self, column: Column) -> str:
         """Render one column as canonical text, null-safe.
 
-        DECIMAL casts to DECIMAL(38, scale) then to text, as DuckDB does, so
-        `1.5` becomes `'1.500000'`; FLOAT follows the shared canonical float
+        DECIMAL casts to DECIMAL(65, scale) then to text, so `1.5` becomes
+        `'1.500000'`, and raises rather than clamp a value that does not fit
+        (see `_decimal_text`); FLOAT follows the shared canonical float
         form (see the branch). Every branch ends inside the coalesce, so NULL
         always becomes the sentinel.
         """
@@ -169,7 +198,7 @@ class MySQLDialect(Dialect):
         if t is LogicalType.INTEGER:
             expr = f"cast({c} as char)"
         elif t is LogicalType.DECIMAL:
-            expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as char)"
+            expr = self._decimal_text(column, c)
         elif t is LogicalType.FLOAT:
             # Widen first: a single-precision column (`real`, FLOAT) is cast to
             # double, which is exact on every engine, so float4 and float8 share
@@ -215,6 +244,56 @@ class MySQLDialect(Dialect):
         else:
             expr = f"cast({c} as char)"
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _decimal_text(self, column: Column, c: str) -> str:
+        """Render a DECIMAL column at the float scale, exactly or not at all.
+
+        MySQL's `CAST(x AS DECIMAL(p,s))` does not raise when `x` does not fit:
+        inside a SELECT, whatever the sql_mode, it *clamps* to the type's
+        largest value and leaves only warning 1264. The original
+        `decimal(38,6)` therefore turned every DECIMAL(65,0) value of 1e32 or
+        more into `99999999999999999999999999999999.999999` (and the negative
+        twin), so 1e32 and 5e40 compared equal - to each other, and to a
+        PostgreSQL or DuckDB row really holding that maximum. Verified as a
+        false match end to end against all three, and again at float_scale 20,
+        where decimal(38,20) clamps from 1e18.
+
+        Two changes close it. The cast widens to `decimal(65,s)`, MySQL's
+        widest, so values up to 65 - s integer digits now render exactly;
+        rendered text does not depend on the cast's precision, so every value
+        the old cast handled renders byte-identically and no checksum moves.
+        And a value that still does not fit raises instead of clamping. The
+        guard compares against the cast's own maximum, 10^(65-s) - 10^-s,
+        which is exact: a value under it could only round past it with 66
+        significant digits, and a value over it could only round down into it
+        with 66, and no MySQL DECIMAL holds more than 65.
+
+        MySQL has no `error()` and a SELECT downgrades most errors to warnings,
+        but UUID_TO_BIN on a non-UUID is a hard error (1411) that quotes its
+        argument. MySQL cuts that quote at 128 characters, so the argument
+        leads with the value (at most 67) and then the column; `query` turns
+        the error into one naming the side and explaining the refusal. The
+        column name goes in as a hex literal, like the NULL sentinel, so no
+        name can break out of it whatever sql_mode does to backslashes.
+        """
+        s = self.float_scale
+        if s > MYSQL_MAX_DECIMAL_SCALE:
+            # MySQL itself refuses with error 1425; say so before any query,
+            # naming the side and column rather than a generated expression.
+            raise self._err(
+                f"DECIMAL column {column.name!r} cannot be compared at "
+                f"float_scale {s}; MySQL's maximum DECIMAL scale is "
+                f"{MYSQL_MAX_DECIMAL_SCALE}"
+            )
+        widest = "9" * (MYSQL_MAX_DECIMAL_DIGITS - s) + ("." + "9" * s if s else "")
+        where = f" in column {column.name!r}".encode()
+        return (
+            f"case when abs({c}) > {widest} "
+            f"then cast(uuid_to_bin(concat('{DECIMAL_RANGE_MARKER}', {c}, "
+            f"convert(0x{where.hex()} using utf8mb4))) as char) "
+            f"else cast(cast({c} as decimal({MYSQL_MAX_DECIMAL_DIGITS},{s})) "
+            f"as char) end"
+        )
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.
