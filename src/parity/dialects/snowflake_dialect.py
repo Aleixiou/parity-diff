@@ -32,7 +32,7 @@ The Snowflake-specific decisions, each confirmed by that run:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
 from parity.dialects.base import Dialect, sql_literal
@@ -100,7 +100,10 @@ class SnowflakeDialect(Dialect):
         cur = self._conn.cursor()
         try:
             cur.execute(sql)
-            return list(cur.fetchall())
+            # The connector's stubs (5.x) type fetchall() as tuples *or* dicts,
+            # because a DictCursor returns dicts. We always use the default
+            # cursor, which returns tuples, so this is a type-only narrowing.
+            return cast("list[tuple[Any, ...]]", list(cur.fetchall()))
         finally:
             cur.close()
 
