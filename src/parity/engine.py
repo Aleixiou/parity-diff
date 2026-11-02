@@ -120,6 +120,9 @@ def _is_tz_aware(column: Column) -> bool:
     `map_type` folds it onto TIMESTAMP by prefix - so the logical type cannot
     tell these apart and the raw name is the only signal there is.
     """
+    if column.tz_aware is not None:
+        # The dialect knew for certain - see `Column.tz_aware`.
+        return column.tz_aware
     return "with time zone" in column.raw_type.lower()
 
 

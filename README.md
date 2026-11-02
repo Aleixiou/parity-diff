@@ -88,6 +88,7 @@ pip install "parity-diff[duckdb]"     # DuckDB only — no other driver pulled i
 pip install "parity-diff[postgres]"   # PostgreSQL only
 pip install "parity-diff[mysql]"      # MySQL only
 pip install "parity-diff[snowflake]"  # Snowflake only
+pip install "parity-diff[bigquery]"   # BigQuery only
 ```
 
 > The PyPI distribution is `parity-diff` — plain `parity` is squatted by an
@@ -103,7 +104,7 @@ imported lazily, so a DuckDB-only user is never made to install `psycopg`.
 parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
             [--columns a,b,c] [--exclude x,y]
             [--bisection-factor 32] [--threshold 10000] [--float-scale 6]
-            [--max-diffs 100] [--json] [--quiet]
+            [--max-diffs 10000] [--json] [--quiet]
 ```
 
 **Exit codes** — this is what makes it a CI check:
@@ -126,10 +127,23 @@ duckdb:///relative/path.duckdb                  (three slashes = relative)
 duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 duckdb:///:memory:
+snowflake://user:password@account/database/schema?warehouse=wh&role=r
+bigquery://project/dataset                      (optional ?location=EU)
 ```
 
 Table names may be schema-qualified. Unqualified names default to `public` on
-PostgreSQL and `main` on DuckDB.
+PostgreSQL and `main` on DuckDB. On BigQuery they default to the dataset in the
+connection string, and a table may also be given as `dataset.table` or
+`project.dataset.table` (to read another project's data while running jobs in
+your own).
+
+BigQuery authenticates with Application Default Credentials — a service
+account via `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default
+login`, impersonation, or the VM's identity — so no secret goes in the
+connection string. The credentials are requested with the read-only
+`bigquery.readonly` scope, under which BigQuery itself refuses any write: the
+tool cannot modify your project even by mistake. The account needs BigQuery Job
+User on the project the jobs run in, and read access to the dataset.
 
 `--json` emits the same content as a machine-readable object, including
 `identical`, `truncated`, per-difference values, and the full stats block.
@@ -241,6 +255,24 @@ stated plainly rather than buried.
   the entire table as changed.
 - Columns present on only one side are skipped with a warning, not treated as
   differences.
+- **A live source table is read at one snapshot on PostgreSQL, MySQL and
+  BigQuery.** PostgreSQL and MySQL run the whole diff in one REPEATABLE READ
+  transaction. BigQuery has no cross-query transaction, so every query reads a
+  base table `FOR SYSTEM_TIME AS OF` the instant of the first one. **A BigQuery
+  view is not pinned** — BigQuery silently ignores time travel on views — so,
+  like every table on Snowflake (READ COMMITTED only), a view that changes
+  during the run can produce differences that never existed at one point in
+  time. Diff the underlying table, or re-run, if the source is busy.
+- **Doubles far from zero round differently on PostgreSQL than on DuckDB and
+  BigQuery.** At 6 decimal places, a double carrying more than ~15 significant
+  digits (roughly, magnitudes above 1e9 with a fractional part, or values a
+  hair from a rounding boundary) is rounded via 15 significant digits by
+  PostgreSQL and via the double multiplied by 10^6 by DuckDB; BigQuery is made
+  to reproduce DuckDB's arithmetic exactly. On such values a PostgreSQL ↔ DuckDB/BigQuery
+  comparison reports a difference that is only rounding. It never hides a real
+  one. Decimal (`numeric`) columns are unaffected.
+- **Interrupting a BigQuery run waits for the in-flight query.** Cancelling a
+  BigQuery job needs a write scope, and read-only was judged worth more.
 
 ## Supported engines
 
@@ -250,7 +282,8 @@ stated plainly rather than buried.
 | DuckDB | supported (tested against 1.5) |
 | MySQL | supported (tested against 8.0) |
 | Snowflake | supported (verified live on AWS; `pip install "parity-diff[snowflake]"`) |
-| BigQuery, Redshift | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
+| BigQuery | supported, unreleased (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
+| Redshift, Databricks | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
 
 ## Scope
 
@@ -273,7 +306,11 @@ pytest
 
 Tests that need PostgreSQL read `PARITY_TEST_PG` (default
 `postgres://parity:parity@127.0.0.1:5432/parity`) and **skip cleanly** when no
-server is reachable — the DuckDB and pure-Python suites still run.
+server is reachable — the DuckDB and pure-Python suites still run. Snowflake
+and BigQuery have no local or CI instance, so their live suites run only when
+`PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY`
+(`bigquery://<project>/<dataset>`) point at a real account; the BigQuery tests
+create and drop their own tables in that dataset.
 
 A disposable PostgreSQL:
 
@@ -298,10 +335,12 @@ way it is. `ROADMAP.md` is what is done and what comes next.
 
 ## Changelog
 
-Latest release **0.2.1** — a generative test suite (property-based, oracle, and
-cross-engine fuzzing) and the correctness fix it surfaced: a same-content
-insert-plus-delete falling in one bucket that could previously read as
-identical. See `CHANGELOG.md` for the full history.
+Latest release **0.2.3** — test-only: a dedicated campaign against the identical
+check (offline logic, every live engine pair, all key types, edge values,
+representation changes) that found no abnormality. 0.2.2 added Snowflake, and
+0.2.1 the generative suite and the same-content insert-plus-delete fix it
+surfaced. BigQuery support is in the `Unreleased` section. See `CHANGELOG.md`
+for the full history.
 
 ## License
 

@@ -37,7 +37,12 @@ your engine has no such view), builds the row text, the per-segment checksum
 query and the small-range fetch, and splits `schema.table`. Two optional hooks
 have sensible defaults — `cancel()` for aborting an in-flight query from
 another thread, and `_exists_but_unreadable()` for engines whose catalog hides
-tables the current role lacks privileges on.
+tables the current role lacks privileges on. Three more exist for engines
+whose SQL departs from the standard, each defaulting to the old behaviour:
+`string_literal()` (BigQuery escapes with backslashes), `int_literal()`
+(BigQuery cannot parse an integer literal past INT64) and `_columns_catalog()`
+(BigQuery's `INFORMATION_SCHEMA` is per dataset). A dialect may also set
+`Column.tz_aware` when its type names do not say `with time zone`.
 
 That comes to roughly 70–85 lines. Read
 `src/parity/dialects/duckdb_dialect.py` first — it is the shortest complete
@@ -124,6 +129,42 @@ is especially likely to spring:
     pinned to one snapshot - a real limitation to document, not hide. None of
     these three showed up in the docs; they surfaced only against a live
     account, which is why the rule below is not negotiable.
+
+BigQuery (unreleased) added more. Each was found by running candidate SQL
+against the live engine next to DuckDB, not by reading the docs:
+
+12. **"Equivalent" rounding expressions are not equivalent.** For FLOAT, every
+    natural BigQuery spelling - `FORMAT('%.6f', x)`, `ROUND(x, 6)`, a cast
+    through NUMERIC or BIGNUMERIC - disagreed with DuckDB on 45-89 of 727
+    sample doubles, because each rounds a different intermediate value. Find
+    out what the reference engine *actually computes* (DuckDB: `x * 10^6` in
+    double precision, rounded half away from zero) and reproduce that. Sweep
+    hundreds of values including halfway cases and magnitudes past 1e15;
+    `1.5 -> 1.500000` passing proves almost nothing. While doing this, note that
+    PostgreSQL and DuckDB already disagree on such doubles (PostgreSQL goes
+    through 15 significant digits), so pick one reference and document it.
+
+13. **Negative zero survives formatting.** `FORMAT('%.6f', -0.0000001)` prints
+    `-0.000000` where the other engines print `0.000000`. Round to the scale
+    *first*, landing on a numeric zero that has no sign.
+
+14. **Formatting helpers can turn NULL into text.** BigQuery's `FORMAT('%t',
+    NULL)` returns the string `'NULL'`, which slips past the `coalesce` and
+    compares equal to a real `'NULL'` - the boolean-`else` bug in a new
+    disguise. Guard with `if(c is null, null, ...)`.
+
+15. **`%Y` may not zero-pad.** Year 999 renders `999` on BigQuery and `0999`
+    elsewhere; BigQuery needs `%E4Y`.
+
+16. **A snapshot clause can be silently ignored.** BigQuery's `FOR SYSTEM_TIME
+    AS OF` pins a base table but is accepted *and ignored* on a view - the
+    query succeeds and reads live data. Test that the pin actually holds (insert
+    mid-walk, count again), and only claim it for objects where it does.
+
+17. **Read-only may be achievable through auth rather than SQL.** BigQuery has
+    no read-only session, but the `bigquery.readonly` OAuth scope makes the
+    server refuse every write - provided queries go through `jobs.query`
+    (`query_and_wait`); `jobs.insert` rejects that scope even for SELECT.
 
 ### Proving it works
 

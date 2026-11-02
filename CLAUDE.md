@@ -77,9 +77,11 @@ The foundation of the whole tool: fold canonical row text into an integer that
 | DuckDB | `cast(('0x' \|\| substr(md5(<text>), 1, 15)) as bigint)` |
 | MySQL | `cast(conv(substr(md5(<text>), 1, 15), 16, 10) as unsigned)` |
 | Snowflake | `floor(md5_number_upper64(<text>) / 16)` |
+| BigQuery | `cast(concat('0x', substr(to_hex(md5(<text>)), 1, 15)) as int64)` |
 
-All four return `648541476951500027` for input `'abc'` - through four different
-paths (bit-cast, hex-cast, CONV, and Snowflake's top-64-bits-then-drop-4), which
+All five return `648541476951500027` for input `'abc'` - through five different
+paths (bit-cast, hex-cast, CONV, Snowflake's top-64-bits-then-drop-4, and
+BigQuery's hex-cast of `to_hex`, since its `md5` returns BYTES), which
 is exactly why a test pins the constant on each. Snowflake has neither a bit
 cast nor `conv`, but `md5_number_upper64` gives the top 64 bits of the digest as
 a number and `floor(.../16)` drops the low 4, leaving the same 60-bit prefix -
@@ -114,6 +116,23 @@ contract. All 17 cases below were verified to agree exactly.
 Verified agreeing values include: `1.5 → "1.500000"`, `-0.125 → "-0.125000"`,
 `1/3 → "0.333333"`, `2024-02-29 13:04:05.123456` round-trips exactly,
 `2024-01-01 00:00:00 → "2024-01-01 00:00:00.000000"`, and full Unicode strings.
+
+**BigQuery** (verified live 2026-11-02 against DuckDB, byte-for-byte over 5,000
+mixed-type rows; `tests/test_bigquery.py`). It has no `concat_ws`, and its
+`cast(numeric as string)` drops trailing zeros, so it needs its own spellings:
+
+| Logical type | BigQuery |
+|---|---|
+| DECIMAL | `format('%.6f', round(c, 6))` (round first, or `format` prints `-0.000000`) |
+| FLOAT (finite) | `format('%.6f', cast(round(c * 1e6) as bignumeric) / bignumeric '1000000')` (reproduces DuckDB's rounding; seven simpler spellings missed on 45-89 of 727 doubles) |
+| DATE | `format_date('%E4Y-%m-%d', c)` (`%Y` prints year 999 as `999`) |
+| DATETIME / TIMESTAMP | `format_datetime('%E4Y-%m-%d %H:%M:%E6S', c)` / `format_timestamp(..., c, 'UTC')` |
+| Row text | `array_to_string([...], chr(31))`, flat - byte-identical to nested `concat_ws` at 130 columns |
+| NULL sentinel | `concat(chr(92), 'N')` |
+
+BigQuery's instant type is plainly `TIMESTAMP` (its naive one is `DATETIME`), the
+opposite of what that name means elsewhere, so the dialect sets
+`Column.tz_aware` explicitly instead of letting the engine infer it from the name.
 
 **Infinity and NaN must be special-cased for FLOAT.** DuckDB cannot cast them
 to DECIMAL at all — `Could not cast value inf to DECIMAL(38,6)` kills the whole
@@ -370,6 +389,14 @@ So the PostgreSQL dialect sets `isolation_level = REPEATABLE_READ` at connect
 time, giving the entire diff one snapshot. DuckDB is opened read-only and needs
 no equivalent.
 
+BigQuery has no multi-statement snapshot, so every read of a **base table** uses
+`FOR SYSTEM_TIME AS OF` the server time captured by the first metadata query -
+verified live: a row inserted mid-walk stays invisible. BigQuery silently ignores
+time travel on a **view** (verified: it returned the live count), so views are read
+live at every level, as on Snowflake (READ COMMITTED only). Documented in the README,
+pinned by a live test. The dialect also requests the `bigquery.readonly` OAuth scope,
+so the server itself refuses any write - verified for INSERT, DELETE, CREATE, DROP.
+
 Two consequences worth knowing:
 
 - The snapshot is taken at the dialect's **first query**, not at connect. A
@@ -400,7 +427,7 @@ for anyone who genuinely wants every row and has the memory for it.
 
 ## 5. Architecture
 
-The whole tool ships in `src/parity/` — dialects, engine and CLI — with 364
+The whole tool ships in `src/parity/` — dialects, engine and CLI — with 415
 tests, `demo/proof.py` as the end-to-end proof, and `demo/benchmark.py` as the
 10M-row one. Read the code before rewriting any of it: several decisions below
 encode findings that were expensive to discover.

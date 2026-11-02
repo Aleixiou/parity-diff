@@ -3,6 +3,56 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
+## Unreleased
+
+### Added
+
+- **BigQuery support** (`pip install "parity-diff[bigquery]"`,
+  `bigquery://project/dataset[?location=EU]`, auth by Application Default
+  Credentials), verified end to end against a live project in the EU region:
+  the hash constant agrees, every row of a 5,000-row mixed-type table renders
+  byte-identically to DuckDB and the full-table checksum matches, a 130-column
+  table and keys at both ends of INT64 compare clean, and the changed-decimal,
+  deleted-row, inserted-row, NULL-vs-`''`, NULL-vs-FALSE and text-key checks
+  each find exactly the planted row. Also diffed live against PostgreSQL
+  through the CLI. The BigQuery-specific SQL: `ARRAY_TO_STRING` stands in for
+  `concat_ws`; the hash is a `0x`-hex INT64 cast of `TO_HEX(MD5(x))`; decimals
+  are `ROUND`ed before `FORMAT('%.6f')` (alone it prints `-0.000000`); floats
+  reproduce DuckDB's own scale-and-round arithmetic, the only one of the eight
+  spellings tried that agreed with DuckDB on all 727 sample doubles; dates use
+  `%E4Y` so year 999 is `0999`; `TIMESTAMP` is rendered in UTC and `DATETIME`
+  as naive; sums and the bucket expression run in `BIGNUMERIC`.
+- **Read-only by construction on BigQuery**: the client requests only the
+  `bigquery.readonly` OAuth scope, under which the server refuses INSERT,
+  DELETE, CREATE, DROP and scripts (verified).
+- **One snapshot on BigQuery**: every query reads a base table `FOR SYSTEM_TIME
+  AS OF` the instant of the first metadata query. Views are not pinned —
+  BigQuery silently ignores time travel on a view, verified — and this is
+  documented as a limitation.
+
+### Changed
+
+- `Column` gained `tz_aware`, so a dialect can state whether a timestamp column
+  is an instant instead of the engine inferring it from `with time zone` in the
+  type name. BigQuery needs it: its instant type is plainly `TIMESTAMP`, which
+  is the *naive* type's name elsewhere, so PostgreSQL `timestamptz` ↔ BigQuery
+  `TIMESTAMP` would have warned falsely and `timestamp` ↔ `TIMESTAMP` not at
+  all. Unset everywhere else, so no existing behaviour moves.
+- Three small `Dialect` hooks, each defaulting to the old behaviour so no
+  other engine's SQL changes: `int_literal` (BigQuery cannot parse an integer
+  literal past INT64, and the key span of a full-range key is 2^64),
+  `string_literal` (BigQuery escapes with backslashes, not doubled quotes), and
+  `_columns_catalog` (BigQuery's `INFORMATION_SCHEMA` is per dataset, and the
+  "did you mean" hint has to look there).
+
+### Documented
+
+- PostgreSQL and DuckDB already disagree on how a 6-place float is rounded for
+  doubles with more than ~15 significant digits or within a hair of a rounding
+  boundary (49 of 727 sampled doubles). The result is a reported difference
+  that is only rounding, never a hidden one; it is now in the README
+  limitations, since BigQuery follows DuckDB's rounding.
+
 ## 0.2.3 — 2026-09-18
 
 ### Internal

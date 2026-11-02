@@ -19,7 +19,7 @@ attacked from every angle it has and did not break.
 
 | | |
 |---|---|
-| Tests | 364; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests skip unless `PARITY_TEST_SNOWFLAKE` points at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
+| Tests | 415; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests and the 15 live BigQuery tests skip unless `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY` point at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
 | Coverage | 96%, with a 95% floor enforced in CI (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
 | CI | ruff, `mypy --strict`, PostgreSQL 16 and 18 + MySQL 8 service containers, Python 3.10 and 3.13, Windows, a DuckDB-only install |
 | Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data. Snowflake verified live: hash constant, a 5,000-row full-table checksum matching DuckDB byte-for-byte, and every planted-difference check |
@@ -37,7 +37,7 @@ Ordered by how much it would change who can use this.
 The first warehouse is shipped, so the tool can finally serve the market it was
 built for — and it has essentially no users. Every item below is speculative
 until someone with a real migration says which one they need. The highest-value
-move is not code: it is posting the launch (see `docs/outreach.md`, now that a
+move is not code: it is posting the launch (now that a
 warehouse exists) and letting the replies pick the next dialect. Building the
 wrong three engines is exactly how the predecessor's maintenance grew expensive.
 
@@ -50,10 +50,19 @@ thing the docs could not predict — case-insensitive identifier matching, since
 Snowflake upper-cases what PostgreSQL and DuckDB lower-case. Proof that the
 dialect abstraction holds against a warehouse, not just OLTP engines.
 
-### 2. The next warehouse — BigQuery, then Redshift / Databricks
+### 2. BigQuery — done (unreleased, on the way to 0.2.4)
 
-BigQuery is the most likely next request and the strongest addition to a
-launch. A dialect is roughly 70–85 lines (`CONTRIBUTING.md` has the contract and
+The second warehouse, verified live the same way: hash constant, a 5,000-row
+checksum matching DuckDB byte for byte, every planted-difference check, a
+130-column table and keys spanning all of INT64. Base tables are pinned to one
+snapshot with time travel; views cannot be, and say so.
+
+### 2b. The next engine — by demand
+
+Public evidence of live migrations in Switzerland, Germany and Austria points
+mostly at **SQL Server / Microsoft Fabric, Databricks and Oracle** as sources or
+targets — none supported yet. Those are the strongest candidates, ahead of
+Redshift. A dialect is roughly 70–85 lines (`CONTRIBUTING.md` has the contract and
 the traps), and — as Snowflake showed — it is not done until it passes against
 the *real* engine, which is where the one unforeseeable quirk always surfaces.
 `data-diff` shipped extras for twelve engines; every one is a table someone

@@ -125,14 +125,46 @@ class Dialect(ABC):
         """
         schema, name = self.split_table(table, self.default_schema)
         rows = self.query(
-            "select column_name, data_type from information_schema.columns "
-            f"where table_schema = {sql_literal(schema)} "
-            f"and table_name = {sql_literal(name)} "
+            f"select column_name, data_type from {self._columns_catalog(schema)} "
+            f"where table_schema = {self.string_literal(schema)} "
+            f"and table_name = {self.string_literal(name)} "
             "order by ordinal_position"
         )
         if not rows:
             raise self._err(self._not_found(table, schema, name))
         return [Column(r[0], map_type(r[1]), r[1]) for r in rows]
+
+    def _columns_catalog(self, schema: str) -> str:
+        """The relation that lists columns for tables in `schema`.
+
+        One global `information_schema.columns` on PostgreSQL, DuckDB, MySQL
+        and Snowflake. BigQuery has no global one: its `INFORMATION_SCHEMA`
+        lives inside each dataset (`` `project.dataset`.INFORMATION_SCHEMA ``),
+        and the region-wide view needs project-level permissions a narrowly
+        granted service account does not hold. A hook rather than a second
+        copy of `_not_found`, so the near-miss hint keeps working there too.
+        """
+        return "information_schema.columns"
+
+    def string_literal(self, value: str) -> str:
+        """Quote a schema or table name as a string literal for this engine.
+
+        Standard SQL doubles an embedded quote, which is `sql_literal`.
+        BigQuery does not accept that - it escapes with a backslash, and treats
+        a bare backslash as the start of an escape sequence - so it overrides
+        this. Only ever used for names, never for user data.
+        """
+        return sql_literal(value)
+
+    def int_literal(self, value: int) -> str:
+        """Render an integer the bucket expression needs as a SQL literal.
+
+        Plain digits everywhere but BigQuery, which refuses to *parse* an
+        integer literal outside INT64 ("Invalid integer literal") - and the
+        precomputed key span of a range as wide as bigint is up to 2^64. Every
+        other engine reads such a literal as numeric/hugeint on its own.
+        """
+        return str(value)
 
     def _not_found(self, table: str, schema: str, name: str) -> str:
         """Explain a missing table, and point at a case mismatch if that is it.
@@ -154,8 +186,8 @@ class Dialect(ABC):
         try:
             near = self.query(
                 "select distinct table_schema, table_name "
-                "from information_schema.columns "
-                f"where lower(table_name) = lower({sql_literal(name)})"
+                f"from {self._columns_catalog(schema)} "
+                f"where lower(table_name) = lower({self.string_literal(name)})"
             )
         except Exception:  # noqa: BLE001 - diagnosing an error must never replace it
             return message
@@ -455,8 +487,10 @@ class Dialect(ABC):
         # dominated by MD5 over every row, not by integer arithmetic. Paying a
         # couple of percent to delete a second code path is the right trade in
         # the one function whose off-by-one would make the walker skip rows.
-        offset = f"({self.wide_int(k)} - ({lo}))"
-        bucket = self.int_div(f"{offset} * {n_segments}", f"({hi - lo})")
+        offset = f"({self.wide_int(k)} - ({self.int_literal(lo)}))"
+        bucket = self.int_div(
+            f"{offset} * {n_segments}", f"({self.int_literal(hi - lo)})"
+        )
         # Fold the *key* into every row's hash, not just the comparable columns.
         # A count plus a content-only sum cannot see a same-content insert and
         # delete in one bucket: the counts balance (one in, one out) and equal
@@ -475,7 +509,7 @@ class Dialect(ABC):
             f"select {bucket} as seg, count(*), "
             f"{self.sum_wide(content)} "
             f"from {self.qualify(table)} "
-            f"where {k} >= {lo} and {k} <= {hi - 1} "
+            f"where {k} >= {self.int_literal(lo)} and {k} <= {self.int_literal(hi - 1)} "
             f"group by 1"
         )
 
@@ -552,10 +586,14 @@ def get_dialect(
         from parity.dialects.snowflake_dialect import SnowflakeDialect
 
         dialect = SnowflakeDialect(float_scale=float_scale, side=side)
+    elif scheme in ("bigquery",):
+        from parity.dialects.bigquery_dialect import BigQueryDialect
+
+        dialect = BigQueryDialect(float_scale=float_scale, side=side)
     else:
         raise ValueError(
             f"[side {side}] no dialect for scheme {scheme!r}. "
-            f"Supported: duckdb, postgres, mysql, snowflake."
+            f"Supported: duckdb, postgres, mysql, snowflake, bigquery."
         )
     try:
         dialect.connect(connection_string)

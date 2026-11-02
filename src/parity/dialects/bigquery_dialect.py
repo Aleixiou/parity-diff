@@ -1,0 +1,440 @@
+"""BigQuery dialect.
+
+Verified against a live BigQuery project (location EU, 2026-11-02): the hash
+constant agrees, a full-table checksum over mixed-type rows matches DuckDB byte
+for byte (including a 130-column table), and `tests/test_bigquery.py` passes end
+to end - identical tables, a changed decimal, a deleted row, an inserted row,
+NULL versus '' and NULL versus FALSE. Every expression below was checked against
+DuckDB on the live engine rather than taken from the documentation, and several
+of them are not what the documentation suggests.
+
+The BigQuery-specific decisions, each confirmed by that run:
+
+- **The hash.** `MD5` returns BYTES, so `TO_HEX` first; BigQuery then casts a
+  `0x`-prefixed hex STRING to INT64, giving the same 60-bit prefix as DuckDB's
+  hex-cast - `648541476951500027` for 'abc'.
+- **No `concat_ws`.** `ARRAY_TO_STRING([...], CHR(31))` instead. It skips NULL
+  elements exactly as `concat_ws` skips NULL arguments, and every element has
+  already been through `coalesce`, so a flat join is byte-identical to the
+  nested `concat_ws` tree the other engines build.
+- **DECIMAL needs `ROUND` before `FORMAT`.** `CAST(numeric AS STRING)` drops
+  trailing zeros (`1.5`, not `1.500000`), and `FORMAT('%.6f', x)` pads but
+  prints `-0.000000` for a value like -0.0000001 that rounds to zero, where
+  DuckDB and PostgreSQL print `0.000000`. `ROUND` to the scale first lands on a
+  NUMERIC zero, which has no sign.
+- **FLOAT copies DuckDB's arithmetic, not the obvious expression.** Every
+  natural BigQuery spelling (`FORMAT` on the double, `ROUND` on the double, a
+  cast through NUMERIC or BIGNUMERIC) disagreed with DuckDB on 45-89 of 727
+  sample doubles, because each rounds a *different* intermediate value. DuckDB
+  multiplies by 10^scale in double precision and rounds half away from zero;
+  doing exactly that here and dividing back exactly in BIGNUMERIC matched DuckDB
+  on all 727. See `normalize`.
+- **Years below 1000.** `%Y` renders year 999 as `999`; DuckDB and PostgreSQL
+  zero-pad to `0999`. `%E4Y` pads.
+- **TIMESTAMP is an instant, DATETIME is naive.** Both map to TIMESTAMP, but the
+  former is formatted in UTC explicitly (BigQuery has no session timezone to
+  pin) and is marked `tz_aware`, because its name lacks the `with time zone`
+  the engine otherwise looks for.
+- **Integer literals past INT64 do not parse.** The key span of a range as wide
+  as bigint is up to 2^64, so `int_literal` emits those as `BIGNUMERIC '...'`.
+- **Identifiers and strings escape with a backslash.** Backtick-quoted names
+  and string literals both process `\\` escapes; neither doubles a quote.
+- **One snapshot, for base tables.** Every SELECT against a base table reads it
+  `FOR SYSTEM_TIME AS OF` the instant of the dialect's first metadata query, so
+  the whole walk sees one version of a live table (CLAUDE.md section 4.9).
+  Views are *not* pinned: BigQuery silently ignores `FOR SYSTEM_TIME AS OF` on
+  a view - verified, it returned the live row count - so a view is read live at
+  every level, the same READ COMMITTED limitation Snowflake has.
+- **Read-only by construction.** Credentials are requested with the
+  `bigquery.readonly` OAuth scope and queries go through `jobs.query`. Verified:
+  SELECT, INFORMATION_SCHEMA and time travel work; INSERT, DELETE, CREATE, DROP
+  and multi-statement scripts are refused by the server ("Need BigQuery or
+  Cloud Platform write scope"). Credentials that cannot be down-scoped (a VM's
+  metadata server) keep their own scopes; the dialect still issues SELECT only.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from urllib.parse import parse_qs, unquote
+
+from parity.dialects.base import HASH_HEX_CHARS, Dialect
+from parity.types import Column, LogicalType
+
+#: Read-only OAuth scope. Under it the server refuses any DML, DDL or script,
+#: so no bug in query building can write to a user's project.
+READONLY_SCOPE = "https://www.googleapis.com/auth/bigquery.readonly"
+
+#: Query parameters `bigquery://` understands. Anything else is refused rather
+#: than ignored: a misspelt `locaton=` silently dropped is a query routed to the
+#: wrong region and an error that does not point at the typo.
+_URL_PARAMS = {"location"}
+
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+
+
+def parse_bigquery_url(connection_string: str) -> tuple[str, str, str | None]:
+    """Split ``bigquery://project[/dataset][?location=EU]``.
+
+    Returns ``(project, dataset, location)``; dataset is "" when omitted and
+    location is None when omitted (then taken from the dataset at connect).
+    Parsed by hand rather than with `urlparse`, whose `hostname` lower-cases
+    and would mangle a domain-scoped project such as ``example.com:proj``.
+    """
+    rest = connection_string.split("://", 1)[1] if "://" in connection_string else ""
+    path, _, query = rest.partition("?")
+    parts = [unquote(p) for p in path.split("/") if p]
+    if not parts:
+        raise ValueError(
+            "bigquery connection string needs a project: "
+            "bigquery://<project>[/<dataset>][?location=<region>]"
+        )
+    if len(parts) > 2:
+        raise ValueError(
+            f"bigquery connection string has {len(parts)} path parts; "
+            "expected bigquery://<project>[/<dataset>]"
+        )
+    params = parse_qs(query)
+    unknown = sorted(set(params) - _URL_PARAMS)
+    if unknown:
+        raise ValueError(
+            f"unknown bigquery connection parameter(s) {unknown}; "
+            f"supported: {sorted(_URL_PARAMS)}"
+        )
+    location = params["location"][0] if "location" in params else None
+    return parts[0], parts[1] if len(parts) > 1 else "", location
+
+
+class BigQueryDialect(Dialect):
+    name = "bigquery"
+    #: The dataset from the connection string; unqualified tables live there.
+    default_schema = ""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Set up per-instance state; nothing touches the network until connect."""
+        super().__init__(*args, **kwargs)
+        self.project = ""
+        #: The google-cloud-bigquery Client. Typed loosely: the library is an
+        #: optional extra and only partly annotated.
+        self._client: Any = None
+        self._location: str | None = None
+        #: The instant every pinned read is taken at, as a literal-ready string.
+        #: Set by the first `columns()` call, from the server's own clock.
+        self.snapshot: str | None = None
+        #: Base tables (project, dataset, table) that read at `snapshot`. Only
+        #: base tables: on a view BigQuery ignores time travel without an error.
+        self._pinned: set[tuple[str, str, str]] = set()
+
+    # ---------------------------------------------------------------- setup
+
+    def connect(self, connection_string: str) -> None:  # pragma: no cover - live
+        """Open a read-only client for the project.
+
+        Authentication is Application Default Credentials - a service account
+        via ``GOOGLE_APPLICATION_CREDENTIALS``, ``gcloud auth
+        application-default login``, impersonation, or a VM's identity - so no
+        secret ever appears in the connection string. Looking the dataset up
+        here proves the credentials work and the dataset exists before any
+        diff starts, and supplies its location so every job runs where the
+        data is.
+        """
+        try:
+            project, dataset, location = parse_bigquery_url(connection_string)
+        except ValueError as exc:
+            # `get_dialect` passes a ValueError through untouched, trusting it
+            # to name the side already - so it has to.
+            raise self._err(str(exc)) from exc
+
+        import google.auth
+        from google.cloud import bigquery
+
+        credentials, _ = google.auth.default(scopes=[READONLY_SCOPE])
+        self._client = bigquery.Client(
+            project=project, credentials=credentials, location=location
+        )
+        self.project = project
+        if dataset:
+            self.default_schema = dataset
+            found = self._client.get_dataset(f"{project}.{dataset}")
+            location = location or found.location
+        self._location = location
+
+    def close(self) -> None:  # pragma: no cover - live
+        """Close the client's HTTP session."""
+        self._client.close()
+
+    def query(self, sql: str) -> list[tuple[Any, ...]]:
+        """Run `sql` and return every row as a tuple of Python values.
+
+        `query_and_wait` uses the `jobs.query` endpoint, which is the one that
+        accepts the read-only scope; `client.query` goes through `jobs.insert`,
+        which refuses it even for a plain SELECT. There is consequently no
+        `cancel()`: cancelling a job needs the write scope (verified, 403), and
+        read-only is worth more than an interruptible query.
+        """
+        rows = self._client.query_and_wait(sql, location=self._location)
+        return [tuple(row.values()) for row in rows]
+
+    # ------------------------------------------------------------ metadata
+
+    def _resolve(self, table: str) -> tuple[str, str, str]:
+        """Split `table`, `dataset.table` or `project.dataset.table`.
+
+        Three parts are accepted here, unlike the other engines, because
+        reading another project's dataset (a shared or public one) while
+        billing your own is ordinary BigQuery usage.
+        """
+        parts = table.split(".")
+        if len(parts) == 3:
+            return parts[0], parts[1], parts[2]
+        if len(parts) == 2:
+            return self.project, parts[0], parts[1]
+        if len(parts) == 1:
+            if not self.default_schema:
+                raise self._err(
+                    f"table {table!r} names no dataset, and the connection "
+                    "string has none either: use dataset.table, or "
+                    "bigquery://<project>/<dataset>"
+                )
+            return self.project, self.default_schema, parts[0]
+        raise self._err(
+            f"table name {table!r} has {len(parts)} dot-separated parts; "
+            "expected table, dataset.table or project.dataset.table"
+        )
+
+    def _columns_catalog(self, schema: str) -> str:
+        """The dataset's own INFORMATION_SCHEMA - there is no global one.
+
+        `schema` may arrive as ``project.dataset`` from `columns()` below.
+        """
+        return f"{self.qualify_parts(*self._split_schema(schema))}.INFORMATION_SCHEMA.COLUMNS"
+
+    def _split_schema(self, schema: str) -> tuple[str, ...]:
+        """``dataset`` or ``project.dataset`` into quoted-ready parts."""
+        return tuple(schema.split(".")) if "." in schema else (self.project, schema)
+
+    def columns(self, table: str) -> list[Column]:
+        """Introspect columns, learn whether the table can be pinned, and fix
+        the snapshot instant - all in the one metadata query.
+
+        Joining TABLES gives `table_type`, which decides pinning: only a
+        `BASE TABLE` honours `FOR SYSTEM_TIME AS OF`. `current_timestamp()` is
+        the server's clock at the start of this job, so the snapshot is "as of
+        the first query", the same point PostgreSQL's REPEATABLE READ takes it.
+        """
+        project, dataset, name = self._resolve(table)
+        schema = f"{project}.{dataset}"
+        info = self.qualify_parts(project, dataset)
+        sql = (
+            "select c.column_name, c.data_type, t.table_type, "
+            "format_timestamp('%Y-%m-%d %H:%M:%E6S+00', current_timestamp()) "
+            f"from {info}.INFORMATION_SCHEMA.COLUMNS as c "
+            f"join {info}.INFORMATION_SCHEMA.TABLES as t "
+            "on c.table_name = t.table_name "
+            f"where c.table_name = {self.string_literal(name)} "
+            "order by c.ordinal_position"
+        )
+        try:
+            rows = self.query(sql)
+        except Exception as exc:
+            # A missing dataset and a dataset this account cannot see return
+            # the same 403 from BigQuery, so the message has to cover both.
+            raise self._err(
+                f"cannot read dataset {schema} while looking for {table}: it "
+                f"does not exist, or this account lacks access to it ({exc})"
+            ) from exc
+        if not rows:
+            raise self._err(self._not_found(table, schema, name))
+        if self.snapshot is None:
+            self.snapshot = str(rows[0][3])
+        if rows[0][2] == "BASE TABLE":
+            self._pinned.add((project, dataset, name))
+        return [_column(str(r[0]), str(r[1])) for r in rows]
+
+    def quote(self, identifier: str) -> str:
+        """Back-quote one identifier, escaping backslash and backtick.
+
+        The injection boundary. Backtick-quoted identifiers process backslash
+        escapes, so a name ending in a backslash would otherwise escape the
+        closing quote. Verified: a name containing a backtick and SQL parses
+        as one identifier (which BigQuery then rejects as an invalid name).
+        """
+        escaped = identifier.replace("\\", "\\\\").replace("`", "\\`")
+        return f"`{escaped}`"
+
+    def qualify_parts(self, *parts: str) -> str:
+        """Quote each part of a reference and join them with dots."""
+        return ".".join(self.quote(p) for p in parts)
+
+    def qualify(self, table: str) -> str:
+        """`project`.`dataset`.`table`, read at the snapshot when it is safe to.
+
+        Appending `FOR SYSTEM_TIME AS OF` here is what pins every checksum and
+        fetch to one version without the engine knowing BigQuery exists. A
+        table `columns()` never saw is left unpinned - it was not proven to be
+        a base table, and on a view the clause is silently ignored.
+        """
+        ref = self._resolve(table)
+        sql = self.qualify_parts(*ref)
+        if self.snapshot is not None and ref in self._pinned:
+            sql += (
+                f" for system_time as of timestamp {self.string_literal(self.snapshot)}"
+            )
+        return sql
+
+    def string_literal(self, value: str) -> str:
+        """A BigQuery string literal: backslash escapes, no quote-doubling.
+
+        `'it''s'` is not an escaped quote in BigQuery, and `\\` starts an escape
+        sequence, so the standard-SQL `sql_literal` is wrong here.
+        """
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
+
+    def int_literal(self, value: int) -> str:
+        """Digits inside INT64, a BIGNUMERIC literal outside it.
+
+        BigQuery rejects `18446744073709551616` at parse time ("Invalid integer
+        literal"), and the key span of a range as wide as bigint is that big.
+        """
+        if _INT64_MIN <= value <= _INT64_MAX:
+            return str(value)
+        return f"bignumeric '{value}'"
+
+    # ----------------------------------------------------------- rendering
+
+    def null_sentinel_sql(self) -> str:
+        r"""Build `\N` from CHR(92): BigQuery processes backslash escapes in
+        string literals, and `'\N'` is an illegal escape (verified)."""
+        return "concat(chr(92), 'N')"
+
+    def _concat(self, parts: list[str]) -> str:
+        """Join with `ARRAY_TO_STRING` - BigQuery has no `concat_ws`.
+
+        No argument limit, so no nesting. Every part is coalesced and never
+        NULL, so this is byte-identical to the nested `concat_ws` tree; verified
+        against DuckDB at 130 columns, past the 64-per-call nesting point.
+        """
+        return f"array_to_string([{', '.join(parts)}], {self.separator_sql()})"
+
+    def normalize(self, column: Column) -> str:
+        """Render one column as canonical text, null-safe.
+
+        Every branch ends inside the `coalesce`, so NULL is always the sentinel.
+        """
+        c = self.quote(column.name)
+        t = column.logical_type
+        s = self.float_scale
+        fmt = f"'%.{s}f'"
+        if t is LogicalType.INTEGER:
+            expr = f"cast({c} as string)"
+        elif t is LogicalType.DECIMAL:
+            # ROUND first: FORMAT alone prints -0.0000001 as `-0.000000`, and
+            # the other engines print `0.000000`. ROUND is half away from zero,
+            # as DuckDB's decimal cast and PostgreSQL's round() are; verified on
+            # 312 decimals, halfway cases included.
+            expr = f"format({fmt}, round({c}, {s}))"
+        elif t is LogicalType.FLOAT:
+            # DuckDB renders a double as round(c * 10^s) computed in double
+            # precision; PostgreSQL goes through 15 significant digits, and the
+            # two already disagree on large or near-halfway doubles. This
+            # reproduces DuckDB's arithmetic exactly - the multiply in FLOAT64
+            # (same IEEE rounding), ROUND half away from zero, then an exact
+            # BIGNUMERIC division back to the scale. Verified identical to
+            # DuckDB on 727 doubles where every simpler spelling missed 45+.
+            # Inf/NaN cannot reach BIGNUMERIC, so they become the fixed tokens.
+            expr = (
+                f"case when is_inf({c}) then (case when {c} > 0 then 'Infinity' "
+                f"else '-Infinity' end) "
+                f"when is_nan({c}) then 'NaN' "
+                f"else format({fmt}, cast(round({c} * 1e{s}) as bignumeric) "
+                f"/ bignumeric '1{'0' * s}') end"
+            )
+        elif t is LogicalType.BOOLEAN:
+            # `when not`, never `else`: an `else` sends NULL to 'false'.
+            expr = f"case when {c} then 'true' when not {c} then 'false' end"
+        elif t is LogicalType.DATE:
+            # %E4Y, not %Y: %Y renders year 999 as `999`, the others `0999`.
+            expr = f"format_date('%E4Y-%m-%d', {c})"
+        elif t is LogicalType.TIMESTAMP:
+            if column.tz_aware is False:
+                expr = f"format_datetime('%E4Y-%m-%d %H:%M:%E6S', {c})"
+            else:
+                # An instant: render in UTC explicitly, since BigQuery has no
+                # session timezone to pin (CLAUDE.md section 4.8).
+                expr = f"format_timestamp('%E4Y-%m-%d %H:%M:%E6S', {c}, 'UTC')"
+        elif t is LogicalType.STRING:
+            expr = f"cast({c} as string)"
+        else:
+            # Anything else (TIME, BYTES, JSON, ARRAY, STRUCT, ...) through
+            # FORMAT('%t'), which renders every type - CAST to STRING raises on
+            # ARRAY/STRUCT and would kill the diff. But '%t' renders NULL as the
+            # *string* 'NULL', which would slip past the coalesce and compare
+            # equal to a real 'NULL' on the other side; hence the explicit guard.
+            expr = f"if({c} is null, null, format('%t', {c}))"
+        return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def hash_expr(self, text_expr: str) -> str:
+        """Fold canonical text into a positive 60-bit integer.
+
+        MD5 gives BYTES, so TO_HEX first; a `0x`-prefixed hex STRING then casts
+        to INT64. 648541476951500027 for 'abc', verified live.
+        """
+        return (
+            f"cast(concat('0x', substr(to_hex(md5({text_expr})), 1, "
+            f"{HASH_HEX_CHARS})) as int64)"
+        )
+
+    def int_div(self, numerator: str, denominator: str) -> str:
+        """`DIV` truncates toward zero on BIGNUMERIC; `/` would give a float."""
+        return f"div({numerator}, {denominator})"
+
+    def wide_int(self, expr: str) -> str:
+        """BIGNUMERIC: 76 digits, which the key offset times the bucket count
+        cannot overflow even for a key range as wide as bigint."""
+        return f"cast(({expr}) as bignumeric)"
+
+    def sum_wide(self, expr: str) -> str:
+        """Sum in BIGNUMERIC, 0 for an empty group.
+
+        INT64 raises after ~8 rows of 2^60; NUMERIC would last ~8.6e10 rows,
+        BIGNUMERIC ~5e20. Measured at 50M rows the two cost the same, within
+        run-to-run noise, so the wider one is free.
+        """
+        return f"coalesce(sum(cast(({expr}) as bignumeric)), 0)"
+
+
+def _column(name: str, raw: str) -> Column:
+    """Build a Column, marking TIMESTAMP as an instant and DATETIME as naive."""
+    t = raw.upper()
+    tz: bool | None = None
+    if t.startswith("TIMESTAMP"):
+        tz = True
+    elif t.startswith("DATETIME"):
+        tz = False
+    return Column(name, map_type_bigquery(raw), raw, tz_aware=tz)
+
+
+def map_type_bigquery(raw: str) -> LogicalType:
+    """Map a BigQuery type name onto a logical category.
+
+    INFORMATION_SCHEMA reports parameterised types as `NUMERIC(12, 2)` and
+    `STRING(20)`, and aliases such as SMALLINT as INT64; strip the parameters.
+    Composite types (`ARRAY<INT64>`, `STRUCT<...>`) fall through to UNKNOWN.
+    """
+    t = raw.upper().split("(")[0].strip()
+    if t in {"INT64", "INTEGER", "INT", "SMALLINT", "BIGINT", "TINYINT", "BYTEINT"}:
+        return LogicalType.INTEGER
+    if t in {"NUMERIC", "DECIMAL", "BIGNUMERIC", "BIGDECIMAL"}:
+        return LogicalType.DECIMAL
+    if t in {"FLOAT64", "FLOAT"}:
+        return LogicalType.FLOAT
+    if t in {"BOOL", "BOOLEAN"}:
+        return LogicalType.BOOLEAN
+    if t == "DATE":
+        return LogicalType.DATE
+    if t in {"TIMESTAMP", "DATETIME"}:
+        return LogicalType.TIMESTAMP
+    if t == "STRING":
+        return LogicalType.STRING
+    return LogicalType.UNKNOWN

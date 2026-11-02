@@ -39,6 +39,13 @@ class Column:
     name: str
     logical_type: LogicalType
     raw_type: str = ""
+    #: Whether the column holds an instant (True) or naive wall-clock time
+    #: (False). None means "infer from `raw_type`", which works wherever the
+    #: engine spells it `... with time zone` (PostgreSQL, DuckDB). BigQuery
+    #: does not: its instant type is plainly `TIMESTAMP` and its naive one is
+    #: `DATETIME`, so it sets this explicitly rather than have the engine
+    #: guess from a name that means the opposite elsewhere.
+    tz_aware: bool | None = None
 
 
 @dataclass(frozen=True)
