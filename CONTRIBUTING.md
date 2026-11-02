@@ -41,7 +41,12 @@ tables the current role lacks privileges on. Three more exist for engines
 whose SQL departs from the standard, each defaulting to the old behaviour:
 `string_literal()` (BigQuery escapes with backslashes), `int_literal()`
 (BigQuery cannot parse an integer literal past INT64) and `_columns_catalog()`
-(BigQuery's `INFORMATION_SCHEMA` is per dataset). A dialect may also set
+(BigQuery's `INFORMATION_SCHEMA` is per dataset). SQL Server added three
+more for SQL the shared queries spelled in a way T-SQL rejects - `group_by()`
+(no `GROUP BY 1`), `count()` (`count_big`) and `count_distinct_key()`
+(uniqueness by digest, not collation-dependent text) - and `caveats()`, which
+returns limitations of *this* comparison for the engine to print as warnings.
+Each default emits exactly the old SQL. A dialect may also set
 `Column.tz_aware` when its type names do not say `with time zone`.
 
 That comes to roughly 70–85 lines. Read
@@ -168,6 +173,34 @@ against the live engine next to DuckDB, not by reading the docs:
     no read-only session, but the `bigquery.readonly` OAuth scope makes the
     server refuse every write - provided queries go through `jobs.query`
     (`query_and_wait`); `jobs.insert` rejects that scope even for SELECT.
+
+SQL Server (unreleased) added six, all found against a live 2022 server:
+
+18. **A string function may truncate silently.** T-SQL's `CONCAT_WS` returns at
+    most 4,000 characters unless an argument is `nvarchar(max)`; three
+    `nvarchar(4000)` columns joined to 4,000 characters, not 12,002. A change
+    past the cut vanishes from the checksum - a false match. Check your
+    engine's concatenation limits, and plant a difference past them.
+19. **The shared SQL may not parse.** No `GROUP BY 1`, `COUNT` overflowing at
+    2^31, `CONCAT_WS` refusing a single value. Use the spelling hooks; never
+    change a default, because other engines' checksums depend on its exact
+    text - generate the shared queries before and after and diff them.
+20. **Text equality may not be byte equality.** SQL Server compares by
+    collation - case-insensitive by default, trailing spaces ignored always -
+    so `count(distinct text_key)` merged `'a'`, `'A'` and `'a '`. Count a
+    digest of the bytes instead.
+21. **Your engine may not hash the bytes you think.** SQL Server stores Unicode
+    as UTF-16, so `HASHBYTES('MD5', nvarchar)` disagreed with every other
+    engine on every row, ASCII included. Convert to UTF-8 once, at the hash,
+    and pin a non-ASCII string and an emoji against Python's
+    `md5(s.encode())`.
+22. **Catalog identifiers can be case-sensitive.** In a SQL Server database
+    with a case-sensitive collation, `information_schema.columns` does not
+    exist; `INFORMATION_SCHEMA.COLUMNS` does. Test in such a database.
+23. **Your engine's own literal parser may be wrong.** SQL Server's
+    string-to-float conversion misrounds some 16-17 digit values and flushes
+    subnormals to zero, so a float test fed through literals blames the
+    rendering for the parser's error. Send test doubles as bound parameters.
 
 ### Proving it works
 

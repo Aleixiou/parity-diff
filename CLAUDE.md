@@ -78,11 +78,20 @@ The foundation of the whole tool: fold canonical row text into an integer that
 | MySQL | `cast(conv(substr(md5(<text>), 1, 15), 16, 10) as unsigned)` |
 | Snowflake | `floor(md5_number_upper64(<text>) / 16)` |
 | BigQuery | `cast(concat('0x', substr(to_hex(md5(<text>)), 1, 15)) as int64)` |
+| SQL Server | `convert(bigint, convert(varbinary(8), '0' + left(convert(varchar(32), hashbytes('MD5', <utf8>), 2), 15), 2))` |
 
-All five return `648541476951500027` for input `'abc'` - through five different
-paths (bit-cast, hex-cast, CONV, Snowflake's top-64-bits-then-drop-4, and
-BigQuery's hex-cast of `to_hex`, since its `md5` returns BYTES), which
-is exactly why a test pins the constant on each. Snowflake has neither a bit
+All six return `648541476951500027` for input `'abc'` - through six different
+paths (bit-cast, hex-cast, CONV, Snowflake's top-64-bits-then-drop-4,
+BigQuery's hex-cast of `to_hex`, since its `md5` returns BYTES, and SQL
+Server's style-2 hex read back as 8 bytes behind a `0` nibble), which
+is exactly why a test pins the constant on each. On SQL Server `<utf8>` is
+`cast(cast(<text> as nvarchar(max)) collate Latin1_General_100_BIN2_UTF8 as
+varchar(max))`: SQL Server holds Unicode as UTF-16, and hashing that disagrees
+with every other engine on every row; a `varchar` under a `_UTF8` collation
+*is* UTF-8. Verified equal to Python's `md5(s.encode())` for accents, CJK,
+emoji and combining marks, in a UTF-8 and a Latin1 database alike, for
+`varchar` and `nvarchar` input. UTF-8 collations exist from SQL Server 2019, so
+older servers are refused. Snowflake has neither a bit
 cast nor `conv`, but `md5_number_upper64` gives the top 64 bits of the digest as
 a number and `floor(.../16)` drops the low 4, leaving the same 60-bit prefix -
 verified live, not just from the docs.
@@ -133,6 +142,48 @@ mixed-type rows; `tests/test_bigquery.py`). It has no `concat_ws`, and its
 BigQuery's instant type is plainly `TIMESTAMP` (its naive one is `DATETIME`), the
 opposite of what that name means elsewhere, so the dialect sets
 `Column.tz_aware` explicitly instead of letting the engine infer it from the name.
+
+**SQL Server** (verified live 2026-11-02 against SQL Server 2022 CU27 in a
+Linux container, byte-for-byte with DuckDB over 5,000 mixed-type rows, in a
+UTF-8, a Latin1 and a case-sensitive database; `tests/test_mssql.py`). Every
+value is `nvarchar(max)` - see the CONCAT trap in 4.5 - and is converted to
+UTF-8 only once, at the hash:
+
+| SQL Server type | Expression (inside `coalesce(..., N'\N')`) |
+|---|---|
+| `tinyint` … `bigint` | `convert(nvarchar(max), c)` |
+| `decimal`, `numeric`, `money`, `smallmoney` | `convert(nvarchar(max), cast(c as decimal(38,6)))` - numeric to numeric rounds half away from zero; money converts exactly |
+| `float`, `real` | see **FLOAT canonical form** below |
+| `bit` | `case when c = 1 then N'true' when c = 0 then N'false' end` |
+| `date` | `convert(nvarchar(max), c, 23)` (pads year 0001 / 0999) |
+| `datetime2`, `smalldatetime` | `left(convert(nvarchar(max), cast(c as datetime2(7)), 121), 26)` - the 7th digit **truncated** |
+| `datetime` | `convert(nvarchar(max), c, 121) + N'000'` - its displayed `.003`/`.007` |
+| `datetimeoffset` | as datetime2, of `switchoffset(c, '+00:00')`; `tz_aware=True` |
+| `char`, `nchar` | `rtrim(cast(c as nvarchar(max)))` |
+| `uniqueidentifier` | `lower(convert(nvarchar(max), c))` |
+| other strings | `cast(c as nvarchar(max))` |
+| `timestamp` (rowversion), binary | `convert(nvarchar(max), convert(varbinary(max), c), 1)` - UNKNOWN, 0x-hex |
+| separator / NULL sentinel | `nchar(31)` / `N'\N'` (T-SQL processes no backslash escapes) |
+
+Decisions, not just spellings:
+
+- **`datetime2(7)` truncates to microseconds.** That is how a microsecond
+  reader (Python's datetime, an ODBC export) carries the value, so it is what
+  most migrations hold, and it never rolls `23:59:59.9999995` into the next day
+  as `cast(... as datetime2(6))` (which rounds) would. A difference below 1 µs is
+  therefore invisible, and `caveats()` says so on every run comparing a
+  precision-7 column. The boundary is pinned by a test.
+- **`datetime` renders its display, not its tick.** It counts 1/300 s;
+  `cast(datetime as datetime2)` gives `.0033333` under compatibility level 130+,
+  which nobody exports. The displayed milliseconds are independent of the
+  compatibility level.
+- **`char(n)` is right-trimmed.** PostgreSQL's `bpchar::text` and MySQL's CHAR
+  strip the padding, DuckDB has none, and `char(n)` cannot tell `abc` from
+  `abc ` itself, so nothing is lost.
+- **`timestamp` is rowversion** and `bit` is boolean: `map_type_mssql` exists
+  because the shared map would read the first as a point in time, and adding
+  `bit` there would turn PostgreSQL's bit strings into booleans.
+- SQL Server floats cannot hold Infinity or NaN, so no tokens are emitted.
 
 **Infinity and NaN must be special-cased for FLOAT.** DuckDB cannot cast them
 to DECIMAL at all — `Could not cast value inf to DECIMAL(38,6)` kills the whole
@@ -211,6 +262,7 @@ for byte:
 | DuckDB | `abs(c) < 1e-7` → `'0.000000'`, else `cast(cast(cast(c as varchar) as decimal(38,6)) as varchar)` |
 | MySQL | `cast(cast(c as decimal(38,6)) as char)` (unchanged: its DECIMAL cast goes through dtoa's shortest repr) |
 | BigQuery | the first of `round(cast(c as bignumeric), n-1-e, 'ROUND_HALF_EVEN')` for n = 15, 16, 17 significant digits that casts back to `c`, then `round(.., 6)` |
+| SQL Server | the same construction from `cast(c as decimal(38,37))` below 1 and `cast(c as decimal(38,21))` up to 2^53, with ties to even built by hand (`ROUND` is half away from zero) at 16 and 17 digits; `--float-scale` capped at 18 |
 
 Every one of these was found by measurement, not by reading the docs:
 
@@ -239,6 +291,15 @@ Every one of these was found by measurement, not by reading the docs:
 - **MySQL's CAST to an integer type clamps silently** on overflow, so two
   different huge doubles would compare equal; its out-of-range branch calls
   `exp(abs(c))`, which raises error 1690 even inside a SELECT.
+- **SQL Server prints no shortest repr either** (style 3 is always 17 digits),
+  but `cast(float as decimal(38, q))` is the exact binary value rounded half up
+  and decimal to float is correctly rounded - both verified on every sample
+  value - so the BigQuery construction carries over. Its decimal arithmetic
+  shortens the scale of `d + d` by one place, which is why the tie test needs
+  the digit past the candidate and why scales above 18 are refused. And **its
+  string-to-float parse is not correctly rounded**: `'-5.795195809241054e+16'`
+  arrives one ulp off and subnormals arrive as 0, so test doubles must travel
+  as bound parameters, never literals.
 - **Snowflake is not verified** against this form (no live account): its FLOAT
   is still `cast(c as number(38,6))`, and `float_caveat()` makes every run that
   compares a Snowflake FLOAT column print a warning.
@@ -378,6 +439,41 @@ stored spelling.
   compares unequal to an empty bucket on the other and the walker recurses
   into nothing forever.
 
+**SQL Server's traps** (verified live against SQL Server 2022; each is pinned by
+a test that plants the difference the trap would hide):
+
+- **`CONCAT_WS` truncates silently.** Without a `max`-typed argument its result
+  is at most 4,000 characters (8,000 bytes): three `nvarchar(4000)` columns
+  joined came back as 4,000 characters, not 12,002, so a difference past the
+  cut would vanish from the checksum - a false match. Every normalized value
+  is `nvarchar(max)`; a change at character 9,500 of a row's text is found.
+- **`CONCAT_WS` refuses one value** ("requires 3 to 254 arguments"). One part
+  reaches `_concat` for a key-only table, a single-column hashed key, and the
+  remainder group of a 65-part row; the dialect returns it as itself.
+- **No `GROUP BY 1`, and `COUNT` is 32-bit.** T-SQL accepts neither an ordinal
+  nor an alias in GROUP BY, and `count` raises past 2^31 - 1 rows. The base
+  class spells both through hooks (`group_by`, `count`) whose defaults emit
+  the old SQL byte for byte - checked by generating every shared query of all
+  five other dialects before and after.
+- **Text equality is the collation's.** Case-insensitive by default, and blind
+  to trailing spaces under every collation: `'a'`, `'A'`, `'a '` count as one
+  distinct value, so a unique text key would be refused as duplicated. The
+  uniqueness count is over `hashbytes('SHA2_256', <utf8>)` instead
+  (`count_distinct_key` hook). Rows are matched by their text in Python, so
+  nothing else depended on server-side text equality.
+- **Catalog names follow the database collation.** In a case-sensitive
+  database `information_schema.columns` is "Invalid object name"; it must be
+  `INFORMATION_SCHEMA.COLUMNS` with upper-case column names, so the dialect
+  overrides `columns()` and the near-miss query.
+- **`int_div` divides an exact multiple: `(n - n % d) / d`.** The design notes
+  feared decimal `/` would *round* a quotient like `q.9999996` up to the next
+  bucket. On SQL Server 2022 it truncates at the reduced scale instead
+  (`2/3 = 0.666666`), so the naive form placed every boundary key correctly too
+  - but that is undocumented behaviour, and the modulo form is exact whatever
+  the rounding mode. Pinned at every bucket boundary of ranges up to 2^64 wide.
+- An integer literal past bigint (the 2^64 span) parses as `numeric`, so no
+  `int_literal` override is needed.
+
 ### 4.6 Performance — measured, not assumed
 
 Benchmarked at 2,000,000 rows per side, PostgreSQL 16 ↔ DuckDB, 2 vCPU:
@@ -499,6 +595,25 @@ live at every level, as on Snowflake (READ COMMITTED only). Documented in the RE
 pinned by a live test. The dialect also requests the `bigquery.readonly` OAuth scope,
 so the server itself refuses any write - verified for INSERT, DELETE, CREATE, DROP.
 
+SQL Server gives one snapshot only where the database has
+`ALLOW_SNAPSHOT_ISOLATION ON`, which the dialect reads from `sys.databases` at
+connect. Then it sets SNAPSHOT while autocommit is on and turns autocommit off,
+so the walk is one transaction - verified live: a row inserted and another
+updated mid-walk stay invisible, a fresh dialect sees both, and the writer is
+not blocked. Otherwise it stays at READ COMMITTED and `caveats()` puts a warning
+in every run's output. It **never** falls back to REPEATABLE READ or
+SERIALIZABLE, whose shared locks are held to the end of the transaction and
+would stall writers on a live legacy system for the whole diff, and never to
+NOLOCK, whose dirty reads invent differences. Verified: with snapshot off the
+session reports isolation level 2 (read committed) and a concurrent UPDATE
+completes under a 5 s lock timeout. Two SQL Server specifics: a table created or
+altered after the snapshot began is not invisible, as on PostgreSQL - reading it
+raises error 3961, loudly; and there is no read-only session
+(`ApplicationIntent=ReadOnly` does not enforce one on a primary), so the dialect
+refuses any non-SELECT in `query`, never commits, rolls back in `close`, and the
+docs require a `db_datareader`-only login - verified live that such a login runs
+the diff and is refused a DELETE by the server.
+
 Two consequences worth knowing:
 
 - The snapshot is taken at the dialect's **first query**, not at connect. A
@@ -529,7 +644,7 @@ for anyone who genuinely wants every row and has the memory for it.
 
 ## 5. Architecture
 
-The whole tool ships in `src/parity/` — dialects, engine and CLI — with 490
+The whole tool ships in `src/parity/` — dialects, engine and CLI — with 592
 tests, `demo/proof.py` as the end-to-end proof, and `demo/benchmark.py` as the
 10M-row one. Read the code before rewriting any of it: several decisions below
 encode findings that were expensive to discover.
@@ -542,6 +657,7 @@ duckdb:///relative/path.duckdb                  (three slashes = relative)
 duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute, POSIX)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 duckdb:///:memory:
+mssql://user:password@host:port/database?trust_server_certificate=yes   (also sqlserver://)
 ```
 
 The slash count carries meaning, as in sqlite and SQLAlchemy: exactly **one**
@@ -553,7 +669,11 @@ letter and carry only one leading slash to start with.
 
 The scheme before `://` selects the dialect in `get_dialect()`. Table names may
 be schema-qualified (`public.orders`, `main.orders`); unqualified names default
-to `public` on PostgreSQL and `main` on DuckDB.
+to `public` on PostgreSQL and `main` on DuckDB (and the login's own default
+schema, normally `dbo`, on SQL Server). The `mssql://` query parameters are
+whitelisted (`encrypt`, `trust_server_certificate`, `application_intent`,
+`login_timeout`, `instance`) and every ODBC value is braced, so a `;` in a
+password cannot inject a keyword.
 
 ```
 src/parity/
@@ -562,6 +682,7 @@ src/parity/
     base.py                     # Dialect ABC + get_dialect() + type mapping
     postgres_dialect.py
     duckdb_dialect.py
+    mssql_dialect.py            # SQL Server 2019+ / Azure SQL (and the other engines' files)
   engine.py                     # segmentation + recursive bisection (engine-agnostic)
   cli.py                        # argparse entry point, human + JSON output
 tests/

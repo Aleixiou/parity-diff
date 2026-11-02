@@ -131,6 +131,33 @@ def _bigquery_available() -> tuple[bool, str]:
     return True, ""
 
 
+#: SQL Server, if one is configured: `mssql://sa:<pw>@127.0.0.1:14330/parity_utf8
+#: ?trust_server_certificate=yes` against the local Developer-edition container
+#: (see tests/test_mssql.py). Opt-in like Snowflake: CI has no SQL Server. The
+#: login must be able to create databases - the fixtures build their own - and
+#: the optional `PARITY_TEST_MSSQL_RO` names a second, read-only login.
+MSSQL_URL = os.environ.get("PARITY_TEST_MSSQL", "")
+MSSQL_RO_URL = os.environ.get("PARITY_TEST_MSSQL_RO", "")
+
+
+def _mssql_available() -> tuple[bool, str]:
+    """Can we reach SQL Server? Returns (yes/no, why not).
+
+    Gated on the env var first so an unconfigured run skips instantly.
+    """
+    if not MSSQL_URL:
+        return False, "PARITY_TEST_MSSQL is not set"
+    try:
+        import mssql_python  # noqa: F401 - importing it is the probe
+    except ImportError:  # pragma: no cover - depends on install extras
+        return False, "mssql-python is not installed"
+    try:
+        get_dialect(MSSQL_URL, side="A").close()
+    except Exception as exc:  # pragma: no cover - depends on the server
+        return False, f"no SQL Server at the configured URL: {type(exc).__name__}"
+    return True, ""
+
+
 def _duckdb_available() -> tuple[bool, str]:
     """Is the duckdb driver installed? Returns (yes/no, why not)."""
     try:
@@ -177,6 +204,15 @@ def bigquery_url() -> str:
 
 
 @pytest.fixture(scope="session")
+def mssql_url() -> str:
+    """The SQL Server endpoint, or skip if none is configured/reachable."""
+    ok, why = _mssql_available()
+    if not ok:
+        pytest.skip(why)
+    return MSSQL_URL
+
+
+@pytest.fixture(scope="session")
 def duckdb_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A scratch path for a DuckDB file, unique to this test session."""
     ok, why = _duckdb_available()
@@ -219,4 +255,9 @@ def open_snowflake(url: str, side: str = "A", float_scale: int = 6):
 
 def open_bigquery(url: str, side: str = "A", float_scale: int = 6):
     """Open a read-only BigQuery dialect (the client is scoped bigquery.readonly)."""
+    return get_dialect(url, side=side, float_scale=float_scale)
+
+
+def open_mssql(url: str, side: str = "A", float_scale: int = 6):
+    """Open a SQL Server dialect (SNAPSHOT where the database allows it)."""
     return get_dialect(url, side=side, float_scale=float_scale)

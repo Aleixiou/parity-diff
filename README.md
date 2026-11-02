@@ -89,6 +89,7 @@ pip install "parity-diff[postgres]"   # PostgreSQL only
 pip install "parity-diff[mysql]"      # MySQL only
 pip install "parity-diff[snowflake]"  # Snowflake only
 pip install "parity-diff[bigquery]"   # BigQuery only
+pip install "parity-diff[mssql]"      # SQL Server / Azure SQL only
 ```
 
 > The PyPI distribution is `parity-diff` — plain `parity` is squatted by an
@@ -129,6 +130,8 @@ duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 duckdb:///:memory:
 snowflake://user:password@account/database/schema?warehouse=wh&role=r
 bigquery://project/dataset                      (optional ?location=EU)
+mssql://user:password@host:port/database        (also sqlserver://; port 1433)
+mssql://user:password@host/database?instance=SQLEXPRESS&encrypt=strict
 ```
 
 Table names may be schema-qualified. Unqualified names default to `public` on
@@ -144,6 +147,22 @@ connection string. The credentials are requested with the read-only
 `bigquery.readonly` scope, under which BigQuery itself refuses any write: the
 tool cannot modify your project even by mistake. The account needs BigQuery Job
 User on the project the jobs run in, and read access to the dataset.
+
+SQL Server (2019 or newer, and Azure SQL Database / Managed Instance) uses
+Microsoft's `mssql-python` driver, which needs no separately installed ODBC
+driver. Unqualified tables default to the login's own default schema (normally
+`dbo`). The connection string takes SQL authentication only so far, and a fixed
+set of options — `encrypt` (`yes`, `no`, `strict`, `mandatory`, `optional`),
+`trust_server_certificate` (`yes`/`no`), `application_intent`
+(`readonly`/`readwrite`), `login_timeout` (seconds) and `instance` (a named
+instance); anything else is refused rather than ignored, and every value is
+quoted so a `;` in a password cannot add a keyword. Encryption is on by default
+and the certificate is checked: use `trust_server_certificate=yes` only for a
+local test server with a self-signed certificate. SQL Server has no read-only
+session, so the tool issues only `SELECT`, refuses anything else before it
+reaches the server, and never commits — but **use a login that holds only
+`db_datareader`** (or `GRANT SELECT` on the tables), which makes the server
+itself refuse a write.
 
 `--json` emits the same content as a machine-readable object, including
 `identical`, `truncated`, per-difference values, and the full stats block.
@@ -261,6 +280,9 @@ stated plainly rather than buried.
   tokens on both sides.
 - **Wide tables are fine.** PostgreSQL caps a function call at 100 arguments,
   so the row concatenation is built as a nested tree; tested to 500 columns.
+  Long rows are fine too: SQL Server's `CONCAT_WS` silently cuts its result at
+  4,000 characters unless an argument is `nvarchar(max)`, so every value is
+  joined as one — tested with a difference planted at character 9,500.
 - **Supported types:** integer, decimal, float, boolean, string, date,
   timestamp. Anything else is compared as raw text and reported as a warning —
   two engines may render the same JSON or array differently for reasons that
@@ -288,6 +310,33 @@ stated plainly rather than buried.
   time. Diff the underlying table, or re-run, if the source is busy.
 - **Interrupting a BigQuery run waits for the in-flight query.** Cancelling a
   BigQuery job needs a write scope, and read-only was judged worth more.
+  The same is true of SQL Server, whose driver has no way to cancel a query.
+- **SQL Server reads one snapshot only if the database allows it.** With
+  `ALLOW_SNAPSHOT_ISOLATION ON` the diff runs in one SNAPSHOT transaction, like
+  PostgreSQL. Without it the run stays at READ COMMITTED and **every run prints
+  a warning** that it was not single-snapshot; it never falls back to
+  REPEATABLE READ, whose locks would block writers on a live system for the
+  whole diff, or to NOLOCK, whose dirty reads invent differences. A table
+  created or altered while a snapshot diff runs makes it stop with SQL Server's
+  error 3961 rather than read inconsistent data.
+- **SQL Server `datetime2(7)` and `datetimeoffset(7)` are compared at
+  microseconds**, the precision the other engines hold: the seventh digit (100
+  ns) is truncated, never rounded, so `23:59:59.9999995` stays on its day.
+  Every run comparing such a column says so. `datetime` (1/300 s ticks)
+  compares as its displayed milliseconds, `.003`/`.007`, which is what tools
+  export; a target that stored the exact tick (`.003333`) will differ.
+  `datetimeoffset` is compared as an instant in UTC.
+- **SQL Server `char(n)`/`nchar(n)` are compared without their trailing
+  padding**, as PostgreSQL's `char(n)` and MySQL's `CHAR` are: a `char(10)`
+  holding `abc` matches `abc` on the other side. Nothing is lost, since the
+  column cannot tell `abc` from `abc ` itself. GUIDs compare in lower case.
+- **SQL Server's own FLOAT rendering** (`float`, `real`) matches the canonical
+  form on the same 1,565-value sample and 10,000 random doubles, at scales 0–18;
+  `--float-scale` above 18 is refused for FLOAT columns there.
+- **Microsoft Fabric and Azure Synapse are not supported yet** and are refused
+  at connect, naming the engine edition: both isolate differently (Fabric
+  ignores `SET TRANSACTION ISOLATION LEVEL`; Synapse dedicated pools read
+  uncommitted by default), and neither has been verified.
 
 ## Supported engines
 
@@ -298,7 +347,8 @@ stated plainly rather than buried.
 | MySQL | supported (tested against 8.0) |
 | Snowflake | supported (verified live on AWS; `pip install "parity-diff[snowflake]"`) |
 | BigQuery | supported, unreleased (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
-| Redshift, Databricks | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
+| SQL Server / Azure SQL | supported, unreleased (SQL Server 2019+; verified live against 2022; `pip install "parity-diff[mssql]"`) |
+| Redshift, Databricks, Fabric | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
 
 ## Scope
 
@@ -325,7 +375,10 @@ server is reachable — the DuckDB and pure-Python suites still run. Snowflake
 and BigQuery have no local or CI instance, so their live suites run only when
 `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY`
 (`bigquery://<project>/<dataset>`) point at a real account; the BigQuery tests
-create and drop their own tables in that dataset.
+create and drop their own tables in that dataset. SQL Server's live suite runs
+when `PARITY_TEST_MSSQL` names a login that may create databases — the
+Developer-edition container works; see the top of `tests/test_mssql.py` — and
+`PARITY_TEST_MSSQL_RO`, if set, adds the read-only-login checks.
 
 A disposable PostgreSQL:
 

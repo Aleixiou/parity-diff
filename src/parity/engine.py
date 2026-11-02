@@ -419,13 +419,21 @@ def diff(
         # A dialect whose FLOAT rendering is not verified against the shared
         # canonical form says so, and the caveat reaches the output rather
         # than only the docs (CLAUDE.md section 8).
-        for side, dialect, cols in (("A", a, a_cols), ("B", b, b_cols)):
+        for side, dialect, cols, key_cols in (
+            ("A", a, a_cols, key_a.columns),
+            ("B", b, b_cols, key_b.columns),
+        ):
             floats = [c.name for c in cols if c.logical_type is LogicalType.FLOAT]
             caveat = dialect.float_caveat() if floats else None
             if caveat:
                 warnings.append(
                     f"side {side} ({dialect.name}) FLOAT columns {floats}: {caveat}"
                 )
+            # Anything else the dialect knows makes this comparison less than
+            # exact - SQL Server without snapshot isolation, say - reaches the
+            # output the same way, naming the side it applies to.
+            for note in dialect.caveats([*key_cols, *cols]):
+                warnings.append(f"side {side} ({dialect.name}): {note}")
 
         ks_a, ks_b = both("key_stats", key_a, _args_b=(key_b,))
 

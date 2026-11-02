@@ -3,6 +3,47 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
+## Unreleased
+
+### Added
+
+- **SQL Server support** — SQL Server 2019+ and Azure SQL Database / Managed
+  Instance (`pip install "parity-diff[mssql]"`,
+  `mssql://user:password@host:port/database`, also `sqlserver://`), through
+  Microsoft's `mssql-python` driver, which needs no system ODBC install.
+  Verified end to end against SQL Server 2022 in a UTF-8, a Latin1 (code page
+  1252) and a case-sensitive database: the hash constant agrees for `varchar`
+  and `nvarchar`, text hashes as the same UTF-8 bytes as every other engine
+  (accents, CJK, emoji), every row of a 5,000-row mixed-type table renders
+  byte-identically to DuckDB and the full-table checksum matches with zero rows
+  downloaded, and the changed-decimal, deleted-row, inserted-row, NULL-vs-`''`
+  and NULL-vs-FALSE checks each find exactly the planted row — also through the
+  CLI against PostgreSQL. FLOAT matches the canonical form on the adversarial
+  sample plus 10,000 random doubles.
+- **Three SQL Server false-match traps closed, each pinned by a planted
+  difference**: `CONCAT_WS` silently truncates to 4,000 characters unless an
+  argument is `nvarchar(max)` (every value is now one; a change at character
+  9,500 of the row text is found); text keys equal under the collation
+  (`'a'`, `'A'`, `'a '`) are counted distinct by SHA-256, not refused as
+  duplicates; and the bucket division divides an exact multiple rather than
+  relying on decimal `/`, checked at every boundary of ranges up to 2^64 wide.
+- **One snapshot on SQL Server when the database allows it**
+  (`ALLOW_SNAPSHOT_ISOLATION ON`); otherwise READ COMMITTED with a warning in
+  every run's output. Never REPEATABLE READ or NOLOCK.
+- **Dialect caveats reach the output.** A new `Dialect.caveats()` hook lets a
+  dialect report limitations of this particular comparison — SQL Server's
+  missing snapshot, or a `datetime2(7)` column compared at microseconds — and
+  the engine prints each as a warning naming the side (CLAUDE.md §8).
+
+### Changed
+
+- The shared checksum and key-statistics queries spell `GROUP BY`, `COUNT` and
+  the distinct-key count through three new dialect hooks (`group_by`, `count`,
+  `count_distinct_key`), because T-SQL accepts no `GROUP BY 1` and its `COUNT`
+  overflows past 2^31 − 1 rows. Their defaults emit exactly the old SQL: the
+  generated queries of PostgreSQL, DuckDB, MySQL, Snowflake and BigQuery are
+  byte-identical to 0.3.0's, so no checksum moves.
+
 ## 0.3.0 — 2026-11-02
 
 > **Upgrade from any earlier version.** Versions up to 0.2.3 could report two

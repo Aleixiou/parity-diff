@@ -409,6 +409,50 @@ class Dialect(ABC):
         """
         return None
 
+    def caveats(self, columns: Sequence[Column]) -> list[str]:
+        """Known limitations of this side's comparison, for the output.
+
+        CLAUDE.md section 8: an approximation the docs admit to must also reach
+        the output, or a reader takes the verdict as exact. The engine calls
+        this once per side with that side's compared columns, after
+        `connect`, and prints every line as a warning naming the side. A
+        dialect returns what holds for this connection - SQL Server, say,
+        whether the walk is pinned to one snapshot, which only the server can
+        tell it. Default: nothing to report.
+        """
+        return []
+
+    # --------------------------------------------------- SQL spelling hooks
+    #
+    # The shared queries below are standard SQL that every engine before
+    # SQL Server accepted. Each hook returns exactly the text the queries
+    # always had, so overriding is the only way any engine's SQL changes.
+
+    def count(self, expr: str = "*") -> str:
+        """`count(expr)`. SQL Server overrides it with `count_big`, because its
+        `count` returns a 32-bit int and raises past 2,147,483,647 rows."""
+        return f"count({expr})"
+
+    def count_distinct_key(self, key: KeySpec, identity: str) -> str:
+        """Count the distinct key identities - the uniqueness check.
+
+        Equality here is the engine's, and on SQL Server that is the column's
+        collation: case-insensitive by default, and blind to trailing spaces
+        under every collation, so two genuinely distinct text keys would merge
+        and raise a false "not unique". A dialect with such equality counts
+        something exact instead. Default `count(distinct identity)`.
+        """
+        return f"count(distinct {identity})"
+
+    def group_by(self, position: int, expr: str) -> str:
+        """How the checksum query names its grouping column.
+
+        By position (`1`) everywhere but SQL Server, whose GROUP BY accepts
+        neither an ordinal nor a select-list alias, so it repeats the
+        expression - `expr` is exactly the text the select list holds.
+        """
+        return str(position)
+
     def null_sentinel_sql(self) -> str:
         r"""SQL producing the NULL sentinel as a string literal.
 
@@ -537,8 +581,8 @@ class Dialect(ABC):
         # and so never NULL, which means a NULL component shows up as a
         # duplicate instead; that is the honest limit of doing this in one pass.
         sql = (
-            f"select min({bucket}), max({bucket}), count(*), "
-            f"count({identity}), count(distinct {identity}) "
+            f"select min({bucket}), max({bucket}), {self.count()}, "
+            f"{self.count(identity)}, {self.count_distinct_key(key, identity)} "
             f"from {self.qualify(table)}"
         )
         lo, hi, rows, non_null, distinct = self.query(sql)[0]
@@ -627,11 +671,11 @@ class Dialect(ABC):
         # hashed exactly once.
         content = self.row_hash([*key.columns, *columns])
         return (
-            f"select {bucket} as seg, count(*), "
+            f"select {bucket} as seg, {self.count()}, "
             f"{self.sum_wide(content)} "
             f"from {self.qualify(table)} "
             f"where {k} >= {self.int_literal(lo)} and {k} <= {self.int_literal(hi - 1)} "
-            f"group by 1"
+            f"group by {self.group_by(1, bucket)}"
         )
 
     def fetch_range(
@@ -711,10 +755,14 @@ def get_dialect(
         from parity.dialects.bigquery_dialect import BigQueryDialect
 
         dialect = BigQueryDialect(float_scale=float_scale, side=side)
+    elif scheme in ("mssql", "sqlserver"):
+        from parity.dialects.mssql_dialect import SQLServerDialect
+
+        dialect = SQLServerDialect(float_scale=float_scale, side=side)
     else:
         raise ValueError(
             f"[side {side}] no dialect for scheme {scheme!r}. "
-            f"Supported: duckdb, postgres, mysql, snowflake, bigquery."
+            f"Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql."
         )
     try:
         dialect.connect(connection_string)
