@@ -228,14 +228,31 @@ stated plainly rather than buried.
   can never merge them.
 - **Floats and decimals are compared at 6 decimal places** by default. Two
   values differing only in the 7th place are reported as *equal*. This is a
-  deliberate cross-engine rounding contract — the two engines do not otherwise
+  deliberate cross-engine rounding contract — the engines do not otherwise
   agree on float text. Change it with `--float-scale`; it always applies to
   both sides, and the scale in force is printed on every run.
+- **How a double is rounded, exactly.** Every engine renders a finite double
+  the same way: below 2^53 (about 9.0e15) its *shortest round-trip decimal* —
+  what Python's `repr` prints, and what the user most likely typed — rounded
+  half away from zero; from 2^53, where every double is an integer, its exact
+  integer value. So `2.0000005` compares as `2.000001` and `1e15+0.5` keeps
+  its `.5`; single-precision (`real`) columns are widened to double first.
+  PostgreSQL, DuckDB, MySQL and BigQuery agree byte for byte on a 1,565-value
+  adversarial sample (`demo/float_agreement.py`) and on 20,000 more random
+  doubles (10,000 on BigQuery), at several scales. PostgreSQL needs version
+  12 or newer for FLOAT columns (older servers are refused with a clear
+  error), and FLOAT columns accept `--float-scale` up to 20.
+- **Doubles of magnitude 2^116 (about 8.3e34) or more are refused**: the diff
+  stops with an error naming the value rather than rounding it approximately.
+  (This replaces the old DuckDB-only limit of 1e32, which PostgreSQL did not
+  share.)
+- **Snowflake FLOAT columns are not verified** against that canonical form —
+  no account was available when it was defined — and every run comparing one
+  prints a warning saying so. Snowflake DECIMAL columns are unaffected.
 - **Keys must be unique.** A non-unique key is detected up front and rejected.
   Silently collapsing duplicate rows would hide real differences.
 - **`Infinity` and `NaN`** in float columns are compared as those literal
-  tokens on both sides. A double whose magnitude reaches 1e32 is not supported
-  and fails loudly on DuckDB.
+  tokens on both sides.
 - **Wide tables are fine.** PostgreSQL caps a function call at 100 arguments,
   so the row concatenation is built as a nested tree; tested to 500 columns.
 - **Supported types:** integer, decimal, float, boolean, string, date,
@@ -263,14 +280,6 @@ stated plainly rather than buried.
   like every table on Snowflake (READ COMMITTED only), a view that changes
   during the run can produce differences that never existed at one point in
   time. Diff the underlying table, or re-run, if the source is busy.
-- **Doubles far from zero round differently on PostgreSQL than on DuckDB and
-  BigQuery.** At 6 decimal places, a double carrying more than ~15 significant
-  digits (roughly, magnitudes above 1e9 with a fractional part, or values a
-  hair from a rounding boundary) is rounded via 15 significant digits by
-  PostgreSQL and via the double multiplied by 10^6 by DuckDB; BigQuery is made
-  to reproduce DuckDB's arithmetic exactly. On such values a PostgreSQL ↔ DuckDB/BigQuery
-  comparison reports a difference that is only rounding. It never hides a real
-  one. Decimal (`numeric`) columns are unaffected.
 - **Interrupting a BigQuery run waits for the in-flight query.** Cancelling a
   BigQuery job needs a write scope, and read-only was judged worth more.
 

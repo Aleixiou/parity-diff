@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 from parity.dialects.base import (
+    FLOAT_EXACT_INT_FROM,
+    FLOAT_MAX_MAGNITUDE_SQL,
+    FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
     Dialect,
     sql_literal,
@@ -24,9 +27,9 @@ class PostgresDialect(Dialect):
     def connect(self, connection_string: str) -> None:
         """Open a read-only, UTC-pinned, single-snapshot session.
 
-        Four settings, in this order, and the order matters: the timezone is
-        set while autocommit is still on so it sticks to the session rather
-        than to a transaction that never commits.
+        Five settings, in this order, and the order matters: the timezone and
+        `extra_float_digits` are set while autocommit is still on so they stick
+        to the session rather than to a transaction that never commits.
         """
         import psycopg
 
@@ -43,6 +46,17 @@ class PostgresDialect(Dialect):
         # Done while autocommit is still on, so it applies to the session
         # rather than to a transaction that later rolls back.
         self._conn.execute("set time zone 'UTC'")
+        # FLOAT canonical text casts a double to text and relies on that being
+        # the shortest round-trip decimal. PostgreSQL 12+ prints exactly that
+        # whenever extra_float_digits > 0 (the default is 1), but a session or
+        # role default of 0 or less falls back to 15 significant digits and a
+        # value like 1e15+0.5 would render as 1e15. Pin it, like the timezone.
+        self._conn.execute("set extra_float_digits = 1")
+        # PostgreSQL 11 and older print 17 significant digits instead of the
+        # shortest repr, so FLOAT columns cannot be rendered canonically there;
+        # `normalize` refuses them rather than report rounding-only diffs.
+        row = self._conn.execute("show server_version_num").fetchone()
+        self._server_version_num = int(row[0]) if row else 0
         self._conn.autocommit = False
         # Read-only by construction (CLAUDE.md section 6). Enforced by the
         # server, so no bug in query building can write to a user's database.
@@ -122,17 +136,56 @@ class PostgresDialect(Dialect):
         if t is LogicalType.INTEGER:
             expr = f"({c})::text"
         elif t is LogicalType.FLOAT:
+            # Widen first: a single-precision column (`real`, FLOAT) is cast to
+            # double, which is exact on every engine, so float4 and float8 share
+            # one canonical form. Rendered as float4 directly, PostgreSQL and
+            # DuckDB print different shortest reprs (-4088288.25 as `-4088288.2`
+            # against `-4088288.25`) and MySQL prints only 6 digits. For a
+            # double column the cast is a no-op.
+            c = f"({c})::float8"
             # PostgreSQL renders these as 'Infinity' / '-Infinity' / 'NaN' on
             # its own, but spelling them explicitly keeps the two engines
             # agreeing by construction rather than by coincidence - DuckDB
             # cannot cast them to DECIMAL at all and needs the same tokens.
             # Note NaN must be found by equality, not `c <> c`: PostgreSQL
             # deliberately treats NaN as equal to itself, unlike IEEE 754.
+            #
+            # Finite values follow `canonical_float_text` (base.py), not
+            # `round(c::numeric, s)`: float8 -> numeric keeps only 15
+            # significant digits, so 1e15+0.5 became `...0.000000` while
+            # DuckDB and MySQL rendered `...0.500000`. Below 2^53 the text
+            # cast is the shortest round-trip decimal - pinned by
+            # `extra_float_digits = 1` at connect - which numeric parses
+            # exactly (exponent notation included) and `round` rounds half
+            # away from zero. From 2^53 every double is an integer, rebuilt
+            # exactly from two bigints, because PostgreSQL's shortest-repr
+            # differs from the other engines' at rounding boundaries there.
+            # Past 2^116 the bigint would overflow: the cast of a non-numeric
+            # string raises, naming the value, instead of rounding it.
+            # Only a connected dialect knows its server; an unconnected one
+            # (SQL generation in tests) is assumed current.
+            version = getattr(self, "_server_version_num", 120000)
+            if version < 120000:
+                raise self._err(
+                    f"FLOAT column {column.name!r} needs PostgreSQL 12 or newer "
+                    f"(server_version_num {version}): older servers do not "
+                    f"print doubles as their shortest round-trip decimal, so "
+                    f"they cannot be rendered canonically"
+                )
+            s = self.float_scale_for(column)
+            two53 = f"{FLOAT_EXACT_INT_FROM}::float8"
+            hi = f"trunc({c} / {two53})"
             expr = (
                 f"case when {c} = 'Infinity'::float8 then 'Infinity' "
                 f"when {c} = '-Infinity'::float8 then '-Infinity' "
                 f"when {c} = 'NaN'::float8 then 'NaN' "
-                f"else cast(round(({c})::numeric, {self.float_scale}) as text) end"
+                f"when abs({c}) < {two53} "
+                f"then cast(round(cast(cast({c} as text) as numeric), {s}) as text) "
+                f"when abs({c}) < '{FLOAT_MAX_MAGNITUDE_SQL}'::float8 "
+                f"then cast(round(cast({hi} as bigint)::numeric * {FLOAT_EXACT_INT_FROM} "
+                f"+ cast({c} - {hi} * {two53} as bigint), {s}) as text) "
+                f"when {c} is not null then cast(cast('{FLOAT_OUT_OF_RANGE_MESSAGE}' || cast({c} as text) "
+                f"as float8) as text) end"
             )
         elif t is LogicalType.DECIMAL:
             expr = f"cast(round(({c})::numeric, {self.float_scale}) as text)"

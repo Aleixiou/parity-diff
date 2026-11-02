@@ -106,7 +106,7 @@ contract. All 17 cases below were verified to agree exactly.
 |---|---|---|
 | INTEGER | `cast(c as varchar)` | `(c)::text` |
 | DECIMAL | `cast(cast(c as decimal(38,6)) as varchar)` | `cast(round((c)::numeric, 6) as text)` |
-| FLOAT (finite) | `cast(cast(c as decimal(38,6)) as varchar)` | `cast(round((c)::numeric, 6) as text)` |
+| FLOAT (finite) | see **FLOAT canonical form** below | see below |
 | FLOAT (non-finite) | `case when isinf(c) … 'Infinity'/'-Infinity' when isnan(c) then 'NaN'` | `case when c = 'Infinity'::float8 … when c = 'NaN'::float8 then 'NaN'` |
 | BOOLEAN | `case when c then 'true' when not c then 'false' end` | `case when c then 'true' when not c then 'false' end` |
 | STRING | `cast(c as varchar)` | `(c)::text` |
@@ -124,7 +124,7 @@ mixed-type rows; `tests/test_bigquery.py`). It has no `concat_ws`, and its
 | Logical type | BigQuery |
 |---|---|
 | DECIMAL | `format('%.6f', round(c, 6))` (round first, or `format` prints `-0.000000`) |
-| FLOAT (finite) | `format('%.6f', cast(round(c * 1e6) as bignumeric) / bignumeric '1000000')` (reproduces DuckDB's rounding; seven simpler spellings missed on 45-89 of 727 doubles) |
+| FLOAT (finite) | see **FLOAT canonical form** below (built from `cast(c as bignumeric)`) |
 | DATE | `format_date('%E4Y-%m-%d', c)` (`%Y` prints year 999 as `999`) |
 | DATETIME / TIMESTAMP | `format_datetime('%E4Y-%m-%d %H:%M:%E6S', c)` / `format_timestamp(..., c, 'UTC')` |
 | Row text | `array_to_string([...], chr(31))`, flat - byte-identical to nested `concat_ws` at 130 columns |
@@ -143,9 +143,69 @@ tokens `Infinity`, `-Infinity`, `NaN`. Note PostgreSQL cannot detect NaN with
 test must be `c = 'NaN'::float8`. DECIMAL needs no guard — PostgreSQL `numeric`
 renders NaN as text on its own and DuckDB `DECIMAL` cannot hold one.
 
-**Still unhandled:** a double whose magnitude reaches 1e32 overflows DuckDB's
-`decimal(38,6)` and raises. PostgreSQL's arbitrary-precision `numeric` does not.
-Rare in warehouse data, and it fails loudly rather than silently.
+**FLOAT canonical form** (verified 2026-11-02 against PostgreSQL 18.4, DuckDB
+1.5.5, MySQL 8.0.42 and live BigQuery; `tests/test_float_canonical.py`,
+`demo/float_agreement.py`). The definition is the Python function
+`canonical_float_text` in `dialects/base.py`; every engine must equal it byte
+for byte:
+
+- **|x| < 2^53:** the *shortest round-trip decimal* of the double, rounded half
+  away from zero to the float scale. A function of the IEEE value alone, and
+  the value the user typed, so a DECIMAL `2.0000005` and a DOUBLE `2.0000005`
+  both render `2.000001`.
+- **2^53 ≤ |x| < 2^116:** every such double is an integer; render it exactly.
+  Split as `hi = trunc(x / 2^53)` and `lo = x - hi * 2^53` (both exact in
+  double, both fit a signed 64-bit integer) and recombine in a decimal type.
+- **|x| ≥ 2^116 (~8.3e34):** refused loudly with an error naming the value.
+- Single-precision columns are widened to double first (exact everywhere).
+  Rendered as float4, the engines' shortest reprs differ.
+- `--float-scale` is honoured up to `FLOAT_MAX_SCALE` (20) for FLOAT columns
+  and refused past it: MySQL's DECIMAL cast clamps silently beyond, and
+  BigQuery's BIGNUMERIC has 38 places. Verified at scales 0, 2, 6, 9 and 20.
+
+| Engine | Finite FLOAT below 2^53 |
+|---|---|
+| PostgreSQL | `round(cast(cast(c as text) as numeric), 6)`, with `extra_float_digits = 1` pinned at connect; FLOAT refused on servers < 12 |
+| DuckDB | `abs(c) < 1e-7` → `'0.000000'`, else `cast(cast(cast(c as varchar) as decimal(38,6)) as varchar)` |
+| MySQL | `cast(cast(c as decimal(38,6)) as char)` (unchanged: its DECIMAL cast goes through dtoa's shortest repr) |
+| BigQuery | the first of `round(cast(c as bignumeric), n-1-e, 'ROUND_HALF_EVEN')` for n = 15, 16, 17 significant digits that casts back to `c`, then `round(.., 6)` |
+
+Every one of these was found by measurement, not by reading the docs:
+
+- **PostgreSQL `float8::numeric` keeps 15 significant digits**, so
+  `round(c::numeric, 6)` turned 1e15+0.5 into `1000000000000000.000000` - the
+  exact text DuckDB gives 1e15. That is a *false match*, not just a false
+  alarm. `float8::text` is the shortest repr only on PostgreSQL 12+ with
+  `extra_float_digits > 0`, hence the pin and the version refusal.
+- **DuckDB `cast(double as decimal(38,6))` computes `x * 10^6` in double**:
+  1e15+0.5 rendered `1000000000000000.524288`. Its string-to-decimal cast is
+  correct *except* in exponent notation with a large negative exponent, which
+  it rounds on the leading digit alone (`'6.4e-10'` → `0.000001`); values under
+  10^-(s+1) are zero at any reading, so they short-circuit before the cast.
+- **PostgreSQL's shortest repr (Ryu) excludes the rounding-interval boundaries
+  that dtoa (MySQL, DuckDB, Python) includes.** Below 2^53 a boundary always
+  has ≥ 17 significant digits, so the two agree; above 2^54 boundaries are
+  short integers and they do not (`3.8809635010537424e16` vs
+  `3.880963501053742e16`). Hence exact integers from 2^53.
+- **BigQuery has no shortest repr.** `CAST(x AS STRING)` is `%.15g` when that
+  round-trips and `%.17g` otherwise, never 16 digits; `FORMAT('%.Ng')` is not
+  correctly rounded (`%.17g` of 2^30 + 1/128 printed `...0078124`, exactly
+  `...0078125`). `CAST(x AS BIGNUMERIC)` *is* exact to 38 places, half up, so
+  the shortest repr is built from it. Candidates break ties to even, as Ryu
+  and dtoa do: 2^50 + 0.25 sits exactly between two 17-digit candidates that
+  both round-trip.
+- **MySQL's CAST to an integer type clamps silently** on overflow, so two
+  different huge doubles would compare equal; its out-of-range branch calls
+  `exp(abs(c))`, which raises error 1690 even inside a SELECT.
+- **Snowflake is not verified** against this form (no live account): its FLOAT
+  is still `cast(c as number(38,6))`, and `float_caveat()` makes every run that
+  compares a Snowflake FLOAT column print a warning.
+
+Before this form, PostgreSQL and DuckDB disagreed on 347 of the 1,565 sample
+doubles, PostgreSQL and MySQL on 296, DuckDB and MySQL on 289; now every pair
+of the four agrees on all of them at scales 0, 2, 6 and 9, and on 20,000
+further random doubles (10,000 on BigQuery). None of the 1,217 values on which
+all four already agreed changed text.
 
 **Known, deliberate limitation:** floats and decimals are compared at 6 decimal
 places. Document this loudly in the README — silent precision assumptions are

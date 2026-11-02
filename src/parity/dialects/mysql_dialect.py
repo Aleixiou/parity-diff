@@ -24,7 +24,13 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from parity.dialects.base import HASH_HEX_CHARS, Dialect, sql_literal
+from parity.dialects.base import (
+    FLOAT_EXACT_INT_FROM,
+    FLOAT_MAX_MAGNITUDE_SQL,
+    HASH_HEX_CHARS,
+    Dialect,
+    sql_literal,
+)
 from parity.types import Column, LogicalType
 
 
@@ -153,17 +159,50 @@ class MySQLDialect(Dialect):
     def normalize(self, column: Column) -> str:
         """Render one column as canonical text, null-safe.
 
-        The DECIMAL/FLOAT path matches DuckDB's exactly - cast to
-        DECIMAL(38, scale) then to text - so `1.5` becomes `'1.500000'` on all
-        three engines. Every branch ends inside the coalesce, so NULL always
-        becomes the sentinel.
+        DECIMAL casts to DECIMAL(38, scale) then to text, as DuckDB does, so
+        `1.5` becomes `'1.500000'`; FLOAT follows the shared canonical float
+        form (see the branch). Every branch ends inside the coalesce, so NULL
+        always becomes the sentinel.
         """
         c = self.quote(column.name)
         t = column.logical_type
         if t is LogicalType.INTEGER:
             expr = f"cast({c} as char)"
-        elif t in (LogicalType.DECIMAL, LogicalType.FLOAT):
+        elif t is LogicalType.DECIMAL:
             expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as char)"
+        elif t is LogicalType.FLOAT:
+            # Widen first: a single-precision column (`real`, FLOAT) is cast to
+            # double, which is exact on every engine, so float4 and float8 share
+            # one canonical form. Rendered as float4 directly, PostgreSQL and
+            # DuckDB print different shortest reprs (-4088288.25 as `-4088288.2`
+            # against `-4088288.25`) and MySQL prints only 6 digits. For a
+            # double column the cast is a no-op.
+            c = f"cast({c} as double)"
+            # Finite values follow `canonical_float_text` (base.py). Below 2^53
+            # MySQL's double -> DECIMAL cast already is that: it converts
+            # through the shortest round-trip decimal (dtoa) and rounds half
+            # away from zero - verified identical to the Python spec on every
+            # value of the adversarial sample, so these checksums do not move.
+            # From 2^53 every double is an integer, rebuilt exactly from two
+            # BIGINTs, because PostgreSQL cannot match the shortest repr there.
+            # Past 2^116 the high half overflows BIGINT, and MySQL's CAST would
+            # *clamp* it silently - two different huge values comparing equal.
+            # MySQL has no error() and a SELECT turns most errors into
+            # warnings, but exp() overflow is a hard error (1690), so that
+            # branch raises "DOUBLE value is out of range in 'exp(...)'".
+            # MySQL DOUBLE cannot hold Infinity or NaN, so no tokens here.
+            s = self.float_scale_for(column)
+            hi = f"truncate({c} / {FLOAT_EXACT_INT_FROM}, 0)"
+            expr = (
+                f"case when abs({c}) < {FLOAT_EXACT_INT_FROM} "
+                f"then cast(cast({c} as decimal(38,{s})) as char) "
+                f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as double) "
+                f"then cast(cast(cast({hi} as signed) as decimal(65,0)) "
+                f"* {FLOAT_EXACT_INT_FROM} "
+                f"+ cast({c} - {hi} * {FLOAT_EXACT_INT_FROM} as signed) "
+                f"as decimal(65,{s})) "
+                f"when {c} is not null then cast(exp(abs({c})) as char) end"
+            )
         elif t is LogicalType.BOOLEAN:
             # MySQL BOOLEAN is an alias for TINYINT(1): 0 or 1, never a real
             # boolean. `when not c` still routes NULL to the sentinel.

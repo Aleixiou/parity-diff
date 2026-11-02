@@ -22,13 +22,14 @@ The BigQuery-specific decisions, each confirmed by that run:
   prints `-0.000000` for a value like -0.0000001 that rounds to zero, where
   DuckDB and PostgreSQL print `0.000000`. `ROUND` to the scale first lands on a
   NUMERIC zero, which has no sign.
-- **FLOAT copies DuckDB's arithmetic, not the obvious expression.** Every
-  natural BigQuery spelling (`FORMAT` on the double, `ROUND` on the double, a
-  cast through NUMERIC or BIGNUMERIC) disagreed with DuckDB on 45-89 of 727
-  sample doubles, because each rounds a *different* intermediate value. DuckDB
-  multiplies by 10^scale in double precision and rounds half away from zero;
-  doing exactly that here and dividing back exactly in BIGNUMERIC matched DuckDB
-  on all 727. See `normalize`.
+- **FLOAT builds the shortest repr, which BigQuery does not print.** The
+  canonical float form (`canonical_float_text` in base.py) starts from a
+  double's shortest round-trip decimal. `CAST(x AS STRING)` never prints 16
+  digits and `FORMAT('%.17g')` is not correctly rounded, but
+  `CAST(x AS BIGNUMERIC)` is exact to 38 places, so the shortest repr is the
+  first of its 15-, 16- and 17-significant-digit roundings that parses back to
+  x. Verified identical to the Python spec, and so to PostgreSQL, DuckDB and
+  MySQL, on 1,565 adversarial and 10,000 random doubles. See `normalize`.
 - **Years below 1000.** `%Y` renders year 999 as `999`; DuckDB and PostgreSQL
   zero-pad to `0999`. `%E4Y` pads.
 - **TIMESTAMP is an instant, DATETIME is naive.** Both map to TIMESTAMP, but the
@@ -58,7 +59,15 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
-from parity.dialects.base import HASH_HEX_CHARS, Dialect
+from parity.dialects.base import (
+    FLOAT_EXACT_INT_FROM,
+    FLOAT_MAX_MAGNITUDE_SQL,
+    FLOAT_OUT_OF_RANGE_MESSAGE,
+    HASH_HEX_CHARS,
+    Dialect,
+    float_tiny_sql,
+    float_zero_text,
+)
 from parity.types import Column, LogicalType
 
 #: Read-only OAuth scope. Under it the server refuses any DML, DDL or script,
@@ -335,20 +344,58 @@ class BigQueryDialect(Dialect):
             # 312 decimals, halfway cases included.
             expr = f"format({fmt}, round({c}, {s}))"
         elif t is LogicalType.FLOAT:
-            # DuckDB renders a double as round(c * 10^s) computed in double
-            # precision; PostgreSQL goes through 15 significant digits, and the
-            # two already disagree on large or near-halfway doubles. This
-            # reproduces DuckDB's arithmetic exactly - the multiply in FLOAT64
-            # (same IEEE rounding), ROUND half away from zero, then an exact
-            # BIGNUMERIC division back to the scale. Verified identical to
-            # DuckDB on 727 doubles where every simpler spelling missed 45+.
+            # Finite values follow `canonical_float_text` (base.py): below 2^53
+            # the shortest round-trip decimal, rounded half away from zero.
+            # BigQuery has no shortest-repr function, and neither obvious
+            # route builds one: CAST(x AS STRING) is %.15g when that round-
+            # trips and %.17g otherwise, never 16 digits (2^45 + 3/128 prints
+            # `...832.023`, not `...832.02`), and FORMAT('%.17g') is not even
+            # correctly rounded (2^30 + 1/128 printed `...0078124`, exactly
+            # `...0078125`; %.15g and %.16g missed 52 and 203 of the sample).
+            # What *is* exact is CAST(x AS BIGNUMERIC): x to 38 places, half
+            # up, verified on every sample value. So the shortest repr is
+            # built from it: round to 15, then 16, then 17 significant digits
+            # and keep the first that parses back to x. Each is the closest
+            # decimal of its length, and below 2^53 the closest one round-trips
+            # whenever any of that length does, so this is exactly the shortest
+            # repr. Ties go to even, as Ryu and dtoa break them: 2^50 + 0.25
+            # sits exactly between two 17-digit candidates that both round-trip,
+            # and every other engine prints `...910.2`, not `...910.3`. Significant digits need the
+            # decimal exponent e, read off the exact integer part's length (or
+            # the leading zeros below 1) rather than a float log10.
+            # Values under 10^-(s+1) are zero at this scale and short-circuit,
+            # which also keeps e within BIGNUMERIC's 38 places.
+            # From 2^53 every double is an integer, rebuilt exactly from two
+            # INT64s; past 2^116 the high half overflows and ERROR() refuses.
             # Inf/NaN cannot reach BIGNUMERIC, so they become the fixed tokens.
+            self.float_scale_for(column)  # BIGNUMERIC's 38 places bound it
+            xb = f"abs(cast({c} as bignumeric))"
+            e = (
+                f"(case when {xb} >= 1 then length(cast(trunc({xb}) as string)) - 1 "
+                f"else -1 - length(regexp_extract(cast({xb} as string), r'^0[.](0*)')) end)"
+            )
+            r15, r16, r17 = (
+                f"round(cast({c} as bignumeric), {n - 1} - {e}, 'ROUND_HALF_EVEN')"
+                for n in (15, 16, 17)
+            )
+            shortest = (
+                f"case when cast({r15} as float64) = {c} then {r15} "
+                f"when cast({r16} as float64) = {c} then {r16} else {r17} end"
+            )
+            two53 = f"{FLOAT_EXACT_INT_FROM}"
+            hi = f"trunc({c} / {two53})"
             expr = (
                 f"case when is_inf({c}) then (case when {c} > 0 then 'Infinity' "
                 f"else '-Infinity' end) "
                 f"when is_nan({c}) then 'NaN' "
-                f"else format({fmt}, cast(round({c} * 1e{s}) as bignumeric) "
-                f"/ bignumeric '1{'0' * s}') end"
+                f"when abs({c}) < {float_tiny_sql(s)} then '{float_zero_text(s)}' "
+                f"when abs({c}) < {two53} "
+                f"then format({fmt}, round({shortest}, {s})) "
+                f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as float64) "
+                f"then format({fmt}, cast(cast({hi} as int64) as bignumeric) * {two53} "
+                f"+ cast({c} - {hi} * {two53} as int64)) "
+                f"when {c} is not null then error(concat('{FLOAT_OUT_OF_RANGE_MESSAGE}', "
+                f"cast({c} as string))) end"
             )
         elif t is LogicalType.BOOLEAN:
             # `when not`, never `else`: an `else` sends NULL to 'false'.

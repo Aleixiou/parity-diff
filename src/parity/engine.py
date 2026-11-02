@@ -416,6 +416,16 @@ def diff(
         shared = _select_columns(cols_a, cols_b, key_folds, columns, exclude, warnings)
         a_cols = [cols_a[f] for f in shared]
         b_cols = [cols_b[f] for f in shared]
+        # A dialect whose FLOAT rendering is not verified against the shared
+        # canonical form says so, and the caveat reaches the output rather
+        # than only the docs (CLAUDE.md section 8).
+        for side, dialect, cols in (("A", a, a_cols), ("B", b, b_cols)):
+            floats = [c.name for c in cols if c.logical_type is LogicalType.FLOAT]
+            caveat = dialect.float_caveat() if floats else None
+            if caveat:
+                warnings.append(
+                    f"side {side} ({dialect.name}) FLOAT columns {floats}: {caveat}"
+                )
 
         ks_a, ks_b = both("key_stats", key_a, _args_b=(key_b,))
 

@@ -165,15 +165,6 @@ def test_normalize_renders_each_logical_type():
         (_col("c", LogicalType.INTEGER), "cast(`c` as string)"),
         (_col("c", LogicalType.DECIMAL), "format('%.6f', round(`c`, 6))"),
         (
-            _col("c", LogicalType.FLOAT),
-            (
-                "case when is_inf(`c`) then (case when `c` > 0 then 'Infinity' "
-                "else '-Infinity' end) when is_nan(`c`) then 'NaN' "
-                "else format('%.6f', cast(round(`c` * 1e6) as bignumeric) "
-                "/ bignumeric '1000000') end"
-            ),
-        ),
-        (
             _col("c", LogicalType.BOOLEAN),
             "case when `c` then 'true' when not `c` then 'false' end",
         ),
@@ -198,13 +189,33 @@ def test_normalize_renders_each_logical_type():
         assert d.normalize(column) == f"coalesce({inner}, {SENTINEL})", column
 
 
-def test_float_scale_reaches_both_the_multiplier_and_the_divisor():
-    """A different --float-scale must change both halves of the float path,
-    or the value would be scaled up by one power and down by another."""
+def test_float_branch_structure():
+    """FLOAT is too long to pin verbatim (it builds the shortest repr), so pin
+    its load-bearing parts: the tokens, the zero short-circuit, the 15/16/17
+    significant-digit candidates with ties to even, the exact-integer split
+    from 2^53, and the loud refusal past 2^116. The values themselves are
+    checked live against the Python spec in test_float_canonical.py."""
+    sql = _d().normalize(_col("c", LogicalType.FLOAT))
+    assert sql.startswith(
+        "coalesce(case when is_inf(`c`) then (case when `c` > 0 then 'Infinity' "
+        "else '-Infinity' end) when is_nan(`c`) then 'NaN' "
+        "when abs(`c`) < 1e-7 then '0.000000' when abs(`c`) < 9007199254740992 "
+    )
+    for n in (14, 15, 16):  # n - 1 for 15, 16, 17 significant digits
+        assert f"round(cast(`c` as bignumeric), {n} - (case" in sql
+    assert sql.count("'ROUND_HALF_EVEN'") == 5  # r15 twice, r16 twice, r17
+    assert "cast(trunc(`c` / 9007199254740992) as int64)" in sql
+    assert "error(concat('parity: FLOAT value out of the comparable range" in sql
+
+
+def test_float_scale_reaches_every_float_and_decimal_rounding():
+    """A different --float-scale must move the zero threshold, the zero text,
+    the final rounding and the format, or the scale would be applied twice."""
     d = BigQueryDialect(side="A", float_scale=2)
     sql = d.normalize(_col("c", LogicalType.FLOAT))
-    assert "round(`c` * 1e2)" in sql and "/ bignumeric '100'" in sql
-    assert "'%.2f'" in sql
+    assert "abs(`c`) < 1e-3 then '0.00'" in sql
+    assert "'ROUND_HALF_EVEN') end, 2))" in sql
+    assert "'%.2f'" in sql and "'%.6f'" not in sql
     assert "round(`c`, 2)" in d.normalize(_col("c", LogicalType.DECIMAL))
 
 

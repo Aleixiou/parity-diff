@@ -9,7 +9,15 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from parity.dialects.base import HASH_HEX_CHARS, Dialect
+from parity.dialects.base import (
+    FLOAT_EXACT_INT_FROM,
+    FLOAT_MAX_MAGNITUDE_SQL,
+    FLOAT_OUT_OF_RANGE_MESSAGE,
+    HASH_HEX_CHARS,
+    Dialect,
+    float_tiny_sql,
+    float_zero_text,
+)
 from parity.types import Column, LogicalType
 
 
@@ -111,16 +119,42 @@ class DuckDBDialect(Dialect):
         if t is LogicalType.INTEGER:
             expr = f"cast({c} as varchar)"
         elif t is LogicalType.FLOAT:
+            # Widen first: a single-precision column (`real`, FLOAT) is cast to
+            # double, which is exact on every engine, so float4 and float8 share
+            # one canonical form. Rendered as float4 directly, PostgreSQL and
+            # DuckDB print different shortest reprs (-4088288.25 as `-4088288.2`
+            # against `-4088288.25`) and MySQL prints only 6 digits. For a
+            # double column the cast is a no-op.
+            c = f"cast({c} as double)"
             # Infinity and NaN cannot be cast to DECIMAL - DuckDB raises
             # "Could not cast value inf to DECIMAL(38,6)" and the whole diff
             # dies. They are ordinary in float columns (any division by zero
             # produces one), so render them as fixed tokens that PostgreSQL
             # spells the same way.
+            #
+            # Finite values follow `canonical_float_text` (base.py), and the
+            # direct `cast(c as decimal(38,s))` does not: it computes c * 10^s
+            # in double precision, so 1e15+0.5 rendered `...0.524288`. Below
+            # 2^53 the varchar cast is the shortest round-trip decimal, and the
+            # string-to-decimal cast rounds it half away from zero - except in
+            # exponent notation with a large negative exponent, which it rounds
+            # on the leading digit alone (`'6.4e-10'` -> `0.000001`). Anything
+            # under 10^-(s+1) is zero at this scale, so it short-circuits there.
+            # From 2^53 every double is an integer and hugeint holds it
+            # exactly; past 2^116 the other engines cannot, so refuse it too.
+            s = self.float_scale_for(column)
+            zero = float_zero_text(s)
+            frac = "." + "0" * s if s else ""
             expr = (
                 f"case when isinf({c}) then (case when {c} > 0 then 'Infinity' "
                 f"else '-Infinity' end) "
                 f"when isnan({c}) then 'NaN' "
-                f"else cast(cast({c} as decimal(38,{self.float_scale})) as varchar) end"
+                f"when abs({c}) < cast('{float_tiny_sql(s)}' as double) then '{zero}' "
+                f"when abs({c}) < cast('{FLOAT_EXACT_INT_FROM}' as double) "
+                f"then cast(cast(cast({c} as varchar) as decimal(38,{s})) as varchar) "
+                f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as double) "
+                f"then cast(cast({c} as hugeint) as varchar) || '{frac}' "
+                f"when {c} is not null then error('{FLOAT_OUT_OF_RANGE_MESSAGE}' || cast({c} as varchar)) end"
             )
         elif t is LogicalType.DECIMAL:
             expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as varchar)"

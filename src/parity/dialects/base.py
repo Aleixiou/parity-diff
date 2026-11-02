@@ -45,6 +45,103 @@ MAX_CONCAT_ARGS = 64
 #: documented limitation - see CLAUDE.md section 4.2.
 DEFAULT_FLOAT_SCALE = 6
 
+# ------------------------------------------------------------------ FLOAT
+#
+# The canonical text of a finite double. Every engine must compute exactly
+# `canonical_float_text` below, and the obvious per-engine spellings do not:
+# PostgreSQL's `float8::numeric` keeps only 15 significant digits, and DuckDB's
+# `cast(double as decimal)` multiplies by 10^scale in double precision, so the
+# two disagreed on a fifth of an adversarial sample of doubles - rounding-only
+# false alarms (1e15+0.5 rendered `...0.500000` against `...0.524288`). The
+# definition below is a function of the IEEE value alone, so two equal doubles
+# always render identically, and every engine can reach it:
+#
+# - |x| < 2^53: take the *shortest round-trip* decimal (what Python's repr,
+#   PostgreSQL 12+'s float8out, DuckDB's and MySQL's double-to-text all print)
+#   and round it half away from zero to the float scale. It is also the value
+#   a user typed, so a DECIMAL 2.0000005 and a DOUBLE 2.0000005 still agree.
+# - 2^53 <= |x| < 2^116: every such double is an integer; render it exactly.
+#   Not the shortest repr, because PostgreSQL's shortest-repr algorithm (Ryu)
+#   excludes the rounding-interval boundaries where MySQL's and DuckDB's (dtoa)
+#   include them, and above 2^54 those boundaries are short integers - so
+#   3.8809635010537424e16 prints with 17 digits on one and 16 on the others.
+#   Every engine splits x into trunc(x / 2^53) and the exact remainder, both
+#   held exactly in a 64-bit integer, and recombines them in a decimal type.
+# - |x| >= 2^116: the high half no longer fits 64 bits. Refused loudly, with
+#   an error naming the value, on every engine - never rendered approximately.
+
+#: Below this magnitude a double's shortest round-trip decimal is the same on
+#: every engine; at and above it every double is an integer and is rendered
+#: exactly. 2^53, exactly representable.
+FLOAT_EXACT_INT_FROM = 2**53
+
+#: Doubles at or above this magnitude are refused: trunc(x / 2^53) no longer
+#: fits a signed 64-bit integer. 2^116 ~= 8.3e34, exactly representable.
+FLOAT_MAX_MAGNITUDE = 2**116
+
+#: `FLOAT_MAX_MAGNITUDE` as a decimal string that parses to exactly 2^116.
+FLOAT_MAX_MAGNITUDE_SQL = "83076749736557242056487941267521536"
+
+#: The text every engine raises with for a double past `FLOAT_MAX_MAGNITUDE`.
+#: The refusing branch must be `when c is not null then ...`, never `else`: a
+#: NULL fails every magnitude test and would land in it - BigQuery then raised
+#: "Input to ERROR function must not be NULL" on an ordinary NULL double. The
+#: boolean `else` trap again (CLAUDE.md section 4.3), in a new place.
+FLOAT_OUT_OF_RANGE_MESSAGE = (
+    "parity: FLOAT value out of the comparable range (|x| >= 2^116, about "
+    "8.3e34) - refusing to round it: "
+)
+
+
+#: Largest --float-scale a FLOAT column can be compared at. Every double below
+#: 2^53 needs 16 integer digits, and BigQuery's BIGNUMERIC holds 38 decimal
+#: places, which a 17-significant-digit rounding of a value just above
+#: 10^-(scale+1) needs scale + 18 of. Past it MySQL's DECIMAL cast would clamp
+#: silently (2e15 at 23 places became 999999999999999.999...) and BigQuery
+#: would round from a truncated value, so it is refused instead.
+FLOAT_MAX_SCALE = 20
+
+
+def float_tiny_sql(scale: int) -> str:
+    """Magnitude below which a double renders as zero at `scale`, as a literal.
+
+    10^-(scale+1) is far below the half-unit 5 * 10^-(scale+1), so anything
+    smaller rounds to zero under any reading of the value. Engines use it to
+    short-circuit values whose text would be in exponent notation, which
+    DuckDB's string-to-decimal cast rounds wrongly (`'6.4e-10'` became
+    `0.000001`).
+    """
+    return f"1e-{scale + 1}"
+
+
+def float_zero_text(scale: int) -> str:
+    """Zero at `scale` places, unsigned: `0.000000`, or `0` at scale 0."""
+    return "0." + "0" * scale if scale else "0"
+
+
+def canonical_float_text(x: float, scale: int = DEFAULT_FLOAT_SCALE) -> str:
+    """The canonical text of a double, in Python: the executable spec.
+
+    Every dialect's FLOAT expression must agree with this byte for byte; the
+    cross-engine tests and `demo/float_agreement.py` check them against it.
+    Raises ValueError for non-finite values (the dialects emit the tokens
+    `Infinity`, `-Infinity`, `NaN`) and past `FLOAT_MAX_MAGNITUDE`.
+    """
+    import math
+    from decimal import ROUND_HALF_UP, Context, Decimal
+
+    if not math.isfinite(x):
+        raise ValueError(f"not finite: {x!r}")
+    if abs(x) >= FLOAT_MAX_MAGNITUDE:
+        raise ValueError(FLOAT_OUT_OF_RANGE_MESSAGE + repr(x))
+    exact_int = abs(x) >= FLOAT_EXACT_INT_FROM
+    d = Decimal(int(x)) if exact_int else Decimal(repr(x))
+    ctx = Context(prec=200)
+    q = d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP, context=ctx)
+    if q == 0:
+        return float_zero_text(scale)
+    return format(q, "f")
+
 
 def sql_literal(value: str) -> str:
     """Quote a string literal. Only ever used for schema and table names read
@@ -287,6 +384,30 @@ class Dialect(ABC):
         bytes when fetched.
         """
         return SEPARATOR_SQL
+
+    def float_scale_for(self, column: Column) -> int:
+        """The float scale, refused if a FLOAT column cannot be rendered at it.
+
+        See `FLOAT_MAX_SCALE`: past it at least one engine would round from a
+        clamped or truncated value without saying so.
+        """
+        if self.float_scale > FLOAT_MAX_SCALE:
+            raise self._err(
+                f"FLOAT column {column.name!r} cannot be compared at "
+                f"float_scale {self.float_scale}; the maximum is {FLOAT_MAX_SCALE}"
+            )
+        return self.float_scale
+
+    def float_caveat(self) -> str | None:
+        """A known gap in this engine's FLOAT rendering, or None.
+
+        None means the dialect renders finite doubles exactly as
+        `canonical_float_text` does, verified against a live engine. A dialect
+        that cannot claim that returns the caveat, and the engine prints it as
+        a warning whenever a FLOAT column is compared, so the limitation
+        surfaces in the output instead of hiding in a docstring.
+        """
+        return None
 
     def null_sentinel_sql(self) -> str:
         r"""SQL producing the NULL sentinel as a string literal.

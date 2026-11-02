@@ -137,6 +137,16 @@ class SnowflakeDialect(Dialect):
 
     # ----------------------------------------------------------- rendering
 
+    def float_caveat(self) -> str | None:
+        """FLOAT here predates the shared canonical float form, unverified."""
+        return (
+            "Snowflake's FLOAT rendering (cast to NUMBER(38, scale)) has not "
+            "been verified against the canonical float form the other engines "
+            "share; doubles with more than ~15 significant digits or within a "
+            "hair of a rounding boundary may report as different, or a change "
+            "at the last compared decimal place may be missed"
+        )
+
     def null_sentinel_sql(self) -> str:
         r"""Build the sentinel from CHR(92), not a `\N` literal.
 
@@ -149,11 +159,14 @@ class SnowflakeDialect(Dialect):
     def normalize(self, column: Column) -> str:
         """Render one column as canonical text, null-safe.
 
-        DECIMAL/FLOAT match DuckDB's path - cast to NUMBER(38, scale) then to
-        text - so `1.5` becomes `'1.500000'`. Non-finite floats are a known
-        unverified gap: Snowflake's Inf/NaN detection differs from the other
-        engines and must be checked against a real account before this is
-        trusted for FLOAT columns holding them.
+        DECIMAL/FLOAT cast to NUMBER(38, scale) then to text - so `1.5`
+        becomes `'1.500000'`. FLOAT is *not* verified against the canonical
+        float form the other engines now share (`canonical_float_text`: the
+        shortest round-trip decimal, rounded half away from zero): it was
+        defined before that form was, and no Snowflake account was available
+        to check it, so `float_caveat` warns on every FLOAT column. Non-finite
+        floats are a further unverified gap: Snowflake's Inf/NaN detection
+        differs from the other engines.
         """
         c = self.quote(column.name)
         t = column.logical_type

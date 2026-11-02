@@ -134,15 +134,18 @@ BigQuery (unreleased) added more. Each was found by running candidate SQL
 against the live engine next to DuckDB, not by reading the docs:
 
 12. **"Equivalent" rounding expressions are not equivalent.** For FLOAT, every
-    natural BigQuery spelling - `FORMAT('%.6f', x)`, `ROUND(x, 6)`, a cast
-    through NUMERIC or BIGNUMERIC - disagreed with DuckDB on 45-89 of 727
-    sample doubles, because each rounds a different intermediate value. Find
-    out what the reference engine *actually computes* (DuckDB: `x * 10^6` in
-    double precision, rounded half away from zero) and reproduce that. Sweep
-    hundreds of values including halfway cases and magnitudes past 1e15;
-    `1.5 -> 1.500000` passing proves almost nothing. While doing this, note that
-    PostgreSQL and DuckDB already disagree on such doubles (PostgreSQL goes
-    through 15 significant digits), so pick one reference and document it.
+    natural spelling rounds a different intermediate value: PostgreSQL's
+    `float8::numeric` keeps 15 significant digits, DuckDB's decimal cast
+    computes `x * 10^6` in double, BigQuery's `FORMAT('%.17g')` is not even
+    correctly rounded - and between them they disagreed on up to 347 of 1,565
+    adversarial doubles, sometimes rendering two *different* values as the
+    same text. The reference is not another engine but a definition,
+    `canonical_float_text` in `dialects/base.py` (shortest round-trip decimal
+    below 2^53, exact integer above, half away from zero to the scale).
+    Reproduce it, then run `pytest tests/test_float_canonical.py` and
+    `python demo/float_agreement.py` against your engine: `1.5 -> 1.500000`
+    passing proves almost nothing. If you cannot verify it live, return a
+    message from `float_caveat()` so every run says so.
 
 13. **Negative zero survives formatting.** `FORMAT('%.6f', -0.0000001)` prints
     `-0.000000` where the other engines print `0.000000`. Round to the scale

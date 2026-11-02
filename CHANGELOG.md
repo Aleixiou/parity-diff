@@ -18,10 +18,11 @@ with the caveat that 0.x means the CLI surface may still move.
   through the CLI. The BigQuery-specific SQL: `ARRAY_TO_STRING` stands in for
   `concat_ws`; the hash is a `0x`-hex INT64 cast of `TO_HEX(MD5(x))`; decimals
   are `ROUND`ed before `FORMAT('%.6f')` (alone it prints `-0.000000`); floats
-  reproduce DuckDB's own scale-and-round arithmetic, the only one of the eight
-  spellings tried that agreed with DuckDB on all 727 sample doubles; dates use
-  `%E4Y` so year 999 is `0999`; `TIMESTAMP` is rendered in UTC and `DATETIME`
-  as naive; sums and the bucket expression run in `BIGNUMERIC`.
+  follow the canonical float form below (built from `CAST(x AS BIGNUMERIC)`,
+  since neither `CAST(x AS STRING)` nor `FORMAT('%.17g')` gives the shortest
+  repr); dates use `%E4Y` so year 999 is `0999`; `TIMESTAMP` is rendered in
+  UTC and `DATETIME` as naive; sums and the bucket expression run in
+  `BIGNUMERIC`.
 - **Read-only by construction on BigQuery**: the client requests only the
   `bigquery.readonly` OAuth scope, under which the server refuses INSERT,
   DELETE, CREATE, DROP and scripts (verified).
@@ -29,6 +30,58 @@ with the caveat that 0.x means the CLI surface may still move.
   AS OF` the instant of the first metadata query. Views are not pinned —
   BigQuery silently ignores time travel on a view, verified — and this is
   documented as a limitation.
+
+### Fixed
+
+- **FLOAT columns now render identically on every verified engine, and a real
+  change at the last compared decimal can no longer be hidden.** PostgreSQL
+  rendered a double through `float8::numeric` (15 significant digits) and
+  DuckDB through `cast(double as decimal)` (the double times 10^scale, in double
+  precision), so on a 1,565-value adversarial sample they disagreed on 347
+  doubles: rounding-only false alarms such as `1000000000000000.500000` against
+  `1000000000000000.524288`. Worse, PostgreSQL's truncation could make two
+  *different* values compare equal — 1e15+0.5 on PostgreSQL and 1e15 on DuckDB
+  both rendered `1000000000000000.000000`, and 123456789.1234565 against
+  123456789.123456 likewise — so a changed value was reported as a match.
+  (The report that prompted this measured 49 of 727 sample doubles and
+  believed it could never hide a difference; it could.) There is now one
+  definition, `canonical_float_text` in `parity.dialects.base`, and every engine
+  computes it: below 2^53 the shortest round-trip decimal rounded half away
+  from zero to the float scale, from 2^53 the exact integer. PostgreSQL,
+  DuckDB, MySQL and BigQuery agree with it on all 1,565 adversarial values at
+  scales 0, 2, 6 and 9 and on 20,000 further random doubles (10,000 on
+  BigQuery); before, every pair except DuckDB↔BigQuery disagreed on 169-347 of
+  them. `demo/float_agreement.py` reproduces the before/after counts.
+- Single-precision (`real` / `FLOAT`) columns are widened to double before
+  rendering. Rendered directly, PostgreSQL, DuckDB and MySQL disagreed on
+  ~630 of 1,500 random float4 values; widened, on none.
+
+### Changed (behaviour)
+
+- **FLOAT canonical text, and therefore FLOAT row checksums, change** for the
+  values the engines used to disagree on: doubles with more than ~15
+  significant digits, near a rounding boundary, or at or above 2^53. Both sides
+  of a diff always run the same version, so this changes verdicts only where
+  the old ones were wrong; on the sample, none of the 1,217 values on which all
+  four engines already agreed moved. MySQL's text is unchanged below 2^53 (its
+  DECIMAL cast already computed the canonical form).
+- **Doubles of magnitude 2^116 (~8.3e34) or more are refused** on PostgreSQL,
+  DuckDB, MySQL and BigQuery, with an error naming the value. Previously
+  DuckDB refused from 1e32 and PostgreSQL rendered any magnitude through 15
+  digits; DuckDB now accepts up to 2^116, PostgreSQL no longer renders huge
+  doubles approximately.
+- PostgreSQL pins `extra_float_digits = 1` at connect, as it pins the timezone,
+  and refuses FLOAT columns on servers older than 12 (which cannot print the
+  shortest round-trip decimal) instead of comparing them approximately.
+- **FLOAT columns refuse `--float-scale` above 20** (`FLOAT_MAX_SCALE`). Past
+  it MySQL's DECIMAL cast clamps silently (2e15 at 23 places became
+  `999999999999999.999...`) and BigQuery's BIGNUMERIC runs out of places;
+  scale 20 itself was verified on all four engines. DECIMAL columns are not
+  affected.
+- A new `Dialect.float_caveat()` hook (default `None`) lets a dialect declare
+  its FLOAT rendering unverified; the engine then warns on every FLOAT column
+  compared on that side. Snowflake uses it: its FLOAT path was defined before
+  the canonical form and has not been re-verified live.
 
 ### Changed
 
@@ -44,14 +97,6 @@ with the caveat that 0.x means the CLI surface may still move.
   `string_literal` (BigQuery escapes with backslashes, not doubled quotes), and
   `_columns_catalog` (BigQuery's `INFORMATION_SCHEMA` is per dataset, and the
   "did you mean" hint has to look there).
-
-### Documented
-
-- PostgreSQL and DuckDB already disagree on how a 6-place float is rounded for
-  doubles with more than ~15 significant digits or within a hair of a rounding
-  boundary (49 of 727 sampled doubles). The result is a reported difference
-  that is only rounding, never a hidden one; it is now in the README
-  limitations, since BigQuery follows DuckDB's rounding.
 
 ## 0.2.3 — 2026-09-18
 
