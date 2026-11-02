@@ -3,7 +3,19 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
-## Unreleased
+## 0.3.0 — 2026-11-02
+
+> **Upgrade from any earlier version.** Versions up to 0.2.3 could report two
+> tables as identical when they were not, in two cases: floating-point (double)
+> columns holding values with about 15 or more significant digits, or near a
+> rounding boundary, compared across engines (for example PostgreSQL
+> `1e15 + 0.5` against DuckDB `1e15`); and MySQL DECIMAL values of about 1e32 or
+> more (more than 38 − scale integer digits), which MySQL silently clamped to
+> its maximum. Both are fixed below and pinned by tests that plant exactly these
+> differences. Re-run any comparison made with an earlier version that involved
+> such columns. Because float rendering changed, checksums of affected values
+> differ from 0.2.x; both sides of a diff always use the same version, so this
+> only matters if you stored checksums.
 
 ### Added
 

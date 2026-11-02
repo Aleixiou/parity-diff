@@ -350,12 +350,11 @@ way it is. `ROADMAP.md` is what is done and what comes next.
 
 ## Changelog
 
-Latest release **0.2.3** — test-only: a dedicated campaign against the identical
-check (offline logic, every live engine pair, all key types, edge values,
-representation changes) that found no abnormality. 0.2.2 added Snowflake, and
-0.2.1 the generative suite and the same-content insert-plus-delete fix it
-surfaced. BigQuery support is in the `Unreleased` section. See `CHANGELOG.md`
-for the full history.
+Latest release **0.3.0** — BigQuery support, and fixes for two false matches in
+earlier versions: large or very precise doubles compared across engines, and
+MySQL DECIMAL values of about 1e32 or more. **Upgrade if you use 0.2.x**, and
+re-run comparisons that involved such columns. 0.2.3 hardened the identical
+check, 0.2.2 added Snowflake. See `CHANGELOG.md` for the full history.
 
 ## License
 

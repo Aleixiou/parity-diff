@@ -11,15 +11,16 @@ document, because it makes a reader distrust the accurate ones.
 
 ## Where it is
 
-**v0.2.3 released** (2026-09-18): PostgreSQL, DuckDB, MySQL, and **Snowflake**
-— the first warehouse — plus non-integer/composite keys and case-insensitive
-identifier matching across engines. `pip install parity-diff`, MIT. 0.2.3 is
-test-only: the identical check, whose failure mode is the unforgivable one, was
-attacked from every angle it has and did not break.
+**v0.3.0 released** (2026-11-02): PostgreSQL, DuckDB, MySQL, **Snowflake** and
+**BigQuery**, with non-integer/composite keys and case-insensitive identifier
+matching across engines. `pip install parity-diff`, MIT. 0.3.0 also fixes two
+false matches found while adding BigQuery — doubles with ~15+ significant digits
+compared across engines, and MySQL DECIMAL values past 38 − scale digits — by
+moving FLOAT onto one canonical form every engine computes identically.
 
 | | |
 |---|---|
-| Tests | 415; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests and the 15 live BigQuery tests skip unless `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY` point at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
+| Tests | 490; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests and the 15 live BigQuery tests skip unless `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY` point at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
 | Coverage | 96%, with a 95% floor enforced in CI (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
 | CI | ruff, `mypy --strict`, PostgreSQL 16 and 18 + MySQL 8 service containers, Python 3.10 and 3.13, Windows, a DuckDB-only install |
 | Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data. Snowflake verified live: hash constant, a 5,000-row full-table checksum matching DuckDB byte-for-byte, and every planted-difference check |
@@ -50,7 +51,7 @@ thing the docs could not predict — case-insensitive identifier matching, since
 Snowflake upper-cases what PostgreSQL and DuckDB lower-case. Proof that the
 dialect abstraction holds against a warehouse, not just OLTP engines.
 
-### 2. BigQuery — done (unreleased, on the way to 0.2.4)
+### 2. BigQuery — done (v0.3.0)
 
 The second warehouse, verified live the same way: hash constant, a 5,000-row
 checksum matching DuckDB byte for byte, every planted-difference check, a
