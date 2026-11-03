@@ -450,8 +450,26 @@ class BigQueryDialect(Dialect):
                 expr = f"format_timestamp('%E4Y-%m-%d %H:%M:%E6S', {c}, 'UTC')"
         elif t is LogicalType.STRING:
             expr = self.escape_text(f"cast({c} as string)")
+        elif t is LogicalType.TIME:
+            # %E6S: seconds with six fractional digits always (TIME holds
+            # microseconds, no more). '%t' printed `12:34:56.500`.
+            expr = f"format_time('%H:%M:%E6S', {c})"
+        elif t is LogicalType.BINARY:
+            # BINARY_PREFIX + lower-case hex; '%t' printed the bytes as an
+            # escaped literal (`\x00`, but `abc` as itself).
+            expr = self.concat_sql(self.binary_prefix_sql(), f"to_hex({c})")
+        elif t is LogicalType.JSON:
+            # TO_JSON_STRING is BigQuery's normal form - keys by code point,
+            # the first duplicate kept - compact, with string escaping that is
+            # already canonical (verified: lower-case \u00xx, U+007F and `/`
+            # raw). Only the layout needs fixing. TO_JSON_STRING of a SQL
+            # NULL is the *string* 'null' (found by the conformance sweep), the
+            # text of a JSON null - so SQL NULL and JSON null rendered alike, a
+            # false match, unless NULL is kept NULL for the coalesce first.
+            text = f"if({c} is null, null, to_json_string({c}))"
+            expr = self.escape_text(self.json_compact_layout(text))
         else:
-            # Anything else (TIME, BYTES, JSON, ARRAY, STRUCT, ...) through
+            # Anything else (ARRAY, STRUCT, INTERVAL, ...) through
             # FORMAT('%t'), which renders every type - CAST to STRING raises on
             # ARRAY/STRUCT and would kill the diff. But '%t' renders NULL as the
             # *string* 'NULL', which would slip past the coalesce and compare
@@ -464,6 +482,40 @@ class BigQueryDialect(Dialect):
     def concat_sql(self, left: str, right: str) -> str:
         """`concat()`, the spelling the sentinel has always used here."""
         return f"concat({left}, {right})"
+
+    def json_compact_layout(self, expr: str) -> str:
+        """The three steps of the base docstring, in BigQuery's RE2 spelling;
+        REGEXP_REPLACE replaces every match. Verified live."""
+        pattern = self.spell_sql(r'(?s)("(?:\\.|[^"\\])*"|[^",:]*)([,:]?)')
+        marked = (
+            f"regexp_replace({expr}, {pattern}, "
+            f"{self.spell_sql(chr(92) + '1' + chr(92) + '2' + chr(1))})"
+        )
+        return (
+            f"replace(replace(replace({marked}, concat(',', chr(1)), ', '), "
+            f"concat(':', chr(1)), ': '), chr(1), '')"
+        )
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; JSON as its own text.
+
+        The client parses a JSON column into Python objects (1.50 becomes the
+        float 1.5); TO_JSON_STRING is the stored document, which the
+        reference lays out itself - NULL kept NULL, since TO_JSON_STRING
+        turns a SQL NULL into the text of a JSON null.
+        """
+        if column.logical_type is LogicalType.JSON:
+            c = self.quote(column.name)
+            return f"if({c} is null, null, to_json_string({c}))"
+        return super().sample_select(column)
+
+    def json_semantics(self, column: Column) -> str:
+        """BigQuery's JSON normal form."""
+        return (
+            "BigQuery JSON: object keys ordered by code point, the first duplicate "
+            "key kept, integers exact to 64 bits and every other number a double "
+            "(1.50 becomes 1.5, 1e2 becomes 100.0)"
+        )
 
     def escape_text(self, expr: str) -> str:
         """Escape with the collation stripped first.
@@ -545,4 +597,10 @@ def map_type_bigquery(raw: str) -> LogicalType:
         return LogicalType.TIMESTAMP
     if t == "STRING":
         return LogicalType.STRING
+    if t == "TIME":
+        return LogicalType.TIME
+    if t == "BYTES":
+        return LogicalType.BINARY
+    if t == "JSON":
+        return LogicalType.JSON
     return LogicalType.UNKNOWN

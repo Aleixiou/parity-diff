@@ -20,10 +20,15 @@ dialect SQL:
 - booleans as booleans;
 - text exactly, except that fixed-width CHAR loses its trailing spaces;
 - dates as calendar dates, with PostgreSQL's infinities and BC years;
-- timestamps to the microsecond, instants converted to UTC.
+- timestamps to the microsecond, instants converted to UTC;
+- times of day to the microsecond (`canonical_time_text`), MySQL durations
+  included;
+- binary as its bytes, exactly;
+- JSON as its engine's normalised document, laid out and escaped one way
+  (`canonical_json_text`).
 
 Two values the rules call equal reduce to equal tokens, whichever engine and
-driver they came from. A type the rules do not cover (JSON, binary, arrays,
+driver they came from. A type the rules do not cover (arrays, intervals,
 ...) is `UNCHECKED`, and the engine reports that the column was not
 independently verified rather than pretend it was.
 """
@@ -39,7 +44,10 @@ from typing import Any
 
 from parity.dialects.base import (
     NULL_SENTINEL,
+    canonical_binary_text,
     canonical_float_text,
+    canonical_json_text,
+    canonical_time_text,
     escape_canonical_text,
 )
 from parity.types import LogicalType
@@ -62,6 +70,11 @@ _TEMPORAL = re.compile(
     r"(?P<bc> BC| \(BC\))?$"
 )
 
+#: `[-]H...:MM:SS[.f...]`: a time of day or a MySQL duration as text.
+_CLOCK = re.compile(
+    r"^(?P<neg>-)?(?P<h>\d{1,3}):(?P<mi>\d\d):(?P<s>\d\d)(?:\.(?P<f>\d{1,9}))?$"
+)
+
 
 def reference_token(
     logical_type: LogicalType,
@@ -71,6 +84,7 @@ def reference_token(
     padded: bool = False,
     single_precision: bool = False,
     sub_micro: bool = False,
+    json_verbatim: bool = False,
 ) -> Any:
     """Reduce one raw driver value to what the comparison rules see.
 
@@ -79,6 +93,8 @@ def reference_token(
     hand back as the shortest repr of the float rather than the float itself.
     `sub_micro` keeps a timestamp's digits past microseconds (both sides of
     the comparison hold them), as nine digits when there are any.
+    `json_verbatim` marks an engine that stores JSON as unnormalised text
+    (`Dialect.json_verbatim`).
     """
     if value is None:
         return None
@@ -104,6 +120,20 @@ def reference_token(
             return ("date", _date_text(value))
         if logical_type is LogicalType.TIMESTAMP:
             return ("ts", _timestamp_text(value, sub_micro))
+        if logical_type is LogicalType.TIME:
+            return ("time", _time_text(value, sub_micro))
+        if logical_type is LogicalType.BINARY:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return ("bin", canonical_binary_text(bytes(value)))
+            return UNCHECKED  # a driver handing back text: do not guess its encoding
+        if logical_type is LogicalType.JSON:
+            if isinstance(value, (bytes, bytearray)):
+                value = bytes(value).decode("utf-8")
+            if not isinstance(value, str):
+                # A driver that parsed the document has already lost its
+                # number spellings; the dialect's sample select reads text.
+                return UNCHECKED
+            return ("json", canonical_json_text(value, verbatim=json_verbatim))
     except (ValueError, TypeError, ArithmeticError, OverflowError):
         return UNCHECKED
     return UNCHECKED
@@ -169,6 +199,38 @@ def _timestamp_text(value: Any, sub_micro: bool = False) -> str:
     return _parse_temporal(str(value), with_time=True, sub_micro=sub_micro)
 
 
+def _time_text(value: Any, sub_micro: bool = False) -> str:
+    """A time of day, or a MySQL duration, as `canonical_time_text`.
+
+    Drivers hand back `datetime.time` (no `24:00:00`, so dialects that can
+    hold it read text), `datetime.timedelta` (MySQL's TIME, a duration), or
+    text, whose digits past the microsecond are truncated as the rule says -
+    unless `sub_micro` (both sides hold them, COV-2), when a value that has
+    any keeps nine, as timestamps do.
+    """
+    if isinstance(value, dt.time):
+        if value.tzinfo is not None:
+            raise ValueError("a time with an offset is not a TIME value")
+        return canonical_time_text(
+            ((value.hour * 60 + value.minute) * 60 + value.second) * 1_000_000
+            + value.microsecond
+        )
+    if isinstance(value, dt.timedelta):
+        micros = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+        return canonical_time_text(micros)
+    m = _CLOCK.match(str(value).strip())
+    if not m:
+        raise ValueError(f"unrecognised time text {value!r}")
+    digits = (m["f"] or "").ljust(9, "0")
+    micros = ((int(m["h"]) * 60 + int(m["mi"])) * 60 + int(m["s"])) * 1_000_000
+    text = canonical_time_text(
+        -(micros + int(digits[:6])) if m["neg"] else micros + int(digits[:6])
+    )
+    if sub_micro and digits[6:9] != "000" and not m["neg"]:
+        text += digits[6:9]
+    return text
+
+
 def _parse_temporal(text: str, *, with_time: bool, sub_micro: bool = False) -> str:
     """Reduce an engine's text form of a date or timestamp to the token text.
 
@@ -225,9 +287,12 @@ def canonical_text(token: Any) -> str:
         return str(value)
     if kind == "bool":
         return "true" if value else "false"
-    if kind == "str":
+    if kind in ("str", "json"):
+        # JSON is text with backslashes in its escapes, so it is escaped as
+        # any text is (it cannot hold chr(31) or equal the NULL sentinel, but
+        # the invariant is cheaper to keep than to argue about per type).
         return escape_canonical_text(value)
-    return str(value)  # num, date, ts: the token is already the text
+    return str(value)  # num, date, ts, time, bin: the token is already the text
 
 
 __all__ = ["UNCHECKED", "canonical_text", "describe", "reference_token"]

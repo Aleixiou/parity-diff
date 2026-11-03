@@ -229,6 +229,39 @@ class DuckDBDialect(Dialect):
                     f"case when {ns} = 0 then {expr} "
                     f"else {expr} || lpad(cast({ns} as varchar), 3, '0') end"
                 )
+        elif t is LogicalType.TIME:
+            # strftime takes no TIME, and the varchar cast drops trailing
+            # zeros (`12:34:56.5`). Built from the fields instead; hour() of
+            # `24:00:00`, which TIME accepts, is 24 (verified), so it renders
+            # `24:00:00.000000` as PostgreSQL does. microsecond() counts the
+            # seconds too, hence the modulo.
+            def two(part: str) -> str:
+                """One clock field, zero-padded to two digits."""
+                return f"lpad(cast({part}({c}) as varchar), 2, '0')"
+
+            expr = (
+                f"{two('hour')} || ':' || {two('minute')} || ':' || {two('second')} "
+                f"|| '.' || lpad(cast(microsecond({c}) % 1000000 as varchar), 6, '0')"
+            )
+        elif t is LogicalType.BINARY:
+            # The varchar cast prints printable bytes as themselves and the
+            # rest as `\xFF`, so b'abc' rendered exactly like the text 'abc'.
+            # BINARY_PREFIX + lower-case hex is exact for every byte string.
+            expr = f"{self.binary_prefix_sql()} || lower(hex({c}))"
+        elif t is LogicalType.JSON:
+            # DuckDB's JSON is text, validated but not normalised: key order,
+            # duplicates and spellings stay as written (`json_verbatim`). Only
+            # the layout is canonical - whitespace outside strings removed,
+            # then one space after each separator (`json_compact_layout`).
+            # `json()` would normalise more, but it rewrites every non-integer
+            # number through a double, which could make two different stored
+            # documents equal; this stays exact.
+            strip = self.spell_sql(r'(?s)("(?:\\.|[^"\\])*")|[ ' + "\t\n\r]+")
+            stripped = (
+                f"regexp_replace(cast({c} as varchar), {strip}, "
+                f"{self.spell_sql(chr(92) + '1')}, 'g')"
+            )
+            expr = self.escape_text(self.json_compact_layout(stripped))
         elif column.raw_type.upper().startswith("UNION("):
             # A plain varchar cast prints the member value and drops its tag,
             # so UNION(n int, s varchar) rendered 1::int and '1' alike - a
@@ -289,9 +322,37 @@ class DuckDBDialect(Dialect):
         whole - `infinity`, `0044-03-15 (BC)`, nine digits, `+00` under the
         pinned UTC - and `parity.reference` reads all of it.
         """
-        if column.logical_type in (LogicalType.DATE, LogicalType.TIMESTAMP):
+        if column.logical_type in (
+            LogicalType.DATE,
+            LogicalType.TIMESTAMP,
+            LogicalType.TIME,  # `24:00:00` has no datetime.time either
+            LogicalType.JSON,
+        ):
             return f"cast({self.quote(column.name)} as varchar)"
         return super().sample_select(column)
+
+    def json_verbatim(self, column: Column) -> bool:
+        """DuckDB's JSON is validated text, never normalised."""
+        return True
+
+    def json_semantics(self, column: Column) -> str:
+        """Text, compared as written."""
+        return (
+            "DuckDB JSON is text: object keys in the order written, duplicate keys "
+            "kept, numbers and string escapes compared exactly as spelled"
+        )
+
+    def json_compact_layout(self, expr: str) -> str:
+        """The three steps of the base docstring, in DuckDB's RE2 spelling."""
+        pattern = self.spell_sql(r'(?s)("(?:\\.|[^"\\])*"|[^",:]*)([,:]?)')
+        marked = (
+            f"regexp_replace({expr}, {pattern}, "
+            f"{self.spell_sql(chr(92) + '1' + chr(92) + '2' + chr(1))}, 'g')"
+        )
+        return (
+            f"replace(replace(replace({marked}, ',' || chr(1), ', '), "
+            f"':' || chr(1), ': '), chr(1), '')"
+        )
 
     def normalize_key(self, column: Column) -> str:
         """Exact key text; a TIMESTAMP_NS key keeps its nanoseconds.

@@ -15,6 +15,7 @@ import pytest
 from parity.dialects.mysql_dialect import (
     SQL_MODE,
     MySQLDialect,
+    map_type_mysql,
     parse_mysql_url,
 )
 from parity.types import Column, LogicalType
@@ -211,7 +212,7 @@ def test_string_literal_escapes_backslashes(name, literal):
 
 def _render(raw: str) -> str:
     """The canonical-text SQL for a column `v` of this raw MySQL type."""
-    return MySQLDialect().normalize(Column("v", LogicalType.UNKNOWN, raw))
+    return MySQLDialect().normalize(Column("v", map_type_mysql(raw), raw))
 
 
 @pytest.mark.parametrize("raw", ["binary", "varbinary", "blob", "longblob", "tinyblob"])
@@ -258,7 +259,7 @@ def test_timestamp_is_an_instant_and_datetime_is_not():
     assert _column("t", "datetime", None).tz_aware is False
     assert _column("t", "date", None).tz_aware is None
     assert _column("b", "bit", 8).raw_type == "bit(8)"
-    assert _column("b", "varbinary", None).logical_type is LogicalType.UNKNOWN
+    assert _column("b", "varbinary", None).logical_type is LogicalType.BINARY
 
 
 def test_row_hash_falls_back_rather_than_going_null():

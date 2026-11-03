@@ -35,7 +35,7 @@ from cov_known import (  # noqa: E402
     SPLITS,
     UNCHECKED,
 )
-from cov_values import REFUSE, RULED, cross_group  # noqa: E402
+from cov_values import FORM_DEPENDENT, REFUSE, RULED, cross_group  # noqa: E402
 
 ENGINE_ORDER = ["postgres", "duckdb", "mysql", "mssql", "bigquery", "snowflake"]
 
@@ -56,6 +56,13 @@ FAMILIES: list[tuple[str, tuple[str, ...]]] = [
     ("TIMESTAMP, infinity / BC", ("ts_ext",)),
     ("TIMESTAMP, sub-microsecond", ("ts_sub",)),
     ("TIMESTAMP, instant (tz-aware)", ("tstz",)),
+    ("TIME", ("time",)),
+    ("TIME, 24:00:00", ("time_ext",)),
+    ("TIME, sub-microsecond", ("time_sub",)),
+    ("TIME, MySQL duration", ("time_dur",)),
+    ("BINARY", ("bytes",)),
+    ("JSON, every engine alike", ("json",)),
+    ("JSON, engine normal forms", ("json_forms",)),
 ]
 
 #: Native types each dialect maps onto a logical type but this suite does not
@@ -68,38 +75,40 @@ NOT_LOADED: dict[str, dict[str, str]] = {
         "timestamptz(p) with p < 6, domains over any of these",
         "unknown": "xml, cidr, macaddr, varbit, point and other geometric types, "
         'tsvector, ranges/multiranges, composite types, oid, "char", hstore and '
-        "citext (extensions)",
+        "citext (extensions); time with time zone (timetz) is loaded below",
     },
     "duckdb": {
         "mapped": "DECIMAL widths other than (4,1), (18,4), (38,9), (38,30); "
-        "TIMESTAMP WITH TIME ZONE spellings",
+        "TIMESTAMP WITH TIME ZONE spellings; BYTEA/VARBINARY (reported as BLOB)",
         "unknown": "STRUCT, MAP, UNION (special-cased), VARIANT (special-cased), "
-        "TIME WITH TIME ZONE, fixed-size ARRAY, BIGNUM/VARINT",
+        "TIME WITH TIME ZONE, TIME_NS, fixed-size ARRAY, BIGNUM/VARINT",
     },
     "mysql": {
         "mapped": "tinytext, mediumtext, text, set, dec/fixed/numeric aliases, "
-        "int unsigned, datetime/timestamp with precision < 6",
-        "unknown": "binary(n), blob family, geometry and the spatial types "
-        "(rendered as hex of the stored bytes)",
+        "int unsigned, datetime/timestamp with precision < 6, binary(n) (its "
+        "zero padding is data), tinyblob/mediumblob/longblob, time(1..5)",
+        "unknown": "geometry and the spatial types (rendered as hex of the stored bytes)",
     },
     "mssql": {
         "mapped": "text, ntext, sysname, varchar(n)/nvarchar(n) with n < max, "
         "datetime2(p) with p < 6, datetimeoffset(p) with p < 7, varchar under a "
-        "non-UTF-8 collation (tested elsewhere: tests/test_mssql.py)",
-        "unknown": "xml, geography, geometry, hierarchyid, rowversion/timestamp, "
-        "binary(n), image",
+        "non-UTF-8 collation (tested elsewhere: tests/test_mssql.py), binary(n), "
+        "rowversion/timestamp (not insertable), time(1..6)",
+        "unknown": "xml, geography, geometry, hierarchyid; no JSON type (an "
+        "nvarchar holding JSON is STRING)",
     },
     "bigquery": {
         "mapped": "INT64 aliases (INTEGER, SMALLINT, ...), BIGDECIMAL, "
-        "parameterised NUMERIC(p,s) / STRING(n)",
+        "parameterised NUMERIC(p,s) / STRING(n) / BYTES(n); a JSON null (the "
+        "load job cannot store one; the NULL guard is pinned offline)",
         "unknown": "ARRAY, STRUCT, GEOGRAPHY, INTERVAL, RANGE",
     },
     "snowflake": {
         "mapped": "NUMBER(p,0) for p < 38 and NUMBER(p,s) for other s, INT/BIGINT "
         "aliases, CHAR/TEXT/STRING (aliases of VARCHAR), TIMESTAMP_NTZ/TZ/LTZ "
-        "with precision < 9, DATETIME alias; no single-precision FLOAT exists",
-        "unknown": "VARIANT, OBJECT, ARRAY (special-cased: TYPEOF + TO_JSON), "
-        "GEOGRAPHY, GEOMETRY, VECTOR, FILE",
+        "with precision < 9, DATETIME alias, TIME(0..8), OBJECT and ARRAY (JSON "
+        "as VARIANT is), VARBINARY; no single-precision FLOAT exists",
+        "unknown": "GEOGRAPHY, GEOMETRY, VECTOR, FILE",
     },
 }
 
@@ -279,6 +288,8 @@ def _unknown_section(runs: dict[str, dict[str, Any]], engines: list[str]) -> lis
 def _cross_section(runs: dict[str, dict[str, Any]]) -> list[str]:
     """Cross-engine agreement: shared values, and every split by kind."""
     shared, splits = compare(runs)
+    forms = [s for s in splits if s.family in FORM_DEPENDENT]
+    splits = [s for s in splits if s.family not in FORM_DEPENDENT]
     ruled_same = [s for s in splits if s.family in RULED and s.same_logical]
     mapping = [s for s in splits if s.family in RULED and not s.same_logical]
     unknown = [s for s in splits if s.family not in RULED]
@@ -298,8 +309,19 @@ def _cross_section(runs: dict[str, dict[str, Any]]) -> list[str]:
             f"- **{len(unknown)}** are UNKNOWN-mapped values that render differently "
             "(no rule; expected)"
         ),
+        (
+            f"- **{len(forms)}** are JSON documents whose engines' normal forms "
+            "differ - key order, duplicate keys, number spelling, escapes kept as "
+            "written - each held to the rule for its own engine, expected to "
+            "differ across engines, and warned about in every such run (a false "
+            "alarm, never a false match)"
+        ),
         "",
     ]
+    if forms:
+        lines += ["**JSON normal forms, as each engine holds the same document:**", ""]
+        lines += [f"- {s.describe().replace('|', '/')[:400]}" for s in forms]
+        lines.append("")
     for title, group in (
         ("Same logical type, different text", ruled_same),
         ("Type-mapping mismatches", mapping),
@@ -416,7 +438,9 @@ def render(results: Path) -> str:
             "or none was loaded); every native type listed under *Not loaded*; "
             "UNKNOWN-mapped types (no rule exists - their section shows only "
             "collisions on the sample); other float scales; other collations and "
-            "server settings than the ones each dialect pins."
+            "server settings than the ones each dialect pins. *JSON, engine normal "
+            "forms* is verified per engine only: across engines those documents "
+            "differ by design (see *Across engines*)."
         ),
         "",
         "## Findings",

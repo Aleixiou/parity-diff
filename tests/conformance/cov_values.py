@@ -27,8 +27,11 @@ Groups, and why each value is there:
 - `bool`; `str` (escaping, Unicode, whitespace); `char` (CHAR(20) padding);
   `uuid`; `date` / `date_ext` (PostgreSQL / DuckDB infinities and BC);
   `ts` / `ts_ext` / `ts_sub` (naive, past 0001..9999, sub-microsecond);
-  `tstz` (instants at odd offsets and DST edges); and for the UNKNOWN-mapped
-  types `time`, `bytes`, `json`.
+  `tstz` (instants at odd offsets and DST edges); `time` / `time_ext` /
+  `time_sub` / `time_dur` (24:00:00, past the microsecond, MySQL durations);
+  `bytes` (zero bytes, padding, invalid UTF-8, all 256 values); `json`
+  (documents every engine normalises alike) and `json_forms` (documents whose
+  engines' normal forms differ - `FORM_DEPENDENT`).
 """
 
 from __future__ import annotations
@@ -367,11 +370,43 @@ TIMES = [Val("tm:<NULL>", None)] + [
     Val(f"tm:{t}", dt.time.fromisoformat(t))
     for t in (
         "00:00:00",
+        "00:00:01",
+        "00:01:00",
+        "01:00:00",
         "12:34:56",
         "12:34:56.5",
+        "12:34:56.05",  # must not equal .5: the fraction is not trimmed
         "12:34:56.123456",
+        "23:59:59",
         "23:59:59.999999",
         "00:00:00.000001",
+        "10:00:00.100000",
+    )
+]
+
+#: `24:00:00`, which PostgreSQL, DuckDB and MySQL accept: it must render as
+#: itself, never as the next midnight (`00:00:00`, a different value).
+TIMES_EXT = [Val("tm:24:00:00", "24:00:00")]
+
+#: Digits past the microsecond (SQL Server time(7), Snowflake TIME(9)): the
+#: rule truncates them, as for timestamps.
+TIMES_SUB = [
+    Val("tmn:12:34:56.1234567", "12:34:56.1234567"),
+    Val("tmn:23:59:59.9999999", "23:59:59.9999999"),
+    Val("tmn:00:00:00.0000001", "00:00:00.0000001"),
+    Val("tmn:12:00:00.123456789", "12:00:00.123456789", "9 digits"),
+]
+
+#: MySQL's TIME is a duration: negative, and past 24 hours.
+TIMES_DUR = [
+    Val(f"tmd:{t}", t)
+    for t in (
+        "-00:00:00.500000",
+        "-01:00:00",
+        "-838:59:59",
+        "100:00:00.5",
+        "838:59:59",
+        "24:00:00.000001",
     )
 ]
 
@@ -380,17 +415,83 @@ BYTES = [Val("by:<NULL>", None)] + [
     for b in (
         b"",
         b"\x00",
+        b"\x00\x00",  # a different value from one zero byte
         b"\xff\x0a",
         b"abc",
+        b"ABC",
+        b"abc ",  # trailing space is data in bytes
         b"\\N",
         b"\\x00",  # the characters a hex rendering of b"\x00" might print
+        b"\x1f",  # the separator as a byte
+        b"\x5c\x5c",
+        b"\xc3\xa9",  # valid UTF-8 (e-acute) - still bytes, not text
+        b"\xff\xfe\x00\xd8",  # invalid UTF-8 and UTF-16
         bytes(range(16)),
+        bytes(range(256)),
     )
 ]
 
+#: JSON every engine with a JSON type renders alike: no key whose order
+#: differs between the engines' normal forms, numbers every engine spells
+#: alike, string escapes every engine decodes to the same character, and any
+#: layout - the canonical one is applied everywhere.
 JSONS = [Val("js:<NULL>", None)] + [
     Val(f"js:{j}", j)
-    for j in ('{"a": 1}', '{"b": [1, 2]}', '"1"', "1", "null", '{"s": "\\\\N"}')
+    for j in (
+        '{"a": 1}',
+        '{"b": [1, 2]}',
+        '"1"',
+        "1",
+        "null",
+        "true",
+        "false",
+        "[]",
+        "{}",
+        "[[], {}]",
+        '{"s": "\\\\N"}',  # a backslash then N: the sentinel's spelling
+        '{"a":1}',  # compact: the same document as '{"a": 1}'
+        '{ "a" :\n 1 }',  # and so is this
+        '[1, "1", true, null]',
+        '{"ab": 1, "cd": 2}',  # equal lengths: both key orders agree
+        '{"a": 1, "bb": 2}',  # shorter first and lower first: both agree
+        '{"a": {"b": {"c": [[], {}]}}}',
+        '"x, y: z"',  # separators inside a string are not separators
+        '{"a, b": "c: d"}',
+        '{"k": "a\\"b"}',
+        '"\\t\\n\\r\\b\\f\\u0001\\u001f"',  # control characters, canonically escaped
+        '"\\\\u00e9"',  # a literal backslash-u, not an escape
+        '"é\U0001f600"',
+        "[-1, 0, 123456789012]",
+        '"\\\\"',
+        '{"": ""}',
+    )
+]
+
+#: JSON whose canonical text depends on the engine's normal form: key order
+#: (length-first on PostgreSQL and MySQL, code point on BigQuery and
+#: Snowflake, as written on DuckDB), duplicate keys, number spelling, and
+#: escapes DuckDB keeps as written. Each engine is held to the rule for its
+#: own form; across engines they are expected to differ (`FORM_DEPENDENT`).
+JSONS_FORMS = [
+    Val(f"jf:{j}", j)
+    for j in (
+        '{"b": 1, "a": 2}',
+        '{"aa": 1, "b": 2}',
+        '{"é": 1, "z": 2, "Z": 3, "ab": 4}',
+        '{"a": 1, "a": 2}',
+        "1.50",
+        "1.0",
+        "1e2",
+        "-0",
+        "0.1",
+        "12345678901234567890123",
+        "1.7976931348623157e308",
+        '"\\u00e9"',
+        '"\\u007f"',
+        '"\\/"',
+        '"\\ud83d\\ude00"',
+        '[1.0, 2.50, {"y": 1e-7, "x": -0.0}]',
+    )
 ]
 
 GROUPS: dict[str, list[Val]] = {
@@ -411,8 +512,12 @@ GROUPS: dict[str, list[Val]] = {
     "ts_sub": TIMESTAMPS_SUB,
     "tstz": _instants(),
     "time": TIMES,
+    "time_ext": TIMES_EXT,
+    "time_sub": TIMES_SUB,
+    "time_dur": TIMES_DUR,
     "bytes": BYTES,
     "json": JSONS,
+    "json_forms": JSONS_FORMS,
 }
 
 #: Groups whose values the rules (`parity.reference`) cover.
@@ -433,7 +538,19 @@ RULED = {
     "ts_ext",
     "ts_sub",
     "tstz",
+    "time",
+    "time_ext",
+    "time_sub",
+    "time_dur",
+    "bytes",
+    "json",
+    "json_forms",
 }
+
+#: Ruled groups whose canonical text depends on the engine's own normal form
+#: (JSON key order, duplicates, number spelling): each engine is held to the
+#: rules, but two engines may legitimately differ, and the run warns.
+FORM_DEPENDENT = {"json_forms"}
 
 #: Values the canonical text must refuse, never render.
 REFUSE = {"float_refuse"}
@@ -445,6 +562,12 @@ def cross_group(group: str) -> str:
     REAL and DOUBLE share keys, so a float32 value must render as the same
     double does; naive and sub-microsecond timestamps are one family too.
     """
-    return {"float4": "float", "ts_ext": "ts", "date_ext": "date", "dec_wide": "dec"}.get(
-        group, group
-    )
+    return {
+        "float4": "float",
+        "ts_ext": "ts",
+        "date_ext": "date",
+        "dec_wide": "dec",
+        "time_ext": "time",
+        "time_sub": "time",
+        "time_dur": "time",
+    }.get(group, group)

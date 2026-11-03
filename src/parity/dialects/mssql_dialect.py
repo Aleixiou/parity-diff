@@ -562,8 +562,8 @@ class SQLServerDialect(Dialect):
     # ----------------------------------------------------------- rendering
 
     def holds_sub_micro(self, column: Column) -> bool:
-        """datetime2(7) and datetimeoffset(7) hold 100 ns ticks."""
-        return column.raw_type.lower() in ("datetime2(7)", "datetimeoffset(7)")
+        """datetime2(7), datetimeoffset(7) and time(7) hold 100 ns ticks."""
+        return column.raw_type.lower() in ("datetime2(7)", "datetimeoffset(7)", "time(7)")
 
     def sample_select(self, column: Column) -> str:
         """Raw values for the sample check, past three driver limits.
@@ -581,11 +581,16 @@ class SQLServerDialect(Dialect):
         if column.logical_type is LogicalType.TIMESTAMP:
             style = 127 if _base_type(column.raw_type) == "datetimeoffset" else 121
             return f"convert(nvarchar(40), {c}, {style})"
+        if column.logical_type is LogicalType.TIME:
+            # As text, all seven digits: the driver would round them.
+            return f"convert(nvarchar(40), cast({c} as time(7)))"
         return super().sample_select(column)
 
     def sample_value(self, column: Column, value: Any) -> Any:
         """Decode the text bytes; a uniqueidentifier in lower case, as the
         rules render it (SQL Server prints it upper case)."""
+        if column.logical_type is LogicalType.BINARY:
+            return value  # bytes are the value; only text travels as bytes
         if isinstance(value, (bytes, bytearray)):
             value = bytes(value).decode("utf-8", errors="replace")
         if isinstance(value, str) and _base_type(column.raw_type) == "uniqueidentifier":
@@ -687,10 +692,27 @@ class SQLServerDialect(Dialect):
             if raw in ("nvarchar", "ntext", "sysname"):
                 expr = self._utf16_safe(expr)
             expr = self.escape_text(expr)
-        elif raw in ("binary", "varbinary", "image", "timestamp", "rowversion"):
-            # Bytes as 0x-hex (style 1); a cast to nvarchar would read them as
-            # UTF-16. `timestamp` is rowversion, not a point in time.
-            expr = f"convert({text}, convert(varbinary(max), {c}), 1)"
+        elif t is LogicalType.TIME:
+            # time(n) as time(7) prints `hh:mm:ss.fffffff`, seven digits; the
+            # first 15 characters are the microseconds, the seventh digit
+            # *truncated* - as datetime2(7) is, for the same reason - and
+            # `caveats` says so for a time(7). The varchar cast printed n
+            # digits, so 12:34:56.5 never matched another engine's time.
+            s7 = f"convert({text}, cast({c} as time(7)))"
+            expr = f"left({s7}, 15)"
+            if column.sub_micro:
+                # Both sides hold the seventh digit (COV-2, as datetime2(7)):
+                # kept, as nine digits, when it is not zero.
+                expr = (
+                    f"case when right({s7}, 1) = N'0' then {expr} else {s7} + N'00' end"
+                )
+        elif t is LogicalType.BINARY:
+            # BINARY_PREFIX + lower-case hex (style 2: no 0x); a cast to
+            # nvarchar would read the bytes as UTF-16. `timestamp` is
+            # rowversion, eight opaque bytes, not a point in time. Was 0x and
+            # upper-case hex, which matched no other engine's binary.
+            hexed = f"lower(convert({text}, convert(varbinary(max), {c}), 2))"
+            expr = self.concat_sql(self.binary_prefix_sql(), hexed)
         elif raw in ("geography", "geometry", "hierarchyid"):
             expr = self.escape_text(f"cast({c}.ToString() as {text})")
         elif raw == "sql_variant":
@@ -804,6 +826,14 @@ class SQLServerDialect(Dialect):
             return (
                 f"case when {c} is null or right({s27}, 1) = N'0' "
                 f"then {self.normalize(column)} else {s27} + N'00' end"
+            )
+        if column.logical_type is LogicalType.TIME:
+            # The same for time(n): a key's seventh digit is kept.
+            c = self.quote(column.name)
+            s7 = f"convert(nvarchar(max), cast({c} as time(7)))"
+            return (
+                f"case when {c} is null or right({s7}, 1) = N'0' "
+                f"then {self.normalize(column)} else {s7} + N'00' end"
             )
         return super().normalize_key(column)
 
@@ -1038,6 +1068,10 @@ def map_type_mssql(raw: str) -> LogicalType:
         return LogicalType.DATE
     if t in {"datetime", "datetime2", "smalldatetime", "datetimeoffset"}:
         return LogicalType.TIMESTAMP
+    if t == "time":
+        return LogicalType.TIME
+    if t in {"binary", "varbinary", "image", "timestamp", "rowversion"}:
+        return LogicalType.BINARY
     if t in {
         "char",
         "varchar",

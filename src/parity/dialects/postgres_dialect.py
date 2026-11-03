@@ -309,7 +309,7 @@ class PostgresDialect(Dialect):
         introspection runs exactly the SQL it always did.
         """
         try:
-            return super().columns(table)
+            return self._with_enums(table, super().columns(table))
         except ValueError as exc:
             try:
                 schema, name = self.split_table(table, self.default_schema)
@@ -319,6 +319,36 @@ class PostgresDialect(Dialect):
             if found is None:
                 raise
             return found
+
+    def _with_enums(self, table: str, columns: list[Column]) -> list[Column]:
+        """Map enum columns to STRING.
+
+        information_schema reports every user-defined type as `USER-DEFINED`
+        - an enum, a composite, an extension's type - so `map_type` cannot
+        tell an enum from the rest. An enum's `::text` is its label, exactly
+        what a varchar holding it renders, so it is compared as text (the
+        rendering, and its checksum, is what the unmapped fallback already
+        produced); the other user-defined types stay unmapped. One catalog
+        query, and only when a column is user-defined at all.
+        """
+        if not any(c.raw_type == "USER-DEFINED" for c in columns):
+            return columns
+        schema, name = self.split_table(table, self.default_schema)
+        rows = self.query(
+            "select a.attname from pg_catalog.pg_attribute a "
+            "join pg_catalog.pg_class c on c.oid = a.attrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "join pg_catalog.pg_type t on t.oid = a.atttypid "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)} "
+            "and a.attnum > 0 and not a.attisdropped and t.typtype = 'e'"
+        )
+        enums = {str(r[0]) for r in rows}
+        return [
+            Column(c.name, LogicalType.STRING, "enum", c.tz_aware)
+            if c.raw_type == "USER-DEFINED" and c.name in enums
+            else c
+            for c in columns
+        ]
 
     def _matview_columns(self, table: str, schema: str, name: str) -> list[Column] | None:
         """The columns of materialized view `schema.name`, or None if it is not one."""
@@ -465,8 +495,29 @@ class PostgresDialect(Dialect):
             expr = self._datetime_text(c, "-MM-DD")
         elif t is LogicalType.TIMESTAMP:
             expr = self._datetime_text(c, "-MM-DD HH24:MI:SS.US")
+        elif t is LogicalType.TIME:
+            # `to_char` has no time overload; time casts implicitly to
+            # interval, whose HH24 runs past 23, so `24:00:00` - which time
+            # accepts - renders `24:00:00.000000`, not the next midnight.
+            # Six digits always, as TIMESTAMP (`::text` drops them: `12:34:56.5`).
+            expr = f"to_char({c}, 'HH24:MI:SS.US')"
+        elif t is LogicalType.BINARY:
+            # BINARY_PREFIX + lower-case hex, whatever bytea_output says. Byte
+            # for byte what the old `::text` fallback produced (escaped, with
+            # bytea_output pinned to hex), so no bytea checksum moves.
+            expr = self.concat_sql(self.binary_prefix_sql(), f"encode({c}, 'hex')")
+        elif t is LogicalType.JSON:
+            # jsonb is PostgreSQL's normal form - insignificant whitespace
+            # gone, keys ordered by length then bytes, the last duplicate kept
+            # - and its text is exactly the canonical layout and string
+            # escaping (verified against `canonical_json_text`). A `json`
+            # column is cast to it, so two json values that differ only in
+            # spacing or key order are equal, as two jsonb values always
+            # were. A json holding the escape for U+0000, which jsonb cannot
+            # store, makes the cast raise - loudly, naming side and table.
+            expr = self.escape_text(f"({c})::jsonb::text")
         else:
-            # STRING, and every unmapped type (json, arrays, intervals, ...)
+            # STRING, and every unmapped type (arrays, intervals, ...)
             # through its text output: arbitrary text, so escaped.
             expr = self.escape_text(f"({c})::text")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
@@ -515,9 +566,30 @@ class PostgresDialect(Dialect):
         (`infinity`, `0044-03-15 BC`, `2024-06-15T06:15:00+00:00` under the
         pinned UTC), which `parity.reference` reads. Verified live.
         """
+        c = self.quote(column.name)
         if column.logical_type in (LogicalType.DATE, LogicalType.TIMESTAMP):
-            return f"to_json({self.quote(column.name)}) #>> '{{}}'"
+            return f"to_json({c}) #>> '{{}}'"
+        if column.logical_type is LogicalType.TIME:
+            # psycopg cannot load `24:00:00` into a datetime.time (verified:
+            # "hour must be in 0..23"), which would end the whole sample.
+            return f"({c})::text"
+        if column.logical_type is LogicalType.JSON:
+            # psycopg parses json into Python objects, turning 1.50 into the
+            # float 1.5; jsonb's own text keeps every number as stored, and
+            # the reference lays it out and escapes it itself.
+            return f"({c})::jsonb::text"
+        if column.raw_type.lower() == "money":
+            # psycopg returns money as its locale text (`$1,234.56`).
+            return f"({c})::numeric"
         return super().sample_select(column)
+
+    def json_semantics(self, column: Column) -> str:
+        """jsonb's normal form, which a json column is cast to."""
+        return (
+            "PostgreSQL jsonb: object keys ordered by length then bytes, the last "
+            "duplicate key kept, numbers as the exact decimals written (1.50 stays "
+            "1.50, 1e2 becomes 100)"
+        )
 
     def escape_text(self, expr: str) -> str:
         """Escape under the C collation, whatever the column's own.
@@ -530,10 +602,12 @@ class PostgresDialect(Dialect):
 
     def decimal_key_text(self, c: str, column: Column) -> str:
         """numeric's own text is exact and plain (never exponent notation);
-        drop the trailing fractional zeros its scale adds."""
-        t = f"({c})::text"
+        drop the trailing fractional zeros its scale adds. Through `::numeric`
+        first, a no-op for numeric, because a `money` key's own text is its
+        locale format (`$1,234.56`)."""
+        t = f"({c})::numeric::text"
         return (
-            f"case when ({c}) = 0 then '0' "
+            f"case when ({c})::numeric = 0 then '0' "
             f"when strpos({t}, '.') > 0 then rtrim(rtrim({t}, '0'), '.') "
             f"else {t} end"
         )

@@ -9,7 +9,9 @@ spelling is exactly the kind of thing under test.
 
 Every object created is ours alone: PostgreSQL schema `parity_cov`, MySQL
 tables `cov_*` in the test database, SQL Server database `cov_db`, BigQuery
-and Snowflake tables `cov_*` / `COV_*`, DuckDB files in a temp directory. The
+and Snowflake tables `cov_*` / `COV_*`, DuckDB files in a temp directory -
+the prefix and schema overridable (`PARITY_COV_PREFIX`,
+`PARITY_COV_PG_SCHEMA`) so two sweeps on one server never meet. The
 builders drop everything they made in `drop_all`.
 """
 
@@ -33,6 +35,13 @@ from parity.dialects.base import Dialect, get_dialect
 
 #: Per-run suffix for cloud tables, so two runs never collide.
 RUN = os.environ.get("PARITY_COV_RUN", f"{os.getpid()}")
+
+#: Prefix of every table, type and database the sweep creates, and the
+#: PostgreSQL schema it creates them in - overridable so two sweeps on one
+#: server (say, a type study beside a red-team run) never touch each
+#: other's objects.
+PREFIX = os.environ.get("PARITY_COV_PREFIX", "cov")
+PG_SCHEMA = os.environ.get("PARITY_COV_PG_SCHEMA", "parity_cov")
 
 
 # ------------------------------------------------------------- value filters
@@ -156,6 +165,21 @@ def digits_at_most(n: int) -> Callable[[Val], bool]:
     return lambda v: v.value is None or len(str(v.value).rpartition(".")[2]) <= n
 
 
+def whole_seconds(v: Val) -> bool:
+    """Times with no fraction (a time(0) rounds one on insert)."""
+    return v.value is None or (isinstance(v.value, dt.time) and v.value.microsecond == 0)
+
+
+def max_bytes(n: int) -> Callable[[Val], bool]:
+    """Byte strings of at most `n` bytes."""
+    return lambda v: v.value is None or len(v.value) <= n
+
+
+def json_not(*texts: str) -> Callable[[Val], bool]:
+    """JSON values other than these (an engine refuses them on load)."""
+    return lambda v: v.value not in texts
+
+
 def both(*fs: Callable[[Val], bool]) -> Callable[[Val], bool]:
     """All of the filters."""
     return lambda v: all(f(v) for f in fs)
@@ -224,7 +248,7 @@ class CovEngine:
 
     def table_name(self, slug: str) -> str:
         """The physical table name for a native's slug."""
-        return f"cov_{slug}"[:60]
+        return f"{PREFIX}_{slug}"[:60]
 
     def drop_all(self) -> None:
         """Drop every object this engine created."""
@@ -248,7 +272,7 @@ class PostgresCov(CovEngine):
     """PostgreSQL: tables in schema `parity_cov`, bound through psycopg."""
 
     name = "postgres"
-    schema = "parity_cov"
+    schema = PG_SCHEMA
 
     def __init__(self, url: str) -> None:
         """Connect an autocommit writer and create the schema."""
@@ -258,7 +282,7 @@ class PostgresCov(CovEngine):
         self.con = psycopg.connect(url, autocommit=True)
         self.con.execute(f"create schema if not exists {self.schema}")
         self.con.execute(
-            "do $$ begin create type parity_cov.cov_mood as enum ('sad', 'ok', 'Ok'); "
+            f"do $$ begin create type {PG_SCHEMA}.{PREFIX}_mood as enum ('sad', 'ok', 'Ok'); "
             "exception when duplicate_object then null; end $$"
         )
         self.tables: list[str] = []
@@ -287,26 +311,39 @@ class PostgresCov(CovEngine):
             Native("timestamptz", "tstz"),
             # UNKNOWN: compared through ::text, escaped.
             Native("time", "time"),
+            Native("time", "time_ext"),
+            Native("time(0)", "time", whole_seconds),
             Native("bytea", "bytes"),
             Native("json", "json"),
+            Native("json", "json_forms"),
             Native("jsonb", "json"),
+            Native("jsonb", "json_forms"),
+            Native(
+                "money",
+                "dec",
+                both(
+                    dec_fits(17, 2),
+                    lambda v: v.value is None or abs(v.value) < 90071992547409,
+                ),
+            ),
             Native("interval", "pg_interval"),
-            Native("money", "pg_money"),
             Native("inet", "pg_inet"),
             Native("bit(8)", "pg_bit"),
             Native("integer[]", "pg_intarr"),
             Native("text[]", "pg_textarr"),
-            Native("parity_cov.cov_mood", "pg_enum"),
+            Native(f"{PG_SCHEMA}.{PREFIX}_mood", "pg_enum"),
             Native("timetz", "pg_timetz"),
             Native("name", "pg_name"),
         ]
 
     def bind(self, native: Native, v: Val) -> Any:
         """psycopg binds Python objects; JSON as text."""
-        from psycopg.types.json import Json
+        from psycopg.types.json import Json, Jsonb
 
-        if native.group == "json" and v.value is not None:
-            return Json(json.loads(v.value))
+        if native.group.startswith("json") and v.value is not None:
+            # As the text itself: Json(json.loads(...)) re-serialised it in
+            # Python first, losing duplicate keys and number spellings.
+            return (Jsonb if native.ddl == "jsonb" else Json)(v.value, dumps=lambda x: x)
         return v.value
 
     def build(self, table, columns, rows):
@@ -333,7 +370,7 @@ class PostgresCov(CovEngine):
         """Drop every table, the enum type and the schema."""
         for q in self.tables:
             self.con.execute(f"drop table if exists {q}")
-        self.con.execute("drop type if exists parity_cov.cov_mood")
+        self.con.execute(f"drop type if exists {PG_SCHEMA}.{PREFIX}_mood")
         self.con.execute(f"drop schema if exists {self.schema}")
         self.con.close()
 
@@ -344,11 +381,6 @@ PG_EXTRA: dict[str, list[Val]] = {
         Val("iv:1 day", "1 day"),
         Val("iv:24 hours", "24 hours"),
         Val("iv:-1 us", "-00:00:00.000001"),
-    ],
-    "pg_money": [
-        Val("m:<NULL>", None),
-        Val("m:1234.56", "1234.56"),
-        Val("m:-0.01", "-0.01"),
     ],
     "pg_inet": [
         Val("in:<NULL>", None),
@@ -403,7 +435,7 @@ class DuckDBCov(CovEngine):
         if os.path.exists(self.path):
             os.remove(self.path)
         self.con = duckdb.connect(self.path)
-        self.con.execute("create type cov_mood as enum ('sad', 'ok', 'Ok')")
+        self.con.execute(f"create type {PREFIX}_mood as enum ('sad', 'ok', 'Ok')")
 
     def natives(self) -> list[Native]:
         """Every DuckDB type the shared `map_type` covers, plus UNKNOWN ones."""
@@ -440,12 +472,14 @@ class DuckDBCov(CovEngine):
             Native("TIMESTAMPTZ", "tstz"),
             # UNKNOWN: compared through their varchar cast, escaped.
             Native("TIME", "time"),
+            Native("TIME", "time_ext"),
             Native("BLOB", "bytes"),
             Native("JSON", "json"),
+            Native("JSON", "json_forms"),
             Native("INTERVAL", "pg_interval"),
             Native("INTEGER[]", "pg_intarr"),
             Native("VARCHAR[]", "pg_textarr"),
-            Native("cov_mood", "pg_enum"),
+            Native(f"{PREFIX}_mood", "pg_enum"),
             Native("BIT", "pg_bit"),
         ]
 
@@ -542,8 +576,13 @@ class MySQLCov(CovEngine):
             ),
             # UNKNOWN (or text-cast) types.
             Native("time(6)", "time"),
-            Native("varbinary(64)", "bytes"),
+            Native("time(6)", "time_ext"),
+            Native("time(6)", "time_dur"),
+            Native("time", "time", whole_seconds),
+            Native("varbinary(300)", "bytes"),
+            Native("blob", "bytes"),
             Native("json", "json"),
+            Native("json", "json_forms"),
             Native("bit(8)", "my_bit"),
             Native("enum('sad','ok','Ok') collate utf8mb4_bin", "my_enum"),
             Native("year", "my_year"),
@@ -609,7 +648,7 @@ MYSQL_EXTRA: dict[str, list[Val]] = {
 
 
 #: Our own SQL Server database: UTF-8 collation, snapshot allowed.
-MSSQL_DB = "cov_db"
+MSSQL_DB = f"{PREFIX}_db"
 
 
 class MSSQLCov(CovEngine):
@@ -681,7 +720,11 @@ class MSSQLCov(CovEngine):
             Native("datetimeoffset(7)", "tstz"),
             # UNKNOWN types.
             Native("time(7)", "time"),
+            Native("time(7)", "time_sub"),
+            Native("time(0)", "time", whole_seconds),
             Native("varbinary(max)", "bytes"),
+            Native("varbinary(300)", "bytes"),
+            Native("image", "bytes"),
             Native("sql_variant", "ms_variant"),
         ]
 
@@ -801,12 +844,14 @@ class BigQueryCov(CovEngine):
             Native("TIME", "time"),
             Native("BYTES", "bytes"),
             # A JSON null cannot be loaded as anything but a missing field.
-            Native("JSON", "json", lambda v: v.value != "null"),
+            Native("JSON", "json", json_not("null")),
+            # BigQuery refuses an integer past 64 bits in JSON on load.
+            Native("JSON", "json_forms", json_not("12345678901234567890123")),
         ]
 
     def table_name(self, slug: str) -> str:
         """Per-run, so concurrent runs never collide."""
-        return f"cov_{slug}_{RUN}"
+        return f"{PREFIX}_{slug}_{RUN}"
 
     def _json(self, native: Native, x: Any) -> Any:
         """A value in BigQuery's JSON load encoding."""
@@ -902,12 +947,16 @@ class SnowflakeCov(CovEngine):
             Native("TIMESTAMP_TZ(9)", "tstz"),
             Native("TIMESTAMP_LTZ(9)", "tstz"),
             Native("TIME(9)", "time"),
+            Native("TIME(9)", "time_sub"),
             Native("BINARY", "bytes"),
+            Native("VARIANT", "json"),
+            # PARSE_JSON refuses duplicate keys.
+            Native("VARIANT", "json_forms", json_not('{"a": 1, "a": 2}')),
         ]
 
     def table_name(self, slug: str) -> str:
         """Per-run, upper case as Snowflake stores unquoted names."""
-        return f"COV_{slug}_{RUN}".upper()
+        return f"{PREFIX}_{slug}_{RUN}".upper()
 
     def bind(self, native: Native, v: Val) -> Any:
         """Typed bindings: temporal values as ISO text, numbers as text with
@@ -936,7 +985,13 @@ class SnowflakeCov(CovEngine):
         """Create the table and insert every row in one bound batch."""
         cur = self.w._conn.cursor()
         try:
-            cols = ", ".join(f'"{n}" {ddl}' for n, ddl in columns)
+            # A string bound into a VARIANT is stored as a VARCHAR variant,
+            # not parsed; so VARIANT columns are loaded as text and the table
+            # is rebuilt with PARSE_JSON over them.
+            variant = {n for n, ddl in columns if ddl == "VARIANT"}
+            cols = ", ".join(
+                f'"{n}" {"VARCHAR" if n in variant else ddl}' for n, ddl in columns
+            )
             cur.execute(f'create or replace table "{table}" ({cols})')
             self.tables.append(table)
             marks = ", ".join(["?"] * len(columns))
@@ -944,6 +999,14 @@ class SnowflakeCov(CovEngine):
             # Server-side binding: the default pyformat style interpolates
             # values into the SQL text client-side - exactly a literal.
             cur.executemany(sql, [list(r) for r in rows], _force_qmark_paramstyle=True)
+            if variant:
+                exprs = ", ".join(
+                    f'parse_json("{n}") as "{n}"' if n in variant else f'"{n}"'
+                    for n, _ in columns
+                )
+                cur.execute(
+                    f'create or replace table "{table}" as select {exprs} from "{table}"'
+                )
         finally:
             cur.close()
         return {}

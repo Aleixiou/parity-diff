@@ -18,6 +18,8 @@ wraps to negative and the two engines disagree.
 
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from decimal import Decimal
@@ -95,6 +97,175 @@ def decode_canonical_field(field: str) -> str | None:
             out.append(field[i])
             i += 1
     return "".join(out)
+
+
+# ------------------------------------------------- BINARY, TIME and JSON
+#
+# The three most common types that used to fall to UNKNOWN and compare
+# through an unchecked text cast. Each has an exact rule now; these functions
+# are its executable spec, which every dialect's SQL and `parity.reference`
+# are tested against (tests/test_types_rules.py, tests/conformance).
+
+#: What every BINARY value's canonical text starts with: two backslashes and
+#: `x`. That is PostgreSQL's bytea text (`\x00ff`) as escaped text, which is
+#: exactly how PostgreSQL bytea and MySQL binary rendered when they were
+#: unmapped (bytea through `::text`, MySQL through `_binary_text`), so their
+#: checksums do not move. It can never equal the NULL sentinel.
+BINARY_PREFIX = "\\\\x"
+
+
+def canonical_binary_text(value: bytes) -> str:
+    """A BINARY value's canonical text: `BINARY_PREFIX` + lower-case hex.
+
+    Bytes compare exactly - no padding is trimmed, no encoding is read -
+    because every engine stores bytes as given (MySQL `binary(n)` and SQL
+    Server `binary(n)` store their zero padding, and so render it).
+    """
+    return BINARY_PREFIX + bytes(value).hex()
+
+
+def canonical_time_text(micros: int) -> str:
+    """A TIME value's canonical text, from its microseconds since midnight.
+
+    `HH:MM:SS.ffffff`, always six fractional digits, as TIMESTAMP's clock
+    part. Hours are at least two digits and run past 23 only for values no
+    time-of-day type holds: PostgreSQL and DuckDB accept `24:00:00` itself,
+    and MySQL's TIME is a duration (-838:59:59 .. 838:59:59), whose negative
+    values carry a leading minus - exactly what MySQL's `time_format` prints,
+    so a MySQL duration still renders exactly and only ever matches MySQL.
+    Digits past the microsecond are not part of the rule: an engine holding
+    more (SQL Server time(7), Snowflake TIME(9)) truncates them, and says so.
+    """
+    sign = "-" if micros < 0 else ""
+    m = abs(micros)
+    seconds, frac = divmod(m, 1_000_000)
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{sign}{hours:02d}:{minute:02d}:{sec:02d}.{frac:06d}"
+
+
+#: JSON's control-character escapes as every engine but one spells them:
+#: the six named ones, and `\u00xx` in lower case for the rest of C0.
+_JSON_NAMED = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n"}
+_JSON_NAMED.update({"\r": "\\r", "\t": "\\t"})
+
+
+def json_string_literal(value: str) -> str:
+    r"""A JSON string as the canonical text spells it.
+
+    `"` and `\` escaped, `\b \f \n \r \t` by name, the rest of U+0000..U+001F
+    as `\u00xx` in lower case, and *every other character raw* - `/`, U+007F,
+    U+2028, non-ASCII, astral characters as themselves rather than surrogate
+    pairs. That is PostgreSQL jsonb's, MySQL's and BigQuery's output exactly
+    (verified live); Snowflake escapes U+007F and its dialect undoes it.
+    """
+    out = ['"']
+    for ch in value:
+        esc = _JSON_NAMED.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ch < " ":
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+class _JsonNumber(str):
+    """A JSON number token, kept exactly as the engine spelled it."""
+
+
+def _json_number(token: str) -> _JsonNumber:
+    """`json.loads` hook: keep a number's text instead of converting it."""
+    return _JsonNumber(token)
+
+
+#: One token of JSON text: a string, a run of whitespace, a structural `,` or
+#: `:`, or anything else (brackets, numbers, literals). The string alternative
+#: comes first, so a `,` or a space inside a string is never mistaken for one
+#: outside it - the same alternation every dialect's SQL uses.
+_JSON_LAYOUT = re.compile(
+    r'("(?:[^"\\]|\\.)*")|([ \t\n\r]+)|([,:])|([^", :\t\n\r]+)', re.S
+)
+
+
+def json_layout(text: str) -> str:
+    """JSON text laid out canonically, tokens otherwise untouched.
+
+    Insignificant whitespace removed, then one space after every structural
+    comma and colon: `{"a": [1, 2]}`, PostgreSQL jsonb's and MySQL's own
+    layout. Strings, numbers and key order pass through verbatim.
+    """
+    out: list[str] = []
+    for m in _JSON_LAYOUT.finditer(text):
+        string, space, sep, other = m.groups()
+        if string is not None:
+            out.append(string)
+        elif sep is not None:
+            out.append(sep + " ")
+        elif other is not None:
+            out.append(other)
+    return "".join(out)
+
+
+def canonical_json_text(text: str, *, verbatim: bool = False) -> str:
+    """A JSON document's canonical text, from its engine's serialisation.
+
+    The engines normalise JSON on the way in, each its own way: PostgreSQL
+    jsonb and MySQL order object keys by length and then bytes and keep the
+    last of duplicate keys, BigQuery and Snowflake order them by code point
+    (BigQuery keeps the first duplicate, Snowflake refuses them), and numbers
+    are exact decimals on PostgreSQL and Snowflake but doubles on MySQL and
+    BigQuery. That normal form *is* each engine's JSON value, so key order,
+    duplicates and number spellings are taken from it as given. What the
+    rule fixes is everything else: the layout (`json_layout`) and every
+    string's escaping (`json_string_literal`), so two engines whose normal
+    forms agree render byte-identical text whatever their output style.
+
+    `verbatim` is for an engine that stores JSON as text without normalising
+    it (DuckDB): only the layout is canonical, and strings, numbers, key
+    order and duplicates are compared exactly as stored - an escape spelled
+    `\\u00e9` stays different from `é`. Stricter than JSON equality, never
+    looser, so it can report two equal documents as different but cannot
+    call two different ones equal.
+
+    Raises ValueError on text that is not JSON.
+    """
+    if verbatim:
+        json.loads(text)  # refuse anything that is not JSON at all
+        return json_layout(text)
+    parsed = json.loads(
+        text,
+        object_pairs_hook=_JsonObject,
+        parse_float=_json_number,
+        parse_int=_json_number,
+        parse_constant=_json_number,
+    )
+    return _json_serialise(parsed)
+
+
+class _JsonObject(list):  # type: ignore[type-arg]
+    """A parsed JSON object: its (key, value) pairs in the engine's order,
+    duplicates included - so `{}` is never mistaken for `[]`."""
+
+
+def _json_serialise(value: Any) -> str:
+    """Serialise what `canonical_json_text` parsed, in the canonical layout."""
+    if isinstance(value, _JsonNumber):
+        return str(value)
+    if isinstance(value, str):
+        return json_string_literal(value)
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, _JsonObject):
+        pairs = (f"{json_string_literal(k)}: {_json_serialise(v)}" for k, v in value)
+        return "{" + ", ".join(pairs) + "}"
+    return "[" + ", ".join(_json_serialise(v) for v in value) + "]"
 
 
 # Number of MD5 hex characters folded into the row hash. 15 nibbles = 60 bits.
@@ -1007,6 +1178,83 @@ class Dialect(ABC):
         t = column.raw_type.lower().split("(")[0].strip()
         return t in ("char", "nchar", "character", "bpchar")
 
+    # ------------------------------------------------- BINARY, TIME and JSON
+
+    def binary_prefix_sql(self) -> str:
+        r"""SQL for `BINARY_PREFIX` (`\\x`), the backslashes from code points."""
+        bs = self.backslash_sql()
+        return self.concat_sql(self.concat_sql(bs, bs), "'x'")
+
+    def spell_sql(self, text: str) -> str:
+        r"""`text` as a SQL string expression with no backslash literal.
+
+        Regular expressions need backslashes, and RT-D1 bans them from
+        rendering SQL - what a literal backslash means is a session setting
+        on PostgreSQL and MySQL. So each backslash is `backslash_sql()` and
+        each control character `chr(n)` (BigQuery's plain literals cannot
+        hold a newline), joined by `concat_sql`; the rest is literal text,
+        which must hold no quote.
+        """
+        if "'" in text:
+            raise ValueError("spell_sql takes no quotes")
+        pieces: list[str] = []
+        lit = ""
+        for ch in text:
+            if ch == "\\" or ch < " ":
+                if lit:
+                    pieces.append(f"'{lit}'")
+                    lit = ""
+                pieces.append(self.backslash_sql() if ch == "\\" else f"chr({ord(ch)})")
+            else:
+                lit += ch
+        if lit or not pieces:
+            pieces.append(f"'{lit}'")
+        out = pieces[0]
+        for p in pieces[1:]:
+            out = self.concat_sql(out, p)
+        return out
+
+    def json_verbatim(self, column: Column) -> bool:
+        """Whether this engine stores a JSON column as unnormalised text, so
+        `canonical_json_text` compares it verbatim (DuckDB). False: the
+        engine's JSON is a normalised value."""
+        return False
+
+    def json_semantics(self, column: Column) -> str:
+        """How this engine normalises a JSON value, for a reader.
+
+        Two sides whose descriptions differ can render equal documents
+        differently - key order, duplicates, number spelling - and the engine
+        prints both descriptions as a warning. A false alarm only: equal
+        canonical text always means the same document, whatever the engine.
+        Empty for an engine without a JSON type.
+        """
+        return ""
+
+    def json_compact_layout(self, expr: str) -> str:
+        """Lay out *compact* JSON text canonically (`json_layout`).
+
+        BigQuery, Snowflake and DuckDB print JSON without spaces, the
+        canonical layout has one after every structural `,` and `:`, and
+        only a regular expression can tell those from a comma inside a
+        string. The engines with no conditional replacement do it in three
+        steps, which every one of them can spell:
+
+        1. `regexp_replace(t, '("(\\.|[^"\\])*"|[^",:]*)([,:]?)', '\1\3' + chr(1))`
+           puts chr(1) after every token - a whole string, or a run of
+           anything else - and its separator, if it has one;
+        2. `,` + chr(1) becomes `, `, and `:` + chr(1) becomes `: ` - only a
+           structural separator can be followed by chr(1), because a string
+           token ends in `"` and the other run excludes `,` and `:`;
+        3. every remaining chr(1) is removed.
+
+        chr(1) cannot already be in the text: JSON escapes every control
+        character inside a string, and none can stand outside one. Verified
+        live on BigQuery, Snowflake and DuckDB against `json_layout`. A
+        dialect whose engine prints JSON spaced already never calls this.
+        """
+        raise self._err("this engine has no compact JSON layout to fix")
+
     def fetch_sample(
         self,
         table: str,
@@ -1139,7 +1387,11 @@ def map_type(raw: str) -> LogicalType:
         "bigserial",
     }:
         return LogicalType.INTEGER
-    if t in {"decimal", "numeric"}:
+    if t in {"decimal", "numeric", "money"}:
+        # PostgreSQL `money` is exact cents. Its `::text` is locale-formatted
+        # (`$1,234.56`, by lc_monetary), so as an unmapped type it never
+        # matched a migrated decimal; as DECIMAL it renders through
+        # `round(c::numeric, s)`, exact, like SQL Server's money.
         return LogicalType.DECIMAL
     if t in {"float", "float4", "float8", "double", "real", "double precision"}:
         return LogicalType.FLOAT
@@ -1149,6 +1401,17 @@ def map_type(raw: str) -> LogicalType:
         return LogicalType.DATE
     if t.startswith(("timestamp", "datetime")):
         return LogicalType.TIMESTAMP
+    # Exactly these spellings: `time with time zone` (PostgreSQL timetz,
+    # DuckDB TIMETZ) carries an offset the TIME rule has no place for, and
+    # DuckDB's TIME_NS has not been verified, so both stay unmapped.
+    if t in {"time", "time without time zone"}:
+        return LogicalType.TIME
+    # PostgreSQL bytea; DuckDB BLOB (BYTEA, VARBINARY and BINARY are aliases
+    # it reports as BLOB).
+    if t in {"bytea", "blob"}:
+        return LogicalType.BINARY
+    if t in {"json", "jsonb"}:
+        return LogicalType.JSON
     if t in {
         "text",
         "varchar",
@@ -1158,6 +1421,9 @@ def map_type(raw: str) -> LogicalType:
         "character",
         "string",
         "uuid",
+        # DuckDB reports an enum column as `ENUM('a', 'b')`; its varchar cast
+        # is the label, exactly the text a STRING column holding it renders.
+        "enum",
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN

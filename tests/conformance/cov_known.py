@@ -56,7 +56,7 @@ FINDINGS: dict[str, str] = {
         "sample check's raw value is not the stored value."
     ),
     "COV-6": (
-        "FIXED 2026-11-03 - Snowflake TIME renders `to_char(c, 'HH24:MI:SS.FF9')` without trailing zeros. Was: "
+        "FIXED 2026-11-03 - Snowflake TIME renders `to_char(c, 'HH24:MI:SS.FF6')`, the TIME rule every engine now follows (`canonical_time_text`). Was: "
         "Snowflake TIME (UNKNOWN-mapped) renders through `cast(c as varchar)`, "
         "which follows TIME_OUTPUT_FORMAT - `HH24:MI:SS` by default - and drops "
         "the fractional seconds: 12:34:56.5 and 12:34:56.123456 render "
