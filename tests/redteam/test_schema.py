@@ -184,10 +184,6 @@ def test_duckdb_timestamp_ns_difference_is_found_or_caveated(tmp_path):
 # is not.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C2: unqualified PG table reads data via search_path, not public",
-)
 def test_unqualified_postgres_table_is_read_from_public_not_search_path(pg, tmp_path):
     """public.rt_sch_shadow differs from B; a search_path twin matches B."""
     pg.execute("create table public.rt_sch_shadow(id int, amount int)")
@@ -216,10 +212,6 @@ def test_unqualified_postgres_table_is_read_from_public_not_search_path(pg, tmp_
 # GRANT, because pg_class does list it.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C3: PG materialized view refused with a false 'missing GRANT' message",
-)
 def test_postgres_materialized_view_is_diffable_or_named_honestly(pg, tmp_path):
     """Either compare the matview, or say it is one - never blame privileges."""
     pg.execute(f"create table {PG_SCHEMA}.base(id int, amount int)")
@@ -816,10 +808,6 @@ INF_OTHER = [("pg", "null"), ("pg", "'-infinity'"), ("duck", "null")]
 @pytest.mark.parametrize(
     ("engine", "other"), INF_OTHER, ids=["pg-null", "pg-neginf", "duck-null"]
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C9: PG to_char(infinity) is NULL, so +/-infinity and NULL all match",
-)
 def test_postgres_infinite_dates_are_not_equal_to_null(pg, tmp_path, pg_t, engine, other):
     """'infinity' on side A must not compare equal to NULL or -infinity on B."""
     pg.execute(f"create table {PG_SCHEMA}.inf_a(id int, v {pg_t})")
@@ -862,10 +850,6 @@ def test_postgres_infinite_dates_are_not_equal_to_null(pg, tmp_path, pg_t, engin
     ids=["date", "timestamp"],
 )
 @pytest.mark.parametrize("engine", ["pg", "duck"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C10: PG to_char drops the era, so a BC date matches the AD one",
-)
 def test_postgres_bc_dates_do_not_match_ad_dates(pg, tmp_path, pg_t, bc, ad, engine):
     """44 BC on side A and AD 44 on side B are 87 years apart."""
     pg.execute(f"create table {PG_SCHEMA}.era_a(id int, v {pg_t})")

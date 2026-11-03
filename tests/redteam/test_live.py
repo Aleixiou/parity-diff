@@ -129,11 +129,6 @@ def pgw(pg_url):
     conn.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D1: standard_conforming_strings=off turns the '\\N' sentinel into "
-    "'N', so a PostgreSQL NULL matches the string 'N' (false match)",
-)
 def test_pg_standard_conforming_strings_off_makes_null_equal_the_letter_n(
     pg_url, pgw, tmp_path
 ):
@@ -155,12 +150,6 @@ def test_pg_standard_conforming_strings_off_makes_null_equal_the_letter_n(
     assert found(result) == [(1, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D2: an unqualified table is introspected in `public` but read "
-    "through search_path, so a same-named table in another schema is compared "
-    "(false match)",
-)
 def test_pg_search_path_reads_a_different_table_than_it_introspects(
     pg_url, pgw, tmp_path
 ):
@@ -186,16 +175,21 @@ def test_pg_search_path_reads_a_different_table_than_it_introspects(
     assert found(result) == [(1, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D2: qualify() leaves an unqualified table unqualified, so the "
-    "schema read is the session's, not the one columns() introspected",
-)
 @pytest.mark.parametrize(
     "dialect_path, schema",
     [
+        # Fixed: PostgresDialect.qualify always names the schema.
         ("parity.dialects.postgres_dialect:PostgresDialect", "public"),
-        ("parity.dialects.snowflake_dialect:SnowflakeDialect", "PUBLIC"),
+        pytest.param(
+            "parity.dialects.snowflake_dialect:SnowflakeDialect",
+            "PUBLIC",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="RT-D2: qualify() leaves an unqualified table unqualified, "
+                "so the schema read is the session's, not the one columns() "
+                "introspected",
+            ),
+        ),
     ],
 )
 def test_unqualified_tables_are_read_from_the_schema_they_were_introspected_in(
@@ -313,11 +307,6 @@ def test_pg_two_sessions_in_different_zones_agree_across_dst(pg_url, pgw):
     assert found(result) == [(4, "different", ("ts",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D5: IntervalStyle / lc_monetary / DateStyle / bytea_output are "
-    "not pinned, so unmapped PostgreSQL types render per session (false diff)",
-)
 @pytest.mark.parametrize(
     "gucs",
     [
@@ -404,11 +393,6 @@ def test_pg_mid_walk_writes_stay_invisible_to_the_whole_diff(pg_url, pgw, tmp_pa
     assert {d.key for d in fresh.diffs} == {11, 30, 150, 200, 100000, 230230}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D8: client_encoding=SQL_ASCII makes psycopg return bytes and the "
-    "walk dies with a bare TypeError that names neither side nor table",
-)
 def test_pg_sql_ascii_client_encoding_fails_naming_the_side(pg_url, pgw, tmp_path):
     """PGCLIENTENCODING / a role default of SQL_ASCII. Failing is fine - the
     error must say which side broke (CLAUDE.md section 6)."""
@@ -1141,11 +1125,6 @@ def test_mysql_case_sensitive_text_key_is_not_called_duplicate(mysql_url, myw):
     assert found(result) == [("b", "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D11: count(distinct) of a text key follows a nondeterministic "
-    "PostgreSQL collation, so 'a'/'A' are refused as a duplicate key",
-)
 def test_pg_nondeterministic_collation_text_key_is_not_called_duplicate(pgw, pg_url):
     """A case-insensitive ICU collation (deterministic = false) - the standard
     PostgreSQL answer to case-insensitive email/user-name columns. The values
@@ -1186,12 +1165,6 @@ def test_pg_query_error_names_the_side(pg_url, pgw):
     assert "side B" in str(info.value), f"{type(info.value).__name__}: {info.value}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D13: the held REPEATABLE READ transaction is killed by a role "
-    "default idle_in_transaction_session_timeout / transaction_timeout while "
-    "the other side's query runs; the dialect does not pin either for its session",
-)
 @pytest.mark.parametrize(
     "gucs",
     [
@@ -1219,12 +1192,6 @@ def test_pg_snapshot_survives_a_slow_other_side(pg_url, pgw, tmp_path, gucs):
     assert found(result) == [(10, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D14: built-ins are called unqualified, so an exact-signature "
-    "function on search_path (here to_char(date, text)) replaces pg_catalog's "
-    "in the canonical text (false match)",
-)
 def test_pg_user_function_on_search_path_cannot_replace_a_builtin(pg_url, pgw, tmp_path):
     """pg_catalog has no `to_char(date, text)`; the DATE rendering resolves to
     `to_char(timestamptz, text)` through an implicit cast. Any schema on the

@@ -1107,13 +1107,6 @@ def test_rt_b8_timezone_aware_key_against_naive_key_is_named(pg_rt, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B10: PG nondeterministic-collation key: count(distinct) merges "
-        "'abc'/'ABC' -> false 'not unique'"
-    ),
-)
 def test_rt_b10_postgres_nondeterministic_collation_key_is_unique(pg_rt):
     """PostgreSQL 12+ ICU nondeterministic collations (case-insensitive natural
     keys) make `count(distinct k::text)` compare under the collation, because
@@ -1140,13 +1133,6 @@ def test_rt_b10_postgres_nondeterministic_collation_key_is_unique(pg_rt):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B11: PG to_char(+/-infinity) is NULL -> renders '\\N': "
-        "infinity == -infinity == NULL"
-    ),
-)
 def test_rt_b11_postgres_infinity_values_are_not_null(pg_rt):
     """`to_char('infinity'::timestamp, ...)` returns SQL NULL, which the
     coalesce turns into the NULL sentinel. So a date/timestamp/timestamptz
@@ -1165,10 +1151,6 @@ def test_rt_b11_postgres_infinity_values_are_not_null(pg_rt):
 
 @pytest.mark.postgres
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B11: PG infinity date value == DuckDB NULL -> false match",
-)
 def test_rt_b11_postgres_infinity_against_duckdb_null(pg_rt, tmp_path):
     ta = _pg_table(
         pg_rt, "rt_key_inf_c", "k int, d date", [(1, "infinity"), (2, "2024-01-01")]
@@ -1179,13 +1161,6 @@ def test_rt_b11_postgres_infinity_against_duckdb_null(pg_rt, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B11: PG timestamp keys infinity and -infinity share one identity "
-        "-> false 'not unique'"
-    ),
-)
 def test_rt_b11_postgres_infinity_keys_are_distinct(pg_rt):
     rows = [("infinity", 1), ("-infinity", 2), ("2024-01-01", 3)]
     ta = _pg_table(pg_rt, "rt_key_infk_a", "k timestamp, v int", rows)
