@@ -67,8 +67,8 @@ stored history.
 
 | Phase | When | Content | Grades after |
 |---|---|---|---|
-| 1 | weeks 1-3 | docs restructure, `--where`, column renames, the config file and summary report, release 0.5.0 | fit B+, ease of use B+ |
-| 2 | weeks 4-8 | Oracle, the cost estimate, `check-connection`, live engines in CI, five observed users | coverage B+, speed A, ease of use A |
+| 1 | weeks 1-3 | docs restructure, `--where`, column renames, the config file and summary report, **Oracle** (moved up from phase 2, 2026-11-03), release 0.5.0 | fit B+, ease of use B+, coverage B+ |
+| 2 | weeks 4-8 | the cost estimate, `check-connection`, live engines in CI, five observed users | coverage B+, speed A, ease of use A |
 | 3 | weeks 9-16 | Databricks, Redshift, keyed checksum, 1.0, outside review of the risk file | coverage A-, trust A+ |
 | 4 | ongoing | Teradata and DB2; users and contributors | maturity A (depends on adoption, not only on work) |
 
