@@ -35,6 +35,45 @@ Every test plants a difference and asserts the tool finds exactly it. That rule
 is the reason this project can be trusted at all, and it is not negotiable — see
 `CONTRIBUTING.md`.
 
+## Since 0.4.0 (unreleased, branch `snowflake-live`)
+
+Snowflake verified live and its FLOAT fixed; the independent sample check
+(default 10,000 rows, 99.9% confidence) and per-run risk figures; the coverage
+map (`docs/coverage.md`); `docs/risk.md`, kept current with every change;
+red-team round G (server settings and versions, 14 findings fixed); exact rules
+for TIME, BINARY, JSON, bit strings, intervals, timetz, lists, inet and
+sql_variant. Full live suite: 1,620 passed.
+
+## The plan to an A in every area (2026-11-03)
+
+A self-assessment graded the tool for backend and database engineers:
+trustworthiness **A**, speed and cost **B+**, database coverage **B-**, fit
+for a real migration **C**, ease of use and docs **C+**, maturity **C**. This
+is the plan to bring each to an A. "A" is defined by something checkable, not
+by how it feels.
+
+| Area | Now | An A means | Work |
+|---|---|---|---|
+| Trustworthiness | A | no known accidental false match; odds published per step; crafted data closable | optional keyed (secret) checksum against tampering; coverage map required for every new engine; an outside review of `docs/risk.md` |
+| Speed and cost | B+ | a huge table can be checked daily without a large bill, and the cost is known before the run | `--where` per side; a cost estimate before the run (BigQuery dry run, Snowflake warehouse/time); tables in parallel; sampling mode that can never print "identical"; benchmarks on every engine |
+| Database coverage | B- | the top legacy sources and modern targets, each verified live | Oracle, then Databricks, Redshift, Teradata, DB2 - each with its coverage map, a settings/versions red-team round, a risk entry and a live suite |
+| Fit for a real migration | C | one command proves a whole migration (hundreds of tables, renamed columns, filters) and gives one report to sign off | a config file of table pairs; column renames; per-column float scale; one summary report (Markdown/HTML, JUnit for CI); resume a run that stopped |
+| Ease of use and docs | C+ | a new user finds a first real difference in under 5 minutes, measured with real people | the docs restructure (quickstart, output, troubleshooting, per-engine pages); `parity check-connection`; every error says what to do next; pipx, a Docker image, CI templates; five observed first-time users |
+| Maturity | C | a large company's engineering team would approve it | release 0.5.0; live engines in CI; a 1.0 stability promise; security policy, signed releases, SBOM; 10 teams using it, 3 named; a second maintainer |
+
+Everything above stays inside the scope rules of `CLAUDE.md` §3: it all
+serves "can I safely switch off the old system?" - no scheduler, no web UI, no
+stored history.
+
+| Phase | When | Content | Grades after |
+|---|---|---|---|
+| 1 | weeks 1-3 | docs restructure, `--where`, column renames, the config file and summary report, release 0.5.0 | fit B+, ease of use B+ |
+| 2 | weeks 4-8 | Oracle, the cost estimate, `check-connection`, live engines in CI, five observed users | coverage B+, speed A, ease of use A |
+| 3 | weeks 9-16 | Databricks, Redshift, keyed checksum, 1.0, outside review of the risk file | coverage A-, trust A+ |
+| 4 | ongoing | Teradata and DB2; users and contributors | maturity A (depends on adoption, not only on work) |
+
+Phase 1 started 2026-11-03.
+
 ## What is not done
 
 Ordered by how much it would change who can use this.
