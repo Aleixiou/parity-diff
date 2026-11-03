@@ -54,7 +54,7 @@ DEFAULT_MAX_DIFFS = 10_000
 #: Rows the independent sample check re-compares from raw values, about. A
 #: table this size or smaller is compared in full. The cost is one scan per
 #: side that hashes the key only, plus this many rows downloaded.
-DEFAULT_VERIFY_SAMPLE = 1_000
+DEFAULT_VERIFY_SAMPLE = 10_000
 
 #: Failures listed in full before the rest are only counted.
 _MAX_LISTED = 20

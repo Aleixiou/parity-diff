@@ -193,7 +193,7 @@ class DiffStats:
 
 
 #: Confidence level of the risk figures each run prints (`max_hidden_fraction`).
-RISK_CONFIDENCE = 0.99
+RISK_CONFIDENCE = 0.999
 
 #: Upper bound on the chance that one bucket holding a real difference still
 #: sums to the other side's checksum: row hashes are 60-bit MD5 prefixes, so

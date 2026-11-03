@@ -422,7 +422,7 @@ def _risk_line(result: DiffResult) -> str:
     r = risk_figures(result)
     if r["max_hidden_fraction"] is None:
         return "not computed"
-    conf = f"{r['confidence']:.0%}"
+    conf = f"{r['confidence'] * 100:g}%"
     collision = "a checksum collision is below 1 in 10^18"
     if r["max_hidden_fraction"] == 0.0:
         return (

@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 8f253e84d2e3e146`
+Source fingerprint: `src-sha256: 5d369f978d4859da`
 
 ## Summary
 
@@ -26,7 +26,7 @@ For one run that reports **identical**, on columns the rules cover:
 | What would have to go wrong | Odds | Kind |
 |---|---|---|
 | A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
-| A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.01^(1/n)** of the rows, at 99% confidence, for n rows sampled — **0.46%** at the default n = 1,000; **0** when every row was compared | Proven bound |
+| A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.001^(1/n)** of the rows, at 99.9% confidence, for n rows sampled — **0.069%** at the default n = 10,000 (about 1 row in 1,450); **0** when every row was compared | Proven bound |
 | An engine renders a value differently from the rules | **0 of 4,142** checks at float scale 6 outside the 26 required refusals (4,116 exact), every type with a rule × 6 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
@@ -124,7 +124,7 @@ them per key range in a wide type and counts rows.
 
 ## 8. The independent sample check
 
-What it does: after the walk, about `--verify-sample` rows (default 1,000;
+What it does: after the walk, about `--verify-sample` rows (default 10,000;
 all rows of a smaller table), chosen by a hash of the key with a fresh random
 residue each run, are fetched as raw driver values on both sides and compared
 in Python by the rules (`parity/reference.py`), with none of the engine SQL.
@@ -133,22 +133,23 @@ Any disagreement means not identical.
 Chance that a rendering error affecting a share p of rows is **missed** by
 n sampled rows: (1 − p)ⁿ.
 
-| Share of rows affected | n = 1,000 | n = 100,000 |
-|---|---|---|
-| 1% | 4.3 × 10⁻⁵ | below 10⁻⁴³⁶ |
-| 0.1% | 0.368 | 3.5 × 10⁻⁴⁴ |
-| 0.01% | 0.905 | 4.5 × 10⁻⁵ |
-| 0.001% | 0.990 | 0.368 |
+| Share of rows affected | n = 1,000 | n = 10,000 (default) | n = 100,000 |
+|---|---|---|---|
+| 1% | 4.3 × 10⁻⁵ | 2.2 × 10⁻⁴⁴ | below 10⁻⁴³⁶ |
+| 0.1% | 0.368 | 4.5 × 10⁻⁵ | 3.5 × 10⁻⁴⁴ |
+| 0.01% | 0.905 | 0.368 | 4.5 × 10⁻⁵ |
+| 0.001% | 0.990 | 0.905 | 0.368 |
 
-Equivalently, after n rows with no disagreement, fewer than 1 − 0.01^(1/n)
-of rows can carry a hidden error, at 99% confidence:
+Equivalently, after n rows with no disagreement, fewer than 1 − 0.001^(1/n)
+of rows can carry a hidden error, at 99.9% confidence (the default since
+2026-11-03, chosen by the project owner; 99% before, with n = 1,000):
 
 | n | share | of 10M rows, at most |
 |---|---|---|
-| 1,000 | 0.4595% | 45,946 |
-| 10,000 | 0.0460% | 4,605 |
-| 100,000 | 0.0046% | 461 |
-| 1,000,000 | 0.00046% | 47 |
+| 1,000 | 0.6884% | 68,840 |
+| 10,000 (default) | 0.0691% | 6,905 |
+| 100,000 | 0.0069% | 691 |
+| 1,000,000 | 0.00069% | 69 |
 | whole table | 0 | 0 |
 
 Assumptions: the key hash spreads keys evenly over residues (MD5), the
@@ -158,7 +159,7 @@ listed as uncovered carry none. Driver quirks that would make the check
 disagree falsely are worked around per engine and verified live (MySQL
 FLOAT and BIT width, SQL Server NULs, 7-digit times and sql_variant base
 types, PostgreSQL and DuckDB infinite and BC dates and interval months,
-DuckDB TIMETZ offsets). Measured: on the full live suite (1,611 tests) the check
+DuckDB TIMETZ offsets). Measured: on the full live suite (1,620 tests, default sample 10,000) the check
 raised no false disagreement; every disagreement it raised was a planted
 walk defect or a table changed mid-run.
 
@@ -188,6 +189,6 @@ Update this file after **every** change to the tool, in the same commit:
 3. Refresh the fingerprint: `python tests/test_risk_doc.py --stamp`.
 
 `tests/test_risk_doc.py` fails when the fingerprint does not match
-`src/parity/`, when a constant quoted here (2⁻⁶⁰, 99%, the default sample
+`src/parity/`, when a constant quoted here (2⁻⁶⁰, 99.9%, the default sample
 size) differs from the code, or when the coverage numbers here differ from
 `docs/coverage.md`.

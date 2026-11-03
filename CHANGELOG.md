@@ -73,7 +73,7 @@ with the caveat that 0.x means the CLI surface may still move.
 
 - **Every run states its own residual risk** (README "Risk figures"): the
   checksum-collision bound (2^-60 per differing range) and, from the sample
-  check, the most rows that could hide a difference at 99% confidence - the
+  check, the most rows that could hide a difference at 99.9% confidence - the
   exact binomial bound, 0 when every row was compared. In the report and in
   JSON `risk`.
 - **Coverage map** (`docs/coverage.md`, `tests/conformance/`): about 500 hard
@@ -93,7 +93,7 @@ with the caveat that 0.x means the CLI surface may still move.
   - The sample check read DuckDB's infinite, BC and nanosecond values wrongly
     (COV-3..5).
 
-- **The tool now checks itself.** After the checksum walk, about 1,000 rows
+- **The tool now checks itself.** After the checksum walk, about 10,000 rows
   (every row of a smaller table) are fetched again from both sides as the
   drivers return them and compared in Python by the documented rules
   (`parity.reference`), with none of the per-engine SQL the checksums depend

@@ -45,7 +45,7 @@ def test_identical_tables_pass_the_check_and_say_so():
     """No false failure: identical data, every sampled row agrees."""
     a = FakeDialect(SyntheticTable(5_000, columns=COLS), side="A")
     b = FakeDialect(SyntheticTable(5_000, columns=COLS), side="B")
-    result = diff(a, b, "t", "t", "id")
+    result = diff(a, b, "t", "t", "id", verify_sample=1_000)  # a partial sample
     v = result.verification
     assert result.identical
     assert v is not None and not v.failures and not v.error
@@ -255,8 +255,12 @@ def test_the_hidden_row_bound_is_the_exact_binomial_bound():
     from parity.types import Verification
 
     v = Verification(10, 3, 1_000, 1_000)
-    p = v.max_hidden_fraction()
+    p = v.max_hidden_fraction(0.99)
     assert p == pytest.approx(0.004594582, rel=1e-6)
+    # The default confidence, 99.9%: (1 - p)^n is then exactly 0.1%.
+    p999 = v.max_hidden_fraction()
+    assert p999 == pytest.approx(0.006884, rel=1e-3)
+    assert (1 - p999) ** 1_000 == pytest.approx(0.001, rel=1e-9)
     assert (1 - p) ** 1_000 == pytest.approx(0.01, rel=1e-9)
     assert v.max_hidden_fraction(0.95) == pytest.approx(
         0.002991, rel=1e-3
@@ -284,9 +288,9 @@ def test_every_run_reports_its_risk_figures():
     result = diff(a, b, "t", "t", "id")
     r = risk_figures(result)
     assert r["checksum_collision_bound"] == 2.0**-60
-    assert r["confidence"] == 0.99
+    assert r["confidence"] == 0.999
     assert 0 < r["max_hidden_fraction"] < 0.01
     assert r["max_hidden_rows"] < 200 and r["rows"] == 20_000
     out = io.StringIO()
     render_human(result, out)
-    assert "risk: with 99% confidence fewer than" in out.getvalue()
+    assert "risk: with 99.9% confidence fewer than" in out.getvalue()

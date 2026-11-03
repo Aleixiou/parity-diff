@@ -49,7 +49,7 @@ whether the table has ten thousand rows or ten million.
 Then it **checks itself**. The checksums are only as right as the SQL that
 renders each value to text inside each engine, and a mistake there can make
 two different values look alike on both sides — the way every false match
-this tool has ever had worked. So after the walk, about 1,000 rows (all of
+this tool has ever had worked. So after the walk, about 10,000 rows (all of
 them, for a table that small) are fetched again from both sides as the
 database drivers return them, and compared in plain Python by the documented
 rules, without any of that SQL. If the two methods disagree about a single
@@ -190,7 +190,7 @@ reaches the server, and never commits — but **use a login that holds only
 itself refuse a write.
 
 `--verify-sample N` sets the size of the independent sample check (default
-1,000 rows; `0` skips it). The rows are chosen by a hash of the key, fresh at
+10,000 rows; `0` skips it). The rows are chosen by a hash of the key, fresh at
 every run, so both sides pick the same rows and the sample spreads over the
 whole table; the result records the choice (`modulus`, `residue`) so a run can
 be repeated. Types outside the check's rules (structs, nested lists and other
@@ -285,16 +285,16 @@ not estimated, under the assumptions stated with each:
 | Figure | What it bounds | Value | Assumption |
 |---|---|---|---|
 | Checksum collision | The chance that a key range holding a real difference still sums to the other side's checksum | at most 2⁻⁶⁰ ≈ 8.7 × 10⁻¹⁹ per differing range | the data was not crafted to collide (see the tamper note below) |
-| Hidden rows | With *n* sampled rows and no disagreement, the share of rows that could still carry a difference both the checksums and the sample missed | below 1 − 0.01^(1/n) at 99% confidence; **0** when every row was compared | rows enter the sample at random (fresh residue each run, keys spread evenly by MD5) |
+| Hidden rows | With *n* sampled rows and no disagreement, the share of rows that could still carry a difference both the checksums and the sample missed | below 1 − 0.001^(1/n) at 99.9% confidence; **0** when every row was compared | rows enter the sample at random (fresh residue each run, keys spread evenly by MD5) |
 
-The hidden-row bound by sample size, at 99% confidence:
+The hidden-row bound by sample size, at 99.9% confidence:
 
 | `--verify-sample` | Share of rows that could hide an error | On 10M rows, at most |
 |---|---|---|
-| 1,000 (default) | 0.46% | 46,000 |
-| 10,000 | 0.046% | 4,600 |
-| 100,000 | 0.0046% | 460 |
-| 1,000,000 | 0.00046% | 46 |
+| 1,000 | 0.69% | 68,840 |
+| 10,000 (default) | 0.069% | 6,905 |
+| 100,000 | 0.0069% | 691 |
+| 1,000,000 | 0.00069% | 69 |
 | ≥ table size | 0 (every row compared twice) | 0 |
 
 A larger sample costs one more pass over the key and the download of the

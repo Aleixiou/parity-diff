@@ -45,15 +45,18 @@ def test_the_risk_file_was_reviewed_for_the_current_source():
 
 
 def test_the_constants_it_quotes_are_the_codes():
-    """2^-60, 99% and the default sample size, as the code has them."""
+    """2^-60, 99.9% and the default sample size, as the code has them."""
     from parity.engine import DEFAULT_VERIFY_SAMPLE
     from parity.types import CHECKSUM_COLLISION_BOUND, RISK_CONFIDENCE
 
     text = RISK.read_text(encoding="utf-8")
     assert CHECKSUM_COLLISION_BOUND == 2.0**-60
     assert "2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹" in text  # noqa: RUF001 - the file prints a real multiplication sign
-    assert RISK_CONFIDENCE == 0.99 and "99% confidence" in text
+    assert RISK_CONFIDENCE == 0.999 and "99.9% confidence" in text
     assert f"default n = {DEFAULT_VERIFY_SAMPLE:,}" in text
+    # The headline share is the bound the code computes at the default size.
+    bound = 1 - (1 - RISK_CONFIDENCE) ** (1 / DEFAULT_VERIFY_SAMPLE)
+    assert f"**{bound:.3%}** at the default n" in text, f"{bound:.3%}"
 
 
 def test_its_coverage_figures_are_the_coverage_maps():
