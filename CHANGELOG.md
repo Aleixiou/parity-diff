@@ -94,6 +94,10 @@ with the caveat that 0.x means the CLI surface may still move.
   column, not two.
 - Errors from the walk are a `ValueError` naming the side and the table, with
   the driver's exception as `__cause__`. Dialects are context managers.
+- **Library users:** a PostgreSQL dialect's session pins `search_path` to
+  `pg_catalog`, so raw SQL passed to `dialect.query()` must schema-qualify its
+  tables (`dialect.qualify("orders")` gives `"public"."orders"`). The tool's
+  own queries always did.
 - Checksums change for: text containing `\` or chr(31); DECIMAL- and
   sub-microsecond-timestamp-keyed tables; MySQL binary-family, `bit` and
   spatial columns; infinite and BC dates on PostgreSQL; DuckDB `TIMESTAMP_NS`

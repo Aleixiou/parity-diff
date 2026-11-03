@@ -62,10 +62,13 @@ def main(argv: list[str] | None = None) -> int:
     a = get_dialect(args.pg, side="A")
     b = get_dialect(f"duckdb:///{args.duckdb}", side="B")
     try:
-        rows = a.query(f"select count(*) from {TABLE}")[0][0]
+        # Qualified: the PostgreSQL session pins search_path to pg_catalog (so
+        # no user function can shadow a built-in), and a bare `orders` no
+        # longer resolves to public.orders. `qualify` names the schema.
+        rows = a.query(f"select count(*) from {a.qualify(TABLE)}")[0][0]
         print(
             f"postgres {TABLE}: {rows:,} rows   duckdb {TABLE}: "
-            f"{b.query(f'select count(*) from {TABLE}')[0][0]:,} rows"
+            f"{b.query(f'select count(*) from {b.qualify(TABLE)}')[0][0]:,} rows"
         )
         print()
 
