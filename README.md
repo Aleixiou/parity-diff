@@ -193,7 +193,7 @@ itself refuse a write.
 1,000 rows; `0` skips it). The rows are chosen by a hash of the key, fresh at
 every run, so both sides pick the same rows and the sample spreads over the
 whole table; the result records the choice (`modulus`, `residue`) so a run can
-be repeated. Types outside the check's rules (JSON, binary, arrays and other
+be repeated. Types outside the check's rules (structs, nested lists and other
 types the tool compares as plain text) are listed as not covered rather than
 passed.
 
@@ -385,13 +385,33 @@ stated plainly rather than buried.
   Long rows are fine too: SQL Server's `CONCAT_WS` silently cuts its result at
   4,000 characters unless an argument is `nvarchar(max)`, so every value is
   joined as one — tested with a difference planted at character 9,500.
-- **Supported types:** integer, decimal, float, boolean, string, date,
-  timestamp. Anything else is compared as raw text and reported as a warning —
-  two engines may render the same JSON or array differently for reasons that
-  have nothing to do with the data. A few such types are rendered exactly
-  rather than lossily: MySQL binary columns as `\x` + hex (PostgreSQL's
-  `bytea` form) and `bit(n)` as its bits; SQL Server `sql_variant`, DuckDB
-  `UNION`/`VARIANT` and Snowflake `VARIANT` with their type tag, so `1` and
+- **Supported types:** integer (DuckDB `UHUGEINT` included), decimal, float,
+  boolean, string (PostgreSQL `name` and enums included), date, timestamp,
+  time, binary (`\x` + hex), JSON (the engine's normalised document), and:
+  - **bit strings** (PostgreSQL bit/varbit, DuckDB BIT, MySQL BIT(n)) as their
+    digits at full width — never a boolean;
+  - **intervals** (PostgreSQL, DuckDB) as their stored months, days and
+    microseconds: `1 day` and `24 hours` are *different* values here, though
+    both engines' `=` calls them equal — they print differently and add
+    differently across a DST change;
+  - **time with time zone** (PostgreSQL timetz, DuckDB TIMETZ) as local time
+    and offset: `12:00+05:45` and `06:15+00` differ;
+  - **arrays and lists** (PostgreSQL arrays, DuckDB lists) of integers,
+    decimals, floats, booleans, text, dates, timestamps, times, binary, bit
+    strings, intervals, timetz or inet, element by element by each element's
+    rule (`[]`, `['']`, `[NULL]` and `['a,b']` against `['a','b']` all
+    differ). A PostgreSQL array's dimensions and lower bounds are part of its
+    value (a 2x2 array is not its four elements). A list cannot be a key;
+  - **inet/cidr** (PostgreSQL) as `address/prefix`: `10.0.0.1/32` is not
+    `10.0.0.1/8`;
+  - **SQL Server sql_variant** as base type and exact value, so `int 1`,
+    `bigint 1` and `N'1'` differ (floats as their IEEE bits).
+
+  Anything else — BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs,
+  ranges, geometry, XML — is compared as raw text, reported as a warning and
+  listed as not covered by the sample check: two engines may render it
+  differently for reasons that have nothing to do with the data. DuckDB
+  `UNION`/`VARIANT` and Snowflake `VARIANT` keep their type tag, so `1` and
   `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds when it has any.
 - **A row wider than MySQL's `max_allowed_packet`** (64 MiB by default) is
   hashed column by column instead of as one string, so it can never drop out

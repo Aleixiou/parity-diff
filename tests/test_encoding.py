@@ -769,7 +769,9 @@ def test_normalize_is_null_safe_for_every_logical_type():
 
     for dialect in (DuckDBDialect(), PostgresDialect()):
         for lt in LogicalType:
-            expr = dialect.normalize(Column("c", lt, ""))
+            # A LIST's raw type names its element, whose rule it renders by.
+            raw = "integer[]" if lt is LogicalType.LIST else ""
+            expr = dialect.normalize(Column("c", lt, raw))
             assert expr.startswith("coalesce("), f"{dialect.name}/{lt}: {expr}"
             assert dialect.null_sentinel_sql() in expr, f"{dialect.name}/{lt}: {expr}"
 

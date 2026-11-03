@@ -38,7 +38,7 @@ from cov_known import REFUSED
 from cov_values import GROUPS, REFUSE, Val
 
 from parity.dialects.base import NULL_SENTINEL, Dialect
-from parity.reference import UNCHECKED, canonical_text, reference_token
+from parity.reference import UNCHECKED, canonical_text, column_token
 from parity.types import Column, LogicalType
 
 #: Where per-engine results go; `report.py` reads the same place.
@@ -230,14 +230,7 @@ def _column(cols: dict[str, Column], j: int) -> Column:
 def _expected(d: Dialect, col: Column, value: Any, scale: int) -> tuple[str | None, str]:
     """canonical_text(reference_token(value)) for this column, or (None, why)."""
     try:
-        token = reference_token(
-            col.logical_type,
-            value,
-            scale,
-            padded=d.padded_char(col),
-            single_precision=d.single_precision(col),
-            json_verbatim=d.json_verbatim(col),
-        )
+        token = column_token(d, col, value, scale)
     except Exception as exc:
         return None, f"reference raised {_short(exc)}"
     if token is UNCHECKED:

@@ -17,7 +17,10 @@ from parity.dialects.base import (
     FLOAT_MAX_MAGNITUDE_SQL,
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
+    INTERVAL_INFINITY,
+    INTERVAL_NEG_INFINITY,
     Dialect,
+    ShapedList,
     float_range_where,
     map_type,
     sql_literal,
@@ -328,7 +331,9 @@ class PostgresDialect(Dialect):
         introspection runs exactly the SQL it always did.
         """
         try:
-            cols = self._with_enums(table, super().columns(table))
+            cols = self._with_arrays(
+                table, self._with_enums(table, super().columns(table))
+            )
             self._note_row_security(table)
             return cols
         except ValueError as exc:
@@ -339,7 +344,7 @@ class PostgresDialect(Dialect):
             found = self._matview_columns(table, schema, name)
             if found is None:
                 raise
-            return found
+            return self._with_arrays(table, found)
 
     def _note_row_security(self, table: str) -> None:
         """Remember a table whose rows a row-level security policy filters.
@@ -401,6 +406,41 @@ class PostgresDialect(Dialect):
             else c
             for c in columns
         ]
+
+    def _with_arrays(self, table: str, columns: list[Column]) -> list[Column]:
+        """Give every array column its element type: `integer[]`, not `ARRAY`.
+
+        information_schema reports every array as `ARRAY`, so the element - and
+        with it the LIST rule each element is rendered by - comes from the
+        catalog: `format_type` of the element type with the column's typmod
+        (`character varying(10)[]`), through a domain to its base array. With
+        search_path pinned to pg_catalog, a user-defined element type prints
+        schema-qualified and maps to UNKNOWN, so its array stays unmapped and
+        is compared as before. One catalog query, only when an array exists.
+        """
+        if not any(c.raw_type == "ARRAY" for c in columns):
+            return columns
+        schema, name = self.split_table(table, self.default_schema)
+        rows = self.query(
+            "select a.attname, pg_catalog.format_type(e.oid, case when t.typtype = 'd' "
+            "then t.typtypmod else a.atttypmod end) "
+            "from pg_catalog.pg_attribute a "
+            "join pg_catalog.pg_class c on c.oid = a.attrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "join pg_catalog.pg_type t on t.oid = a.atttypid "
+            "left join pg_catalog.pg_type bt on t.typtype = 'd' and bt.oid = t.typbasetype "
+            "join pg_catalog.pg_type e on e.oid = coalesce(bt.typelem, t.typelem) "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)} "
+            "and a.attnum > 0 and not a.attisdropped and e.oid <> 0"
+        )
+        elements = {str(r[0]): str(r[1]) for r in rows}
+        out = []
+        for c in columns:
+            if c.raw_type == "ARRAY" and c.name in elements:
+                raw = elements[c.name] + "[]"
+                c = Column(c.name, map_type(raw), raw, c.tz_aware)
+            out.append(c)
+        return out
 
     def _matview_columns(self, table: str, schema: str, name: str) -> list[Column] | None:
         """The columns of materialized view `schema.name`, or None if it is not one."""
@@ -558,6 +598,22 @@ class PostgresDialect(Dialect):
             # for byte what the old `::text` fallback produced (escaped, with
             # bytea_output pinned to hex), so no bytea checksum moves.
             expr = self.concat_sql(self.binary_prefix_sql(), f"encode({c}, 'hex')")
+        elif t is LogicalType.BITS:
+            # bit(n) and varbit print their digits at full width, from 0 and
+            # 1 only - the bytes the escaped `::text` fallback produced.
+            expr = f"({c})::text"
+        elif t is LogicalType.INET:
+            # `::text` is `text(inet)`, which always prints the prefix
+            # (`10.0.0.1/32`; the output function drops a full one), with
+            # IPv6 compressed by BIND's rules - `canonical_inet_text`. The
+            # fallback's bytes exactly, so no checksum moves.
+            expr = f"({c})::text"
+        elif t is LogicalType.INTERVAL:
+            expr = self._interval_text(c)
+        elif t is LogicalType.TIMETZ:
+            expr = self._timetz_text(c)
+        elif t is LogicalType.LIST:
+            expr = self._list_text(column, c)
         elif t is LogicalType.JSON:
             # jsonb is PostgreSQL's normal form - insignificant whitespace
             # gone, keys ordered by length then bytes, the last duplicate kept
@@ -569,10 +625,91 @@ class PostgresDialect(Dialect):
             # store, makes the cast raise - loudly, naming side and table.
             expr = self.escape_text(f"({c})::jsonb::text")
         else:
-            # STRING, and every unmapped type (arrays, intervals, ...)
+            # STRING, and every unmapped type (xml, ranges, composites, ...)
             # through its text output: arbitrary text, so escaped.
             expr = self.escape_text(f"({c})::text")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    @staticmethod
+    def _interval_text(c: str) -> str:
+        """An interval's months, days and microseconds - `canonical_interval_text`.
+
+        PostgreSQL stores exactly those three and `extract` returns each
+        exactly: year and month split the months (truncating, so both carry
+        its sign), and hour, minute and microseconds split the time part the
+        same way, so their weighted sum is it. `::numeric` before the
+        arithmetic, because before 14 `extract` returns double precision -
+        each part is a small exact integer there, but 2562047788 hours in
+        microseconds is not. The `::text` fallback printed `1 day` and
+        `24:00:00`; that text depends on IntervalStyle, this does not.
+        PostgreSQL 17's infinite intervals render as the date infinities.
+        """
+
+        def part(field: str) -> str:
+            """One extracted field, exact."""
+            return f"extract({field} from {c})::numeric"
+
+        months = f"({part('year')} * 12 + {part('month')})::bigint::text"
+        days = f"({part('day')})::bigint::text"
+        micros = (
+            f"({part('hour')} * 3600000000 + {part('minute')} * 60000000 "
+            f"+ {part('microseconds')})::bigint::text"
+        )
+        return (
+            f"case when not isfinite({c}) then case when {c} > interval '0' "
+            f"then '{INTERVAL_INFINITY}' else '{INTERVAL_NEG_INFINITY}' end "
+            f"else {months} || ' mon ' || {days} || ' day ' || {micros} || ' us' end"
+        )
+
+    @staticmethod
+    def _timetz_text(c: str) -> str:
+        """Local time and offset - `canonical_timetz_text`.
+
+        `::time` keeps the local clock (`24:00:00` included) and renders as
+        the TIME rule does; `extract(timezone)` is the offset in seconds east
+        of UTC, which PostgreSQL holds to the second. The fallback's text
+        (`12:00:00+05:45`) dropped the fraction's trailing zeros and the
+        offset's zero minutes.
+        """
+        off = f"extract(timezone from {c})::integer"
+        mag = f"abs({off})"
+        return (
+            f"to_char(({c})::time, 'HH24:MI:SS.US') "
+            f"|| case when {off} < 0 then '-' else '+' end "
+            f"|| lpad(({mag} / 3600)::text, 2, '0') || ':' "
+            f"|| lpad(({mag} % 3600 / 60)::text, 2, '0') "
+            f"|| case when {mag} % 60 <> 0 then ':' || lpad(({mag} % 60)::text, 2, '0') "
+            "else '' end"
+        )
+
+    def _list_text(self, column: Column, c: str) -> str:
+        """An array as `canonical_list_text`: each element by its own rule.
+
+        `unnest ... with ordinality` walks the elements in storage order, each
+        is rendered by its element type's `normalize` (the alias stands in for
+        the column) and followed by the terminator, and `string_agg` joins
+        them; an empty array aggregates to NULL, which is `[]`. An array with
+        more than one dimension, or whose lower bound is not 1, holds its
+        shape as part of its value - `'{{1,2},{3,4}}'` is not `'{1,2,3,4}'`,
+        nor `'[0:1]={1,2}'` `'{1,2}'` - and `unnest` flattens it, so its
+        `array_dims` come first, between `LIST_DIMS_MARK`s. The fallback
+        printed `{a,b}` and `{"a,b"}`, whose quoting no other engine shares.
+        """
+        element = self.list_element_text(column)
+        ordinal = self.quote("__parity_ordinal")
+        agg = (
+            f"coalesce((select string_agg("
+            f"{self.concat_sql(element, self.list_terminator_sql())}, '' order by {ordinal}) "
+            f"from unnest({c}) with ordinality "
+            f"as {self.quote('__parity_list')}({self.quote(self.LIST_ELEMENT_NAME)}, {ordinal})), '')"
+        )
+        mark = self.list_dims_mark_sql()
+        return (
+            f"case when {c} is null then null "
+            f"when array_ndims({c}) > 1 or array_lower({c}, 1) <> 1 "
+            f"then '[' || {mark} || array_dims({c}) || {mark} || {agg} || ']' "
+            f"else '[' || {agg} || ']' end"
+        )
 
     @staticmethod
     def _datetime_text(c: str, after_year: str) -> str:
@@ -630,10 +767,43 @@ class PostgresDialect(Dialect):
             # float 1.5; jsonb's own text keeps every number as stored, and
             # the reference lays it out and escapes it itself.
             return f"({c})::jsonb::text"
+        if column.logical_type in (LogicalType.INTERVAL, LogicalType.TIMETZ):
+            # psycopg folds a month into 30 days (`1 mon` and `30 days` both
+            # load as timedelta(30)) and cannot load a timetz of 24:00:00;
+            # the text, under the pinned IntervalStyle, carries both whole.
+            return f"({c})::text"
+        if column.logical_type is LogicalType.LIST:
+            # As the array's text, which `sample_value` parses: psycopg loads
+            # a multi-dimensional array as nested lists and drops its lower
+            # bounds (`'[0:1]={1,2}'` arrives as [1, 2]), and fails on the
+            # same element values its scalar loaders fail on (infinity, BC,
+            # 24:00:00, a month). money elements go through numeric, whose
+            # text is not locale-formatted.
+            if self.list_element(column).raw_type.lower() == "money":
+                return f"({c})::numeric[]::text"
+            return f"({c})::text"
         if column.raw_type.lower() == "money":
             # psycopg returns money as its locale text (`$1,234.56`).
             return f"({c})::numeric"
         return super().sample_select(column)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """An array's text (`sample_select`) as its elements, for the
+        reference: a list, or a `ShapedList` when it has more than one
+        dimension or a lower bound other than 1. Elements stay text - the
+        reference reads every element type's text - except booleans (`t`,
+        `f`) and bytea (`\\x00ff`), whose text form the reference does not
+        guess at."""
+        if column.logical_type is not LogicalType.LIST or not isinstance(value, str):
+            return value
+        dims, texts = parse_pg_array(value)
+        kind = self.list_element(column).logical_type
+        items: list[Any] = list(texts)
+        if kind is LogicalType.BOOLEAN:
+            items = [None if x is None else x == "t" for x in texts]
+        elif kind is LogicalType.BINARY:
+            items = [None if x is None else bytes.fromhex(x[2:]) for x in texts]
+        return items if dims is None else ShapedList(dims, tuple(items))
 
     def json_semantics(self, column: Column) -> str:
         """jsonb's normal form, which a json column is cast to."""
@@ -696,3 +866,58 @@ class PostgresDialect(Dialect):
         """Sum row hashes without overflowing, and return 0 for an empty group."""
         # numeric is arbitrary precision: cannot overflow no matter the row count.
         return f"coalesce(sum(({expr})::numeric), 0)"
+
+
+def parse_pg_array(text: str) -> tuple[str | None, list[str | None]]:
+    """(dimensions, elements) of a PostgreSQL array's text output.
+
+    `{a,"b c",NULL,"NULL"}` is four elements, the third SQL NULL; a quoted
+    element undoes `\\` and `\"`. Nested braces are dimensions, read in
+    storage order; a `[l:u]...=` prefix (printed only when a lower bound is
+    not 1) is the dimensions as `array_dims` spells them. Returns None for
+    the dimensions of a one-dimensional array from 1 - the plain list - and
+    computes them from the nesting for a multi-dimensional one whose bounds
+    PostgreSQL left out.
+    """
+    dims: str | None = None
+    if text.startswith("["):
+        dims, text = text.split("=", 1)
+    items: list[str | None] = []
+    lengths: dict[int, int] = {}
+    i = 0
+
+    def group(depth: int) -> None:
+        """One `{...}`, from `text[i]`; elements appended to `items`."""
+        nonlocal i
+        i += 1  # the opening brace
+        count = 0
+        while text[i] != "}":
+            if text[i] == "{":
+                group(depth + 1)
+            elif text[i] == '"':
+                i += 1
+                out = []
+                while text[i] != '"':
+                    if text[i] == "\\":
+                        i += 1
+                    out.append(text[i])
+                    i += 1
+                i += 1
+                items.append("".join(out))
+            else:
+                end = i
+                while text[end] not in ",}":
+                    end += 1
+                raw = text[i:end]
+                items.append(None if raw.upper() == "NULL" else raw)
+                i = end
+            count += 1
+            if text[i] == ",":
+                i += 1
+        i += 1  # the closing brace
+        lengths[depth] = count
+
+    group(0)
+    if dims is None and len(lengths) > 1 and items:
+        dims = "".join(f"[1:{lengths[d]}]" for d in sorted(lengths))
+    return dims, items

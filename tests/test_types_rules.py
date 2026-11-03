@@ -144,7 +144,7 @@ def test_reference_reads_every_driver_form():
     [
         (map_type, "time without time zone", LogicalType.TIME),
         (map_type, "TIME", LogicalType.TIME),
-        (map_type, "time with time zone", LogicalType.UNKNOWN),
+        (map_type, "time with time zone", LogicalType.TIMETZ),  # its own rule
         (map_type, "TIME_NS", LogicalType.UNKNOWN),
         (map_type, "bytea", LogicalType.BINARY),
         (map_type, "BLOB", LogicalType.BINARY),
@@ -153,7 +153,7 @@ def test_reference_reads_every_driver_form():
         (map_type, "JSON", LogicalType.JSON),
         (map_type, "money", LogicalType.DECIMAL),
         (map_type, "ENUM('a', 'b')", LogicalType.STRING),
-        (map_type, "bit", LogicalType.UNKNOWN),  # a bit *string* here
+        (map_type, "bit", LogicalType.BITS),  # a bit *string* here
         (map_type_mysql, "time", LogicalType.TIME),
         (map_type_mysql, "varbinary", LogicalType.BINARY),
         (map_type_mysql, "longblob", LogicalType.BINARY),

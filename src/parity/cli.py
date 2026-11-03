@@ -270,6 +270,10 @@ _BARE_TYPES = frozenset(
         LogicalType.TIMESTAMP,
         LogicalType.TIME,
         LogicalType.BINARY,  # `\x` + hex, printed as PostgreSQL prints bytea
+        LogicalType.INTERVAL,  # `0 mon 1 day 0 us`
+        LogicalType.TIMETZ,
+        LogicalType.INET,
+        # Not BITS: an empty bit string would print as nothing at all.
     }
 )
 

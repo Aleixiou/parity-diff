@@ -60,6 +60,23 @@ def _version_tuple(version: str) -> tuple[int, ...]:
     return tuple(out)
 
 
+#: Types the sample check reads as DuckDB's own text (see `sample_select`):
+#: the driver is lossy on their edges - infinities, BC, nanoseconds,
+#: `24:00:00`, a month folded into 30 days.
+_TEXT_SAMPLED = frozenset(
+    {
+        LogicalType.DATE,
+        LogicalType.TIMESTAMP,
+        LogicalType.TIME,  # `24:00:00` has no datetime.time either
+        LogicalType.JSON,
+        LogicalType.INTERVAL,  # the driver turns `1 month` into 30 days
+        # Not TIMETZ: its varchar cast drops an offset's minutes when it has
+        # seconds (+05:00:30 prints +05:30, COV-7), and the driver's
+        # datetime.time carries the offset whole (24:00:00 arrives as text).
+    }
+)
+
+
 class DuckDBDialect(Dialect):
     name = "duckdb"
     default_schema = "main"
@@ -268,6 +285,61 @@ class DuckDBDialect(Dialect):
                 f"{two('hour')} || ':' || {two('minute')} || ':' || {two('second')} "
                 f"|| '.' || lpad(cast(microsecond({c}) % 1000000 as varchar), 6, '0')"
             )
+        elif t is LogicalType.TIMETZ:
+            # Local clock fields (hour() of `24:00:00` is 24, as for TIME)
+            # and the offset in seconds east of UTC, held to the second -
+            # `canonical_timetz_text`. The varchar cast printed `12:00:00+05:45`
+            # with the fraction's trailing zeros dropped.
+            def pad(value: str, width: int = 2) -> str:
+                """An integer expression, zero-padded."""
+                return f"lpad(cast({value} as varchar), {width}, '0')"
+
+            def field(name: str) -> str:
+                """One clock field of the local time."""
+                return f"datepart('{name}', {c})"
+
+            off = field("timezone")
+            mag = f"abs({off})"
+            expr = (
+                f"{pad(field('hour'))} || ':' || {pad(field('minute'))} || ':' "
+                f"|| {pad(field('second'))} || '.' "
+                f"|| {pad(field('microsecond') + ' % 1000000', 6)} "
+                f"|| case when {off} < 0 then '-' else '+' end "
+                f"|| {pad(mag + ' // 3600')} || ':' || {pad(mag + ' % 3600 // 60')} "
+                f"|| case when {mag} % 60 <> 0 then ':' || {pad(mag + ' % 60')} "
+                "else '' end"
+            )
+        elif t is LogicalType.INTERVAL:
+            # The three stored components - `canonical_interval_text`. year
+            # and month split the months, hour, minute and microseconds the
+            # micros, each truncating so all carry the stored sign; the sum
+            # is in HUGEINT because 2562047788 hours of microseconds is not
+            # far from INT64's edge. The varchar cast printed `1 day` and
+            # `24:00:00` - distinct, but in a layout no other engine shares.
+            def iv(field: str) -> str:
+                """One field, widened."""
+                return f"cast(datepart('{field}', {c}) as hugeint)"
+
+            expr = (
+                f"cast({iv('year')} * 12 + {iv('month')} as varchar) || ' mon ' "
+                f"|| cast({iv('day')} as varchar) || ' day ' "
+                f"|| cast({iv('hour')} * 3600000000 + {iv('minute')} * 60000000 "
+                f"+ {iv('microseconds')} as varchar) || ' us'"
+            )
+        elif t is LogicalType.BITS:
+            # BIT prints its digits, 0 and 1 only - the bytes the escaped
+            # fallback produced, so no checksum moves.
+            expr = f"cast({c} as varchar)"
+        elif t is LogicalType.LIST:
+            # `canonical_list_text`: each element by its own rule, bound to
+            # the comprehension variable (which shadows a column of that
+            # name), followed by the terminator, joined. An empty list joins
+            # to '', so `[]`. The varchar cast printed `[a, b]` - the same
+            # text as the one string 'a, b' in a list, a false match.
+            element = self.list_element_text(column)
+            var = self.quote(self.LIST_ELEMENT_NAME)
+            each = f"[{element} || {self.list_terminator_sql()} for {var} in {c}]"
+            expr = f"case when {c} is not null then '[' || array_to_string({each}, '') || ']' end"
         elif t is LogicalType.BINARY:
             # The varchar cast prints printable bytes as themselves and the
             # rest as `\xFF`, so b'abc' rendered exactly like the text 'abc'.
@@ -303,9 +375,8 @@ class DuckDBDialect(Dialect):
                 f"variant_typeof({c}) || ':' || cast(cast({c} as json) as varchar) end"
             )
         else:
-            # STRING, and every unmapped type (lists, structs, json, blobs,
-            # intervals, ...) through its varchar cast: arbitrary text, so
-            # escaped.
+            # STRING, and every unmapped type (structs, maps, nested lists,
+            # ...) through its varchar cast: arbitrary text, so escaped.
             expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
 
@@ -347,14 +418,21 @@ class DuckDBDialect(Dialect):
         whole - `infinity`, `0044-03-15 (BC)`, nine digits, `+00` under the
         pinned UTC - and `parity.reference` reads all of it.
         """
-        if column.logical_type in (
-            LogicalType.DATE,
-            LogicalType.TIMESTAMP,
-            LogicalType.TIME,  # `24:00:00` has no datetime.time either
-            LogicalType.JSON,
-        ):
+        if column.logical_type in _TEXT_SAMPLED:
             return f"cast({self.quote(column.name)} as varchar)"
+        if (
+            column.logical_type is LogicalType.LIST
+            and self.list_element(column).logical_type in _TEXT_SAMPLED
+        ):
+            # Each element as the scalar sample would read it.
+            return f"cast({self.quote(column.name)} as varchar[])"
         return super().sample_select(column)
+
+    def bisects_natively(self, column: Column) -> bool:
+        """UHUGEINT holds 2^128 - 1, past the HUGEINT that `wide_int` widens
+        into, and DuckDB turns UHUGEINT arithmetic with a signed operand into
+        DOUBLE silently; such a key is hashed instead."""
+        return column.raw_type.upper() != "UHUGEINT"
 
     def json_verbatim(self, column: Column) -> bool:
         """DuckDB's JSON is validated text, never normalised."""

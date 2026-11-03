@@ -22,6 +22,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, TypeVar
 
@@ -266,6 +267,279 @@ def _json_serialise(value: Any) -> str:
         pairs = (f"{json_string_literal(k)}: {_json_serialise(v)}" for k, v in value)
         return "{" + ", ".join(pairs) + "}"
     return "[" + ", ".join(_json_serialise(v) for v in value) + "]"
+
+
+# ------------------------- BITS, INTERVAL, TIMETZ, LIST, INET and VARIANT
+#
+# The second batch of types that used to fall to UNKNOWN. Same contract as
+# above: each function is the executable spec its dialects' SQL and
+# `parity.reference` are held to (tests/test_types_rules2.py, tests/conformance).
+# Every one renders from a fixed alphabet or escaped text, so none holds
+# chr(31), and none can equal the NULL sentinel.
+
+
+def canonical_bits_text(digits: str) -> str:
+    """A bit string's canonical text: its digits, every one, at full width.
+
+    `bit(8)` b'101' is `00000101`, never `101` and never `5`: the width is
+    part of the value (PostgreSQL `B'101' = B'0101'` is false), and the
+    digits are exactly what PostgreSQL bit/varbit, DuckDB BIT and MySQL BIT(n)
+    rendered before the type had a rule, so their checksums do not move. A
+    varbit may be empty, which renders as the empty text - still distinct
+    from NULL. Raises ValueError on anything but 0 and 1.
+    """
+    if digits.strip("01"):
+        raise ValueError(f"not a bit string: {digits!r}")
+    return digits
+
+
+#: An infinite interval (PostgreSQL 17+), as its date/timestamp infinities.
+INTERVAL_INFINITY = "infinity"
+INTERVAL_NEG_INFINITY = "-infinity"
+
+
+def canonical_interval_text(months: int, days: int, micros: int) -> str:
+    """An interval's canonical text: its three stored components, exactly.
+
+    `<months> mon <days> day <microseconds> us`, each a signed integer. That
+    is how PostgreSQL and DuckDB *store* an interval - months, days and
+    microseconds, never normalised into one another - so `1 day`, `24:00:00`
+    and `1 mon` against `30 days` render differently. Both engines' `=` calls
+    `1 day` equal to `24 hours`, but they are different values: added to a
+    timestamp across a DST change they give different instants, and they
+    print differently. So two engines that agree on the components agree on
+    the text, and two different stored intervals never share one (the rule
+    is stricter than `=`, never looser: a false alarm at worst).
+    """
+    return f"{months} mon {days} day {micros} us"
+
+
+def canonical_timetz_text(micros: int, offset_seconds: int) -> str:
+    """A time-with-time-zone value's canonical text: local time, then offset.
+
+    The local time as `canonical_time_text` (`24:00:00` included) and the
+    offset east of UTC as `+HH:MM`, with `:SS` only when it has seconds
+    (PostgreSQL and DuckDB accept offsets to the second). The offset is part
+    of the value: `12:00+05:45` and `06:15+00` are the same instant of
+    different days' clocks, and PostgreSQL's own `=` calls them different.
+    """
+    sign = "-" if offset_seconds < 0 else "+"
+    hours, rest = divmod(abs(offset_seconds), 3600)
+    minutes, seconds = divmod(rest, 60)
+    offset = f"{sign}{hours:02d}:{minutes:02d}"
+    if seconds:
+        offset += f":{seconds:02d}"
+    return canonical_time_text(micros) + offset
+
+
+#: What follows every element of a list: a backslash and a comma. No element
+#: text can contain it - an escaped text's backslashes are always followed by
+#: `\` or `s`, the sentinel is `\N`, and every other rule's alphabet has no
+#: backslash - so a list's text splits into its elements one way only.
+LIST_TERMINATOR = "\\,"
+
+#: Element types a list can hold and still have a rule. JSON is left out (its
+#: sample path reads text a list cannot carry), nested lists and every
+#: UNKNOWN type too: such a list is UNKNOWN, as it always was.
+LIST_ELEMENT_TYPES = frozenset(
+    {
+        LogicalType.INTEGER,
+        LogicalType.DECIMAL,
+        LogicalType.FLOAT,
+        LogicalType.BOOLEAN,
+        LogicalType.STRING,
+        LogicalType.DATE,
+        LogicalType.TIMESTAMP,
+        LogicalType.TIME,
+        LogicalType.BINARY,
+        LogicalType.BITS,
+        LogicalType.INTERVAL,
+        LogicalType.TIMETZ,
+        LogicalType.INET,
+    }
+)
+
+
+#: Brackets the dimensions of a PostgreSQL array that is not one-dimensional
+#: from 1 (`canonical_list_text`). No element text can hold it, and a plain
+#: list's text cannot start `[\=`, so the two forms never meet.
+LIST_DIMS_MARK = "\\="
+
+
+@dataclass(frozen=True)
+class ShapedList:
+    """A PostgreSQL array that is not one-dimensional from 1, as the sample
+    check reads it: its dimensions as `array_dims` prints them
+    (`[1:2][1:2]`, `[0:1]`) and its elements in storage (row-major) order."""
+
+    dims: str
+    items: tuple[Any, ...]
+
+
+def canonical_list_text(elements: Sequence[str], dims: str | None = None) -> str:
+    r"""A list's canonical text, from its elements' canonical texts.
+
+    `[` + each element followed by `LIST_TERMINATOR` + `]`: `[]` is empty,
+    `[\,]` holds one empty string, `[\N\,]` one NULL, `[a,b\,]` one string
+    with a comma and `[a\,b\,]` two strings. Each element is rendered by its
+    own type's rule (a NULL as the sentinel, text escaped), so the text is
+    injective: it starts with `[`, so it never equals the sentinel, and no
+    element can forge a terminator. Element order is part of the value.
+
+    A PostgreSQL array with more than one dimension or a lower bound other
+    than 1 carries that shape in its value (`'[0:1]={1,2}'` is not `'{1,2}'`,
+    nor `'{{1,2}}'`), so its `dims` come first, between `LIST_DIMS_MARK`s:
+    `[\=[1:2][1:2]\=1\,2\,3\,4\,]`. No other engine holds such a value.
+    """
+    head = "[" if dims is None else "[" + LIST_DIMS_MARK + dims + LIST_DIMS_MARK
+    return head + "".join(e + LIST_TERMINATOR for e in elements) + "]"
+
+
+def canonical_inet_text(packed: bytes, prefix: int) -> str:
+    """A PostgreSQL inet/cidr value's canonical text: `address/prefix`.
+
+    PostgreSQL's own `::text` (not its output function, which drops a full
+    `/32`): every byte of the address, then the prefix length, so
+    `10.0.0.1/32` and `10.0.0.1/8` differ, as they do in PostgreSQL. IPv4 is
+    dotted; IPv6 is lower-case hex groups with the longest run of two or more
+    zero groups - the first, on a tie - written `::`, and the last 32 bits
+    dotted when the address is IPv4-compatible or IPv4-mapped (BIND's
+    `inet_net_ntop`, which PostgreSQL uses). An inet and a cidr holding the
+    same network render alike, as PostgreSQL's `=` holds them equal.
+    """
+    if len(packed) == 4:
+        return ".".join(str(b) for b in packed) + f"/{prefix}"
+    if len(packed) != 16:
+        raise ValueError(f"not an IPv4 or IPv6 address: {packed!r}")
+    words = [packed[i] << 8 | packed[i + 1] for i in range(0, 16, 2)]
+    best_base, best_len, cur_base, cur_len = -1, 0, -1, 0
+    for i, w in enumerate(words):
+        if w == 0:
+            if cur_base == -1:
+                cur_base, cur_len = i, 1
+            else:
+                cur_len += 1
+        elif cur_base != -1:
+            if best_base == -1 or cur_len > best_len:
+                best_base, best_len = cur_base, cur_len
+            cur_base = -1
+    if cur_base != -1 and (best_base == -1 or cur_len > best_len):
+        best_base, best_len = cur_base, cur_len
+    if best_base != -1 and best_len < 2:
+        best_base = -1
+    out = ""
+    for i, w in enumerate(words):
+        if best_base != -1 and best_base <= i < best_base + best_len:
+            if i == best_base:
+                out += ":"
+            continue
+        if i:
+            out += ":"
+        if (
+            i == 6
+            and best_base == 0
+            and (
+                best_len == 6
+                or (best_len == 7 and words[7] != 1)
+                or (best_len == 5 and words[5] == 0xFFFF)
+            )
+        ):
+            out += ".".join(str(b) for b in packed[12:])
+            break
+        out += f"{w:x}"
+    if best_base != -1 and best_base + best_len == 8:
+        out += ":"
+    return f"{out}/{prefix}"
+
+
+#: sql_variant base types whose value is an integer (or bit), a decimal at its
+#: own scale, or text, rendered by SQL Server's default conversion.
+_VARIANT_INTEGERS = frozenset({"tinyint", "smallint", "int", "bigint", "bit"})
+_VARIANT_TEXTS = frozenset({"char", "varchar", "nchar", "nvarchar"})
+
+
+def _ns_clock(ns: int, digits: int) -> str:
+    """`HH:MM:SS.fff...` from nanoseconds since midnight, `digits` places."""
+    seconds, frac = divmod(ns, 1_000_000_000)
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    text = f"{hours:02d}:{minute:02d}:{sec:02d}"
+    if digits:
+        text += "." + f"{frac:09d}"[:digits]
+    return text
+
+
+def canonical_variant_text(base: str, value: Any) -> str:
+    """A SQL Server sql_variant's canonical text: `<base type>:<exact value>`.
+
+    The base type leads, so int 1, bigint 1, N'1' and 1.5 as float against
+    decimal never meet; the value follows in an exact spelling of that base
+    type (escaped, since it can be text). `value` is the base type's value
+    as Python holds it:
+
+    - tinyint/smallint/int/bigint/bit: int - its digits;
+    - decimal/numeric: Decimal at its declared scale - `1.50` stays `1.50`;
+    - float/real: float - the IEEE bits in hex, `0x3FF8000000000000` (real:
+      eight digits), with -0.0 as 0.0. SQL Server prints no exact decimal
+      for a double: style 3 is not correctly rounded (1626983080611305.75
+      printed ...057, not ...058) and raised "Arithmetic overflow" for any
+      negative value past e-100 and for -0.0, so the bits are the value;
+    - money/smallmoney: Decimal - four places, `-1.5000`;
+    - date: datetime.date - `YYYY-MM-DD`;
+    - datetime, smalldatetime, datetime2: (date, nanoseconds since midnight) -
+      datetime as its displayed milliseconds (`.003`, `.007`), smalldatetime
+      to the second, datetime2 to seven places;
+    - datetimeoffset: (local date, local nanoseconds, offset minutes) -
+      seven places and ` +HH:MM`;
+    - time: nanoseconds since midnight - seven places;
+    - binary/varbinary: bytes - `0x` and upper-case hex;
+    - uniqueidentifier: uuid.UUID - lower case;
+    - char/varchar/nchar/nvarchar: str, exactly (a char keeps its padding).
+
+    Raises ValueError for any other base type.
+    """
+    import struct
+    import uuid
+
+    b = base.lower()
+    if b in _VARIANT_INTEGERS:
+        text = str(int(value))
+    elif b in ("decimal", "numeric"):
+        text = format(Decimal(value), "f")
+    elif b in ("float", "real"):
+        x = float(value)
+        if x == 0:
+            x = 0.0  # -0.0: equal to 0.0 in SQL Server, so one value
+        fmt = ">d" if b == "float" else ">f"
+        text = "0x" + struct.pack(fmt, x).hex().upper()
+    elif b in ("money", "smallmoney"):
+        text = format(Decimal(value).quantize(Decimal("0.0001")), "f")
+    elif b == "date":
+        d = value
+        text = f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+    elif b in ("datetime", "smalldatetime", "datetime2"):
+        d, ns = value
+        digits = {"datetime": 3, "smalldatetime": 0, "datetime2": 7}[b]
+        text = f"{d.year:04d}-{d.month:02d}-{d.day:02d} {_ns_clock(ns, digits)}"
+    elif b == "datetimeoffset":
+        d, ns, offset = value
+        sign = "-" if offset < 0 else "+"
+        hh, mm = divmod(abs(offset), 60)
+        text = (
+            f"{d.year:04d}-{d.month:02d}-{d.day:02d} {_ns_clock(ns, 7)} "
+            f"{sign}{hh:02d}:{mm:02d}"
+        )
+    elif b == "time":
+        text = _ns_clock(int(value), 7)
+    elif b in ("binary", "varbinary"):
+        text = "0x" + bytes(value).hex().upper()
+    elif b == "uniqueidentifier":
+        text = str(uuid.UUID(str(value))).lower()
+    elif b in _VARIANT_TEXTS:
+        text = str(value)
+    else:
+        raise ValueError(f"sql_variant base type {base!r} has no rule")
+    return f"{b}:{escape_canonical_text(text)}"
 
 
 # Number of MD5 hex characters folded into the row hash. 15 nibbles = 60 bits.
@@ -933,10 +1207,82 @@ class Dialect(ABC):
         )
 
     def check_key(self, table: str, key: KeySpec) -> None:
-        """Refuse a key that cannot be matched exactly, naming side and table."""
+        """Refuse a key that cannot be matched exactly, naming side and table.
+
+        A FLOAT key, and a LIST key: its elements render by the value rules,
+        which round DECIMAL and FLOAT elements to the float scale, so two
+        distinct list keys could merge into one row.
+        """
         for c in key.columns:
             if c.logical_type is LogicalType.FLOAT:
                 raise self._err(f"in {table}: {float_key_refusal(c)}")
+            if c.logical_type is LogicalType.LIST:
+                raise self._err(
+                    f"in {table}: list column {c.name!r} cannot be used as a key. "
+                    "Its elements are compared by the value rules, which round "
+                    "decimals and floats, so distinct keys could merge into one row"
+                )
+
+    def bisects_natively(self, column: Column) -> bool:
+        """Whether a single INTEGER key column can be bucketed as itself.
+
+        The bucket expression widens the key with `wide_int` before any
+        arithmetic. An integer type as wide as that widening cannot be: DuckDB
+        UHUGEINT holds 2^128 - 1, which no signed 128-bit type holds, and
+        mixing it with a signed operand silently turns DuckDB arithmetic into
+        DOUBLE. Such a key is hashed instead, as any non-integer key is - its
+        exact decimal text, hashed, then matched by that text. True by
+        default.
+        """
+        return True
+
+    # ------------------------------------------------------------- lists
+
+    #: The name an element is bound to while its own rule renders it: a list
+    #: comprehension variable on DuckDB, an `unnest` alias on PostgreSQL. It
+    #: shadows a column of the same name inside the element expression only.
+    LIST_ELEMENT_NAME = "__parity_element"
+
+    def list_element(self, column: Column) -> Column:
+        """The element of a LIST column, as a column its rule can render.
+
+        Its raw type is the list's without the trailing `[]` - `INTEGER[]` on
+        DuckDB, `integer[]` as the PostgreSQL dialect spells an array.
+        """
+        if not column.raw_type.endswith("[]"):
+            raise self._err(f"column {column.name!r} ({column.raw_type}) is not a list")
+        inner = column.raw_type[:-2]
+        return Column(self.LIST_ELEMENT_NAME, map_type(inner), inner)
+
+    def list_element_text(self, column: Column) -> str:
+        """The element's canonical text, by its own type's rule, null-safe.
+
+        Refuses an element whose engine holds more than the rule compares
+        (DuckDB TIMESTAMP_NS): a scalar column of it carries a caveat, and a
+        list's element could not, so the digits would vanish silently.
+        """
+        element = self.list_element(column)
+        if element.logical_type not in LIST_ELEMENT_TYPES:
+            raise self._err(f"list column {column.name!r} has no element rule")
+        if self.holds_sub_micro(element):
+            raise self._err(
+                f"list column {column.name!r} holds {element.raw_type} elements, "
+                "whose digits past the microsecond a list cannot compare; "
+                "leave it out with --exclude"
+            )
+        # A refusal inside the element's rule (a FLOAT past 2^116) names the
+        # column it renders; make that the list's, not the stand-in variable.
+        where = sql_literal(float_range_where(element))
+        named = sql_literal(f" in an element of column {column.name!r}")
+        return self.normalize(element).replace(where, named)
+
+    def list_terminator_sql(self) -> str:
+        r"""SQL for `LIST_TERMINATOR` (`\,`), the backslash from its code point."""
+        return self.concat_sql(self.backslash_sql(), "','")
+
+    def list_dims_mark_sql(self) -> str:
+        r"""SQL for `LIST_DIMS_MARK` (`\=`), the backslash from its code point."""
+        return self.concat_sql(self.backslash_sql(), "'='")
 
     # ------------------------------------------------------------- queries
 
@@ -1368,6 +1714,14 @@ def require_matching_scales(a: Dialect, b: Dialect) -> None:
 
 def map_type(raw: str) -> LogicalType:
     """Map an engine's type name onto a logical category."""
+    if raw.endswith("[]"):
+        # A list (DuckDB `INTEGER[]`) or array (PostgreSQL, whose dialect
+        # spells the element type the same way, `integer[]`). Checked before
+        # the `(` split, or `DECIMAL(10,2)[]` would read as a decimal. Ruled
+        # only when its element is (`LIST_ELEMENT_TYPES`); a nested list, a
+        # list of structs or of JSON stays UNKNOWN, compared as before.
+        element = map_type(raw[:-2])
+        return LogicalType.LIST if element in LIST_ELEMENT_TYPES else LogicalType.UNKNOWN
     t = raw.lower().split("(")[0].strip()
     if t in {
         "int",
@@ -1379,6 +1733,10 @@ def map_type(raw: str) -> LogicalType:
         "smallint",
         "tinyint",
         "hugeint",
+        # DuckDB's unsigned 128-bit integer: its varchar cast is the exact
+        # decimal, as every integer's is. It cannot be widened into HUGEINT
+        # for bucketing, so as a key it is hashed (`bisects_natively`).
+        "uhugeint",
         "utinyint",
         "usmallint",
         "uinteger",
@@ -1402,10 +1760,21 @@ def map_type(raw: str) -> LogicalType:
     if t.startswith(("timestamp", "datetime")):
         return LogicalType.TIMESTAMP
     # Exactly these spellings: `time with time zone` (PostgreSQL timetz,
-    # DuckDB TIMETZ) carries an offset the TIME rule has no place for, and
-    # DuckDB's TIME_NS has not been verified, so both stay unmapped.
+    # DuckDB TIMETZ) carries an offset, which TIMETZ keeps; DuckDB's TIME_NS
+    # has not been verified and stays unmapped.
     if t in {"time", "time without time zone"}:
         return LogicalType.TIME
+    if t in {"time with time zone", "timetz"}:
+        return LogicalType.TIMETZ
+    if t == "interval":
+        return LogicalType.INTERVAL
+    # PostgreSQL bit(n) and bit varying (information_schema says `bit` and
+    # `bit varying`), DuckDB BIT. SQL Server's and MySQL's `bit` have their
+    # own maps: a boolean and a BIT(n) there.
+    if t in {"bit", "bit varying", "varbit"}:
+        return LogicalType.BITS
+    if t in {"inet", "cidr"}:
+        return LogicalType.INET
     # PostgreSQL bytea; DuckDB BLOB (BYTEA, VARBINARY and BINARY are aliases
     # it reports as BLOB).
     if t in {"bytea", "blob"}:
@@ -1424,6 +1793,9 @@ def map_type(raw: str) -> LogicalType:
         # DuckDB reports an enum column as `ENUM('a', 'b')`; its varchar cast
         # is the label, exactly the text a STRING column holding it renders.
         "enum",
+        # PostgreSQL's 63-byte identifier type: its `::text` is the name, as
+        # a text column holding it renders (and rendered, unmapped, before).
+        "name",
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN

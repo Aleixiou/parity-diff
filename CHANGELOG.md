@@ -5,6 +5,30 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Bit strings, intervals, times with a time zone, lists, network addresses
+  and SQL Server variants have exact rules** (new logical types BITS,
+  INTERVAL, TIMETZ, LIST, INET, VARIANT; `tests/test_types_rules2.py`):
+  bit strings as their digits at full width (never a boolean); intervals as
+  their three stored components, `<months> mon <days> day <µs> us`, so
+  `1 day`, `24 hours`, `1 mon` and `30 days` are four values; TIMETZ as
+  `HH:MM:SS.ffffff+HH:MM[:SS]`, local time and offset; one-dimensional
+  arrays and lists as `[` + each element by its own type's rule, each
+  followed by `\,`, + `]`, so `[]`, `['']`, `[NULL]`, `['a,b']` and
+  `['a','b']` all differ (a PostgreSQL array's dimensions and lower bounds
+  are part of its value; a list cannot be a key); PostgreSQL
+  inet/cidr as `address/prefix`; sql_variant as `<base type>:<exact value>`
+  with floats as their IEEE bits. DuckDB UHUGEINT is an INTEGER, hashed as a
+  key; PostgreSQL `name` is a STRING. Every one is checked by the sample
+  check now. Found on the way and fixed: **DuckDB TIMETZ was a false
+  match** (COV-7): its text printed the offset +05:00:30 as `+05:30`; and a
+  sql_variant float raised "Arithmetic overflow" for -0.0 and negatives
+  below 1e-99 (COV-8). **Checksums move** for interval, timetz, array/list
+  and sql_variant float/real columns; unchanged for bit strings (PostgreSQL,
+  DuckDB, MySQL), inet/cidr, `name`, UHUGEINT and every other sql_variant.
+  Still UNKNOWN: BigQuery ARRAY and INTERVAL, arrays of JSON or of unmapped
+  types, nested lists, structs, ranges (Snowflake ARRAY stays JSON). Coverage: see
+  `docs/coverage.md`; every native type the sweep loads that had no rule now
+  has one.
 - **Server settings and versions** (red-team round G, `tests/redteam/test_settings.py`,
   `test_versions.py`, against PostgreSQL 9.5-18, MySQL 8.0/8.4/9.7, SQL Server
   2019/2022 at compatibility levels 100-160, DuckDB 1.0-2.0, live BigQuery and

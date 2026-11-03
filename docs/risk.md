@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 1a8b6e56fd0b8385`
+Source fingerprint: `src-sha256: 8f253e84d2e3e146`
 
 ## Summary
 
@@ -27,7 +27,7 @@ For one run that reports **identical**, on columns the rules cover:
 |---|---|---|
 | A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
 | A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.01^(1/n)** of the rows, at 99% confidence, for n rows sampled — **0.46%** at the default n = 1,000; **0** when every row was compared | Proven bound |
-| An engine renders a value differently from the rules | **0 of 3,743** checks at float scale 6 outside the 26 required refusals (3,717 exact), every type with a rule × 6 engines | Measured |
+| An engine renders a value differently from the rules | **0 of 4,142** checks at float scale 6 outside the 26 required refusals (4,116 exact), every type with a rule × 6 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
@@ -36,7 +36,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
 | Row-level security hides rows from the reading role (PostgreSQL) | **not bounded**: those rows are not compared; every run names the table in a caveat | Not quantifiable |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
-| Columns of types outside the rules (arrays, interval, inet, bit strings, timetz, sql_variant; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
+| Columns of types outside the rules (BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, ranges, arrays of JSON, geometry, XML; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
 
 How to state a run's risk to a client: quote the run's own `risk` line (or
@@ -71,7 +71,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Risk | Odds | Kind |
 |---|---|---|
 | Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation) | By design (tested) |
-| Two distinct keys render alike and merge | **0** for INTEGER, DECIMAL (exact text), TIMESTAMP (all stored digits), STRING (escaped); FLOAT keys are refused | By design (tested) |
+| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do) | By design (tested) |
 
 ## 4. Rendering each value as canonical text (per engine)
 
@@ -80,15 +80,19 @@ and 4.3. This is where every past false match lived.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Rendering disagrees with the rules, covered types | **0 of 3,743** checks at scale 6 (3,717 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
+| Rendering disagrees with the rules, covered types | **0 of 4,142** checks at scale 6 (4,116 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
-| Types outside the rules: arrays/lists, INTERVAL, INET/CIDR, bit strings, PostgreSQL timetz, SQL Server sql_variant, DuckDB UHUGEINT (14 native types in the sweep) | **not covered**: compared by text, named in every report | Not quantifiable |
+| Types outside the rules: BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report | Not quantifiable |
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
+| INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
+| A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |
 | Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
 
-Findings this check produced and fixed: 6 (COV-1 to COV-6), one of them a
-false match (Snowflake TIME); the type rules found one more (BigQuery SQL
-NULL equal to JSON `null`). Red-team round G (settings, versions): 14
+Findings this check produced and fixed: 8 (COV-1 to COV-8), two of them
+false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
++05:00:30 as +05:30) and one a refusal of ordinary values (SQL Server
+sql_variant floats, -0.0 and negatives below 1e-99); the type rules found
+one more (BigQuery SQL NULL equal to JSON `null`). Red-team round G (settings, versions): 14
 problems, 8 of them false matches, all fixed. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
@@ -152,8 +156,9 @@ residue is random (`random.SystemRandom`), and the data is not crafted
 against the sample. The bound covers the run's `covered_columns`; columns
 listed as uncovered carry none. Driver quirks that would make the check
 disagree falsely are worked around per engine and verified live (MySQL
-FLOAT, SQL Server NULs and 7-digit times, PostgreSQL and DuckDB infinite
-and BC dates). Measured: on the full live suite (1,437 tests) the check
+FLOAT and BIT width, SQL Server NULs, 7-digit times and sql_variant base
+types, PostgreSQL and DuckDB infinite and BC dates and interval months,
+DuckDB TIMETZ offsets). Measured: on the full live suite (1,611 tests) the check
 raised no false disagreement; every disagreement it raised was a planted
 walk defect or a table changed mid-run.
 

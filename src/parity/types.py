@@ -44,6 +44,26 @@ class LogicalType(str, Enum):
     #: - key order, number spelling - so cross-engine equality holds only
     #: where their normal forms coincide, and the engine warns otherwise.
     JSON = "json"
+    #: A bit string, as its digits at full width: `00000101` (PostgreSQL
+    #: bit/varbit, DuckDB BIT, MySQL BIT(n)). Never a boolean: `1` is not
+    #: `true`, and SQL Server's `bit` stays BOOLEAN.
+    BITS = "bits"
+    #: A calendar interval as its three exact components, `<months> mon
+    #: <days> day <microseconds> us` (`canonical_interval_text`): `1 day` and
+    #: `24:00:00` are stored differently and render differently.
+    INTERVAL = "interval"
+    #: A time of day with its UTC offset, `HH:MM:SS.ffffff+HH:MM`
+    #: (`canonical_timetz_text`): local time and offset both kept.
+    TIMETZ = "timetz"
+    #: A one-dimensional list or array: each element by its own type's rule,
+    #: each followed by a terminator, inside brackets (`canonical_list_text`).
+    LIST = "list"
+    #: A PostgreSQL inet/cidr value: its full address and prefix length,
+    #: `10.0.0.1/32` (`canonical_inet_text`).
+    INET = "inet"
+    #: A SQL Server sql_variant: `<base type>:<exact value>`
+    #: (`canonical_variant_text`). No other engine has the type.
+    VARIANT = "variant"
     UNKNOWN = "unknown"
 
 
@@ -201,7 +221,8 @@ class Verification:
     rows_a: int
     rows_b: int
     #: Columns compared by value, and columns whose type the reference rules
-    #: do not cover (JSON, binary, ...) - those were not independently checked.
+    #: do not cover (structs, nested lists, ...) - those were not
+    #: independently checked.
     checked: list[str] = field(default_factory=list)
     unchecked: list[str] = field(default_factory=list)
     #: Rows the walk called equal that the raw values say differ, or keys one

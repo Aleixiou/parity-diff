@@ -760,6 +760,53 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   exact only where normal forms coincide; `json_semantics` names both forms
   in a warning otherwise. A NULL JSON must render the sentinel, never `null`
   (BigQuery's TO_JSON_STRING(NULL) is `null`).
+- **BITS, INTERVAL, TIMETZ, LIST, INET, VARIANT** (`canonical_*_text` in
+  base.py, `tests/test_types_rules2.py`; verified live on PostgreSQL 18.4,
+  DuckDB 1.5.5, MySQL 8, SQL Server 2022). Rules, and why each is injective:
+  - BITS: the digits at full width (`bit(8)` b'101' is `00000101`) - what
+    PostgreSQL, DuckDB and MySQL already printed. Never merged with BOOLEAN:
+    SQL Server's `bit` keeps its own map (`map_type_mssql`).
+  - INTERVAL: `<months> mon <days> day <µs> us`, the three stored components
+    (PostgreSQL `extract` year/month, day, hour/minute/microseconds, summed in
+    numeric; DuckDB `datepart` in HUGEINT). `1 day` and `24 hours` differ
+    though both engines' `=` says equal - they print and add differently. PG
+    17's infinite intervals render `infinity`/`-infinity`. The sample reads
+    text (IntervalStyle pinned): both drivers fold a month into 30 days.
+  - TIMETZ: `canonical_time_text` of the local clock + offset `+HH:MM`, `:SS`
+    when it has seconds. **DuckDB's varchar cast of a TIMETZ is not
+    injective** (COV-7: `+05:00:30` prints `+05:30`), so DuckDB renders from
+    `datepart` and its sample reads the driver's `datetime.time`.
+  - LIST: `[` + each element by its own type's `normalize`, each followed by
+    `\,` (`LIST_TERMINATOR`), + `]`. Escaped text only ever has `\\`, `\s`
+    after a backslash, so no element forges the terminator; the text starts
+    with `[`, so it is never the sentinel. The element is rendered through a
+    stand-in column (`LIST_ELEMENT_NAME`: an `unnest ... with ordinality`
+    alias on PostgreSQL, a list-comprehension variable on DuckDB). PostgreSQL
+    reports every array as `ARRAY`, so `_with_arrays` reads the element type
+    from the catalog (`integer[]`). Ruled element types are
+    `LIST_ELEMENT_TYPES`; anything else (JSON, nested, structs) leaves the
+    list UNKNOWN. A PostgreSQL array with more than one dimension or a lower
+    bound other than 1 holds its shape in its value and `unnest` would
+    flatten it, so its `array_dims` lead, between `\=` marks
+    (`LIST_DIMS_MARK`): `[\=[1:2][1:2]\=1\,2\,3\,4\,]` - a plain list
+    cannot start `[\=`. psycopg drops lower bounds, so the PostgreSQL sample
+    reads the array's text (`parse_pg_array`). Refused loudly: a list of
+    DuckDB TIMESTAMP_NS (no caveat could reach an element) and a LIST key
+    (elements round as values do).
+  - INET: PostgreSQL's `::text` (`text(inet)`: the prefix always written, IPv6
+    by BIND's `inet_net_ntop`, reproduced in `canonical_inet_text`).
+  - VARIANT (sql_variant): `<base type>:<value>`, each base type in an exact
+    style; float/real as `0x` + IEEE bits (-0 as 0), because style 3 raised
+    on -0.0 and on negatives below 1e-99 and is not correctly rounded
+    (COV-8). mssql-python drops the base type, so the sample reads base type,
+    code page and `convert(varbinary)` of the value, decoded by
+    `_variant_value` from SQL Server's storage layouts.
+  - UHUGEINT is INTEGER, and as a key it is hashed (`bisects_natively`):
+    DuckDB silently turns UHUGEINT arithmetic with a signed operand into
+    DOUBLE. PostgreSQL `name` is STRING.
+  - Not ruled, by choice: BigQuery ARRAY (cannot be NULL or hold a NULL, so a
+    rule would only partly meet other engines') and INTERVAL; ranges,
+    structs, nested lists, arrays of JSON.
 - **Session pins are the contract for server settings** (round G): every
   setting that changes rendering or row visibility is pinned at connect -
   MySQL `sql_select_limit`, Snowflake `rows_per_resultset`, PostgreSQL

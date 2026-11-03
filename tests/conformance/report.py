@@ -63,6 +63,18 @@ FAMILIES: list[tuple[str, tuple[str, ...]]] = [
     ("BINARY", ("bytes",)),
     ("JSON, every engine alike", ("json",)),
     ("JSON, engine normal forms", ("json_forms",)),
+    ("BITS", ("bits",)),
+    ("INTERVAL", ("interval",)),
+    ("TIMETZ", ("timetz",)),
+    ("INET", ("inet",)),
+    ("LIST of text", ("list_text",)),
+    ("LIST of integers", ("list_int",)),
+    (
+        "LIST of dates, decimals, floats, booleans, intervals",
+        ("list_date", "list_dec", "list_float", "list_bool", "list_interval"),
+    ),
+    ("LIST, PostgreSQL shapes (dimensions, lower bounds)", ("list_shaped",)),
+    ("VARIANT (sql_variant)", ("variant",)),
 ]
 
 #: Native types each dialect maps onto a logical type but this suite does not
@@ -72,21 +84,31 @@ NOT_LOADED: dict[str, dict[str, str]] = {
     "postgres": {
         "mapped": "serial, bigserial, int2/int4/int8 spellings (same types), "
         "char(n) widths other than 20, varchar without length, timestamp(p)/"
-        "timestamptz(p) with p < 6, domains over any of these",
-        "unknown": "xml, cidr, macaddr, varbit, point and other geometric types, "
-        'tsvector, ranges/multiranges, composite types, oid, "char", hstore and '
-        "citext (extensions); time with time zone (timetz) is loaded below",
+        "timestamptz(p) with p < 6, domains over any of these, bit(n) widths "
+        "other than 8, arrays of element types other than integer, text, date, "
+        "numeric, double precision, boolean and interval (each element follows "
+        "its own type's rule); multi-dimensional arrays and arrays with a lower "
+        "bound other than 1 of element types other than integer",
+        "unknown": "xml, macaddr, point and other geometric types, tsvector, "
+        'multiranges, composite types, oid, "char", hstore and citext '
+        "(extensions), arrays of JSON, of enums and of any other unmapped type; "
+        "a range and a jsonb array are loaded below",
     },
     "duckdb": {
         "mapped": "DECIMAL widths other than (4,1), (18,4), (38,9), (38,30); "
-        "TIMESTAMP WITH TIME ZONE spellings; BYTEA/VARBINARY (reported as BLOB)",
-        "unknown": "STRUCT, MAP, UNION (special-cased), VARIANT (special-cased), "
-        "TIME WITH TIME ZONE, TIME_NS, fixed-size ARRAY, BIGNUM/VARINT",
+        "TIMESTAMP WITH TIME ZONE spellings; BYTEA/VARBINARY (reported as BLOB); "
+        "lists of element types other than INTEGER, VARCHAR, DATE, DECIMAL(18,7), "
+        "DOUBLE, BOOLEAN and INTERVAL; lists of TIMESTAMP_NS (refused: digits "
+        "past the microsecond)",
+        "unknown": "MAP, UNION (special-cased), VARIANT (special-cased), TIME_NS, "
+        "fixed-size ARRAY, lists of structs, maps or JSON, BIGNUM/VARINT; a "
+        "nested list and a STRUCT are loaded below",
     },
     "mysql": {
         "mapped": "tinytext, mediumtext, text, set, dec/fixed/numeric aliases, "
         "int unsigned, datetime/timestamp with precision < 6, binary(n) (its "
-        "zero padding is data), tinyblob/mediumblob/longblob, time(1..5)",
+        "zero padding is data), tinyblob/mediumblob/longblob, time(1..5), "
+        "bit(n) widths other than 1, 8 and 64",
         "unknown": "geometry and the spatial types (rendered as hex of the stored bytes)",
     },
     "mssql": {
@@ -101,7 +123,9 @@ NOT_LOADED: dict[str, dict[str, str]] = {
         "mapped": "INT64 aliases (INTEGER, SMALLINT, ...), BIGDECIMAL, "
         "parameterised NUMERIC(p,s) / STRING(n) / BYTES(n); a JSON null (the "
         "load job cannot store one; the NULL guard is pinned offline)",
-        "unknown": "ARRAY, STRUCT, GEOGRAPHY, INTERVAL, RANGE",
+        "unknown": "ARRAY, STRUCT, GEOGRAPHY, INTERVAL, RANGE (no rule yet: a "
+        "BigQuery ARRAY cannot be NULL or hold NULLs, so it meets another "
+        "engine's arrays only partly)",
     },
     "snowflake": {
         "mapped": "NUMBER(p,0) for p < 38 and NUMBER(p,s) for other s, INT/BIGINT "

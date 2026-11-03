@@ -137,3 +137,23 @@ def test_the_sample_is_hard_and_mostly_checked(engine_runs):
     assert {"integer", "decimal", "float", "boolean", "string", "date", "timestamp"} <= (
         logical | ({"boolean"} if engine == "mysql" else set())
     ), (engine, logical)
+
+
+#: Groups whose every stored value must render exactly as the rules render
+#: the *input*: the binders hand each engine the value itself, so text that
+#: agrees with the read-back but not with the input means the engine stored
+#: something else - a binder or storage fault the per-value check is blind
+#: to, since it reads the stored value back.
+SPEC_EXACT = {"bits", "interval", "timetz", "inet", "variant"}
+
+
+def test_the_new_types_render_their_input_exactly(engine_runs):
+    """For BITS, INTERVAL, TIMETZ, INET, VARIANT and every LIST group."""
+    engine, runs = engine_runs
+    cells = [
+        c
+        for c in runs[SCALES[0]].cells
+        if (c.group in SPEC_EXACT or c.group.startswith("list_")) and c.status == "agree"
+    ]
+    wrong = [c for c in cells if c.text != c.spec]
+    assert not wrong, "\n".join(_line(c) + f" spec={c.spec!r}" for c in wrong[:25])

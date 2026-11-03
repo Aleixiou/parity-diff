@@ -1,9 +1,11 @@
 """Each conformance finding, as the regression test that keeps it fixed.
 
 The red-team convention: a confirmed bug was first a strict xfail asserting
-the right behaviour; all six COV findings are fixed (2026-11-03), so the
+the right behaviour; all eight COV findings are fixed (2026-11-03), so the
 markers are gone and each test is the smallest reproduction of what the
-sweep found. `cov_known.FINDINGS` says what was wrong and how it was fixed.
+sweep found. COV-7 and COV-8 were found in UNKNOWN-mapped renderings while
+their types got rules, and the rule replaced the rendering in the same
+change, so they never carried a marker. `cov_known.FINDINGS` says what was wrong and how it was fixed.
 """
 
 from __future__ import annotations
@@ -161,3 +163,53 @@ def test_cov6_snowflake_time_keeps_its_fractional_seconds(snowflake_url):
     assert rows[1] != rows[2], rows
     assert rows[1] == "12:34:56.500000", rows
     assert rows[2] == "12:34:56.000000", rows
+
+
+@pytest.mark.duckdb
+def test_cov7_duckdb_timetz_keeps_an_offsets_minutes_beside_its_seconds(tmp_path):
+    """+05:00:30 and +05:30 are different offsets; they must render apart,
+    and the sample must read the offset the column holds."""
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "f.duckdb")
+    con = duckdb.connect(path)
+    con.execute("create table t (id bigint, v timetz)")
+    con.execute("insert into t values (1, '12:00:00+05:00:30'), (2, '12:00:00+05:30')")
+    con.close()
+    d = get_dialect(f"duckdb:///{path}", side="B")
+    try:
+        (col,) = [c for c in d.columns("main.t") if c.name == "v"]
+        rows = dict(d.query(f"select id, {d.normalize(col)} from main.t"))
+        raws = dict(d.query(f"select id, {d.sample_select(col)} from main.t"))
+    finally:
+        d.close()
+    assert rows == {1: "12:00:00.000000+05:00:30", 2: "12:00:00.000000+05:30"}, rows
+    for i, text in rows.items():
+        assert canonical_text(reference_token(col.logical_type, raws[i], 6)) == text
+
+
+@pytest.mark.mssql
+def test_cov8_a_variant_float_renders_where_style_3_raised(mssql_url):
+    """-0.0 and a negative double below 1e-99 render, exactly, and -0 is 0."""
+    from parity.types import Column
+
+    d = get_dialect(mssql_url, side="A")
+    # Rows of two base types, so the variant is not folded into a constant
+    # float at compile time (the CASE's datetime2 branch would then be
+    # refused as a float-to-datetime2 conversion).
+    rows = (
+        "(values (1, cast(cast(-1e-300 as float) as sql_variant)), "
+        "(2, cast(-cast(0 as float) as sql_variant)), "
+        "(3, cast(cast(0 as float) as sql_variant)), "
+        "(4, cast(N'x' as sql_variant))) s(id, v)"
+    )
+    try:
+        sql = d.normalize(Column("v", LogicalType.VARIANT, "sql_variant"))
+        got = dict(d.query(f"select id, {d.fetch_text(sql)} from {rows}"))
+    finally:
+        d.close()
+    assert {k: d.fetched(v) for k, v in got.items()} == {
+        1: "float:0x81A56E1FC2F8F359",
+        2: "float:0x0000000000000000",
+        3: "float:0x0000000000000000",
+        4: "nvarchar:x",
+    }, got

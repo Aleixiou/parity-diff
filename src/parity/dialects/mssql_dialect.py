@@ -597,11 +597,32 @@ class SQLServerDialect(Dialect):
         if column.logical_type is LogicalType.TIME:
             # As text, all seven digits: the driver would round them.
             return f"convert(nvarchar(40), cast({c} as time(7)))"
+        if column.logical_type is LogicalType.VARIANT:
+            # mssql-python reads a sql_variant as its base value but drops
+            # the base type - int 1, bigint 1 and N'1' arrive alike, the one
+            # thing the rule must tell apart. So the sample reads the base
+            # type, a text value's code page, and the value's own bytes
+            # (`convert(varbinary)` of a variant is its base value's storage)
+            # - none of the conversions `normalize` uses; `_variant_value`
+            # decodes them.
+            prop = f"sql_variant_property({c}, '{{}}')"
+            page = (
+                "convert(nvarchar(20), collationproperty(cast("
+                f"{prop.format('Collation')} as nvarchar(128)), 'CodePage'))"
+            )
+            return (
+                f"cast({prop.format('BaseType')} as nvarchar(128)) + N':' "
+                f"+ coalesce({page}, N'') + N':' "
+                f"+ convert(nvarchar(max), convert(varbinary(max), {c}), 2)"
+            )
         return super().sample_select(column)
 
     def sample_value(self, column: Column, value: Any) -> Any:
         """Decode the text bytes; a uniqueidentifier in lower case, as the
-        rules render it (SQL Server prints it upper case)."""
+        rules render it (SQL Server prints it upper case); a sql_variant from
+        its base type and stored bytes (`_variant_value`)."""
+        if column.logical_type is LogicalType.VARIANT:
+            return None if value is None else _variant_value(str(value))
         if column.logical_type is LogicalType.BINARY:
             return value  # bytes are the value; only text travels as bytes
         if isinstance(value, (bytes, bytearray)):
@@ -741,7 +762,7 @@ class SQLServerDialect(Dialect):
             expr = self.concat_sql(self.binary_prefix_sql(), hexed)
         elif raw in ("geography", "geometry", "hierarchyid"):
             expr = self.escape_text(f"cast({c}.ToString() as {text})")
-        elif raw == "sql_variant":
+        elif t is LogicalType.VARIANT:
             expr = self._variant_text(c)
         else:
             # Any other type through its text: arbitrary, so escaped.
@@ -749,25 +770,40 @@ class SQLServerDialect(Dialect):
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
 
     def _variant_text(self, c: str) -> str:
-        """A `sql_variant` as `<base type>:<exact value>` (RT-A16, RT-C5).
+        """A `sql_variant` as `<base type>:<exact value>` - `canonical_variant_text`.
 
         A plain cast to nvarchar(max) is lossy twice over: it drops the base
         type, so int 1 and N'1' (or float 1.5 and decimal 1.5) rendered alike,
         and it formats by the base type's *default* style, which keeps ~6
         significant digits of a float and only the minutes of a datetime or
         datetime2 (`Jan  1 2024 10:00AM`) - two different values on one engine
-        compared equal. So the base type leads, and each value is rendered by
-        an exact style: float/real round-trip (style 3), money to 4 places
-        (style 2), date-times to their full precision (style 121), binary as
-        hex. No other engine has the type, so this is about exactness on SQL
-        Server itself: a variant column against another engine's column
-        differs on every row, as the unmapped-type warning says.
+        compared equal (RT-A16, RT-C5). So the base type leads, and each value
+        is rendered by an exact style: money to 4 places (style 2), date-times
+        to their full precision (style 121), binary as hex (style 1).
+
+        float and real render their IEEE bits in hex (-0 as 0): style 3 was
+        used until the rule was written and turned out not to be one - it is
+        not correctly rounded (1626983080611305.75 printed `...057e+015`, so
+        no Python spec could reproduce it) and it raises "Arithmetic overflow"
+        for -0.0 and for any negative double below 1e-99, killing the diff on
+        an ordinary value (COV-7). No other engine has the type, so this is
+        about exactness on SQL Server itself: a variant column against
+        another engine's column differs on every row.
         """
         text = "nvarchar(max)"
         base = f"cast(sql_variant_property({c}, 'BaseType') as nvarchar(128))"
+
+        def bits(sql_type: str, size: int) -> str:
+            """`0x` + the big-endian IEEE bits; a zero of either sign as +0."""
+            v = f"cast({c} as {sql_type})"
+            return (
+                f"case when {v} = 0 then N'0x{'0' * 2 * size}' "
+                f"else convert({text}, convert(varbinary({size}), {v}), 1) end"
+            )
+
         by_type = {
-            "float": f"convert({text}, cast({c} as float), 3)",
-            "real": f"convert({text}, cast({c} as real), 3)",
+            "float": bits("float", 8),
+            "real": bits("real", 4),
             "money": f"convert({text}, cast({c} as money), 2)",
             "smallmoney": f"convert({text}, cast({c} as smallmoney), 2)",
             "datetime": f"convert({text}, cast({c} as datetime), 121)",
@@ -1109,7 +1145,91 @@ def map_type_mssql(raw: str) -> LogicalType:
         "uniqueidentifier",
     }:
         return LogicalType.STRING
+    if t == "sql_variant":
+        return LogicalType.VARIANT
     return LogicalType.UNKNOWN
+
+
+def _variant_value(payload: str) -> tuple[str, Any]:
+    """(base type, value) of a sql_variant, from `sample_select`'s payload.
+
+    `<base type>:<code page>:<hex of the stored bytes>`, decoded by the
+    storage layouts SQL Server documents and that were verified live: integers
+    big-endian two's complement (tinyint unsigned); decimal as precision,
+    scale, a zero byte, the sign (1 positive) and the magnitude little-endian;
+    float/real and money/smallmoney big-endian; datetime as days since 1900
+    and 1/300-second ticks, displayed to the millisecond; smalldatetime as
+    days and minutes; date, time, datetime2 and datetimeoffset little-endian,
+    a time in units of 10^-precision seconds after a precision byte, a
+    datetimeoffset in UTC with its offset in minutes; uniqueidentifier in
+    GUID byte order; text in its code page (nvarchar UTF-16LE). Returns the
+    value in the form `canonical_variant_text` takes.
+    """
+    import datetime as dt
+    import struct
+    import uuid
+    from decimal import Decimal
+
+    base, page, hexed = payload.split(":", 2)
+    base = base.lower()
+    b = bytes.fromhex(hexed)
+    if base in ("smallint", "int", "bigint"):
+        return base, int.from_bytes(b, "big", signed=True)
+    if base in ("tinyint", "bit"):
+        return base, int.from_bytes(b, "big")
+    if base in ("decimal", "numeric"):
+        # Built from text, which is exact: `scaleb` rounds to the default
+        # context's 28 digits, and 10^38 - 1 came back as 1E+38.
+        sign = "" if b[3] else "-"
+        return base, Decimal(f"{sign}{int.from_bytes(b[4:], 'little')}E-{b[1]}")
+    if base == "float":
+        return base, struct.unpack(">d", b)[0]
+    if base == "real":
+        return base, struct.unpack(">f", b)[0]
+    if base in ("money", "smallmoney"):
+        return base, Decimal(f"{int.from_bytes(b, 'big', signed=True)}E-4")
+    if base == "datetime":
+        days = int.from_bytes(b[:4], "big", signed=True)
+        ticks = int.from_bytes(b[4:], "big")
+        # 1/300 s ticks shown as .000, .003, .007: the nearest millisecond.
+        millis = (ticks * 10 + 1) // 3
+        return base, (dt.date(1900, 1, 1) + dt.timedelta(days=days), millis * 1_000_000)
+    if base == "smalldatetime":
+        days, minutes = int.from_bytes(b[:2], "big"), int.from_bytes(b[2:], "big")
+        return base, (
+            dt.date(1900, 1, 1) + dt.timedelta(days=days),
+            minutes * 60_000_000_000,
+        )
+    if base == "date":
+        return base, dt.date(1, 1, 1) + dt.timedelta(days=int.from_bytes(b, "little"))
+    if base in ("time", "datetime2", "datetimeoffset"):
+        precision = b[0]
+        width = 3 if precision <= 2 else 4 if precision <= 4 else 5
+        ns = int.from_bytes(b[1 : 1 + width], "little") * 10 ** (9 - precision)
+        if base == "time":
+            return base, ns
+        days = int.from_bytes(b[1 + width : 4 + width], "little")
+        if base == "datetime2":
+            return base, (dt.date(1, 1, 1) + dt.timedelta(days=days), ns)
+        offset = int.from_bytes(b[4 + width : 6 + width], "little", signed=True)
+        total = days * 86_400_000_000_000 + ns + offset * 60_000_000_000
+        local_days, local_ns = divmod(total, 86_400_000_000_000)
+        return base, (dt.date(1, 1, 1) + dt.timedelta(days=local_days), local_ns, offset)
+    if base in ("binary", "varbinary"):
+        return base, b
+    if base == "uniqueidentifier":
+        return base, uuid.UUID(bytes_le=b)
+    if base in ("nchar", "nvarchar"):
+        try:
+            return base, b.decode("utf-16-le")
+        except UnicodeDecodeError:
+            # An unpaired surrogate: `_utf16_safe` renders the marker and the
+            # UTF-16LE bytes, which is what such a value is.
+            return base, INVALID_UTF16_MARKER + "0x" + b.hex().upper()
+    if base in ("char", "varchar"):
+        codec = "utf-8" if page == "65001" else f"cp{page}"
+        return base, b.decode(codec)
+    raise ValueError(f"sql_variant base type {base!r} has no rule")
 
 
 def _base_type(raw: str) -> str:

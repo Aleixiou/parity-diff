@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from parity.dialects.base import Dialect, require_matching_scales
-from parity.reference import UNCHECKED, canonical_text, describe, reference_token
+from parity.reference import UNCHECKED, canonical_text, column_token, describe
 from parity.types import (
     Column,
     DiffResult,
@@ -237,6 +237,8 @@ def _resolve_key(
     a_table: str,
     b_table: str,
     warnings: list[str],
+    a: Dialect | None = None,
+    b: Dialect | None = None,
 ) -> tuple[KeySpec, KeySpec]:
     """Work out how to match rows up, and whether the key needs hashing.
 
@@ -281,10 +283,15 @@ def _resolve_key(
     # Hash unless it is one integer column on both sides. A single-column key
     # that is integer on one side and text on the other has to be hashed too,
     # or the two sides would bucket by different things entirely.
+    # And only if both dialects can bucket it as itself: DuckDB's UHUGEINT is
+    # wider than any type the bucket expression can widen it into, so it is
+    # hashed like any other key (`Dialect.bisects_natively`).
     single_integer = (
         len(names) == 1
         and a_key[0].logical_type is LogicalType.INTEGER
         and b_key[0].logical_type is LogicalType.INTEGER
+        and (a is None or a.bisects_natively(a_key[0]))
+        and (b is None or b.bisects_natively(b_key[0]))
     )
     hashed = not single_integer
 
@@ -574,7 +581,7 @@ def diff(
         # users read as "how much work did this cost".
         stats.queries -= 2
 
-        key_a, key_b = _resolve_key(key, cols_a, cols_b, a_table, b_table, warnings)
+        key_a, key_b = _resolve_key(key, cols_a, cols_b, a_table, b_table, warnings, a, b)
         key_folds = {c.name.casefold() for c in key_a.columns}
 
         shared, schema_differences = _select_columns(
@@ -906,15 +913,7 @@ def _verify(
 
     def token(dialect: Dialect, column: Column, value: Any) -> Any:
         """One raw value, reduced by the reference rules for its side."""
-        return reference_token(
-            column.logical_type,
-            value,
-            dialect.float_scale,
-            padded=dialect.padded_char(column),
-            single_precision=dialect.single_precision(column),
-            sub_micro=column.sub_micro,
-            json_verbatim=dialect.json_verbatim(column),
-        )
+        return column_token(dialect, column, value)
 
     failures: list[str] = []
     for k in sorted(set(sample_a) | set(sample_b), key=_key_order):

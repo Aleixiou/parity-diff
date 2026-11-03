@@ -32,6 +32,15 @@ Groups, and why each value is there:
   `bytes` (zero bytes, padding, invalid UTF-8, all 256 values); `json`
   (documents every engine normalises alike) and `json_forms` (documents whose
   engines' normal forms differ - `FORM_DEPENDENT`).
+- `bits` (widths, empty, leading zeros); `interval` (one day against 24
+  hours against 30 days against a month, mixed signs, each field's limits,
+  PostgreSQL 17's infinities); `timetz` (offsets to the second, `24:00:00`,
+  the +05:00:30 / +05:30 pair DuckDB's text could not tell apart);
+  `inet` (PostgreSQL inet/cidr: prefixes, every IPv6 compression case);
+  `list_*` (arrays and lists: empty against one empty string against one
+  NULL, separators and terminators inside elements, each element type's own
+  hard values); `variant` (SQL Server sql_variant: every base type, values
+  that print alike in a lossy style).
 """
 
 from __future__ import annotations
@@ -47,6 +56,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from float_sample import adversarial_doubles
+
+from parity.dialects.base import ShapedList
 
 
 @dataclass(frozen=True)
@@ -494,6 +505,244 @@ JSONS_FORMS = [
     )
 ]
 
+#: Bit strings, as their digits (PostgreSQL binds them as text, DuckDB casts
+#: them, MySQL's binder turns them into an integer of the column's width).
+BITS = [Val("bt:<NULL>", None)] + [
+    Val(f"bt:{x}", x)
+    for x in (
+        "00000101",
+        "10100000",
+        "00000000",
+        "11111111",
+        "101",
+        "0101",
+        "1",
+        "0",
+        "00",
+        "",
+        "1" * 64,
+        "0" * 63 + "1",
+        "10" * 50,
+    )
+]
+
+#: Intervals as (months, days, microseconds) - what the engines store.
+INTERVALS = (
+    [Val("iv:<NULL>", None)]
+    + [
+        Val(f"iv:{m},{d},{us}", (m, d, us))
+        for m, d, us in (
+            (0, 0, 0),
+            (0, 1, 0),  # '1 day'
+            (0, 0, 86_400_000_000),  # '24 hours': equal under `=`, not the same value
+            (1, 0, 0),  # '1 month'
+            (0, 30, 0),  # '30 days'
+            (12, 0, 0),
+            (14, 0, 0),
+            (-14, 3, -14_706_000_007),  # -1 year -2 mons +3 days -04:05:06.000007
+            (0, 0, -1),
+            (0, 0, 1),
+            (1, 0, -1),
+            (0, -1, 86_400_000_000),  # mixed signs
+            (-1, 1, 0),
+            (0, 0, 3_600_000_000 * 1000),  # 1000 hours, not days
+            (2_147_483_647, 0, 0),
+            (-2_147_483_648, 0, 0),
+            (0, 2_147_483_647, 0),
+            (0, -2_147_483_648, 0),
+            (0, 0, 9_223_372_036_854_775_807),
+            (0, 0, -9_223_372_036_854_775_807),
+        )
+    ]
+    + [Val("iv:infinity", "infinity"), Val("iv:-infinity", "-infinity")]
+)
+
+#: Times with an offset, as text both engines read (`HH:MM:SS` in full: DuckDB
+#: refuses `12:00+05:45`).
+TIMETZS = [Val("tz:<NULL>", None)] + [
+    Val(f"tz:{x}", x)
+    for x in (
+        "12:00:00+05:45",
+        "06:15:00+00",  # the same instant as the one above, another value
+        "12:00:00.5+05:45",
+        "12:00:00.500001+05:45",
+        "12:00:00+05:30",
+        "12:00:00+05:00:30",  # DuckDB's own text printed this as +05:30 (COV-7)
+        "12:00:00-05:00:30",
+        "12:00:00+00:00:30",
+        "00:00:00+00",
+        "24:00:00+00",
+        "24:00:00-15:59:59",
+        "00:00:00+15:59:59",
+        "23:59:59.999999-15:59",
+        "13:30:00-03:30",
+    )
+]
+
+#: PostgreSQL inet/cidr values as text, the prefix explicit or full width.
+INETS = [Val("in:<NULL>", None)] + [
+    Val(f"in:{x}", x)
+    for x in (
+        "10.0.0.1",
+        "10.0.0.1/32",  # the same value: a host's prefix is its width
+        "10.0.0.1/8",
+        "10.0.0.0/8",
+        "0.0.0.0/0",
+        "255.255.255.255",
+        "::1",
+        "::",
+        "::/0",
+        "::2",  # IPv4-compatible: PostgreSQL prints ::0.0.0.2
+        "::ffff:1.2.3.4",
+        "::1.2.3.4",
+        "::ffff:0:0",
+        "1:0:0:1:0:0:0:1",  # the longest run of zero groups is compressed
+        "1:0:0:1:0:0:1:1",  # a tie: the first run
+        "1:0:1:1:1:1:1:1",  # a single zero group is not
+        "1::",
+        "fe80::1/64",
+        "2001:db8::/32",
+        "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "::ffff:1.2.3.4/96",
+    )
+]
+
+
+def _lists(tag: str, items: list[list[Any]]) -> list[Val]:
+    """A list group: NULL, then each list keyed by its repr."""
+    return [Val(f"{tag}:<NULL>", None)] + [Val(f"{tag}:{x!r}", x) for x in items]
+
+
+#: Lists that a text rendering of the list (`{a,b}`, `[a, b]`) could confuse.
+LIST_TEXT = _lists(
+    "lt",
+    [
+        [],
+        [""],
+        [None],
+        ["", ""],
+        [None, None],
+        ["", None],
+        ["a,b"],
+        ["a", "b"],
+        ["a, b"],
+        ["a", " b"],
+        ["NULL"],
+        ["\\N"],
+        ["\\"],
+        ["a\\,b"],
+        ["a\\", ",b"],
+        ["a\x1fb"],
+        ["{}"],
+        ["[]"],
+        ['"'],
+        ["é", "\U0001f600"],
+        ["\\,"],
+        ["a", "", "b"],
+    ],
+)
+LIST_INT = _lists(
+    "li",
+    [[], [None], [1, 2], [12], [1, None, 3], [None, 1], [-(2**31), 2**31 - 1], [0]],
+)
+LIST_DATE = _lists(
+    "ld",
+    [
+        [],
+        [dt.date(2024, 1, 1)],
+        [dt.date(1, 1, 1), dt.date(9999, 12, 31)],
+        [None, dt.date(2024, 2, 29)],
+    ],
+)
+LIST_DEC = _lists(
+    "ln",
+    [
+        [],
+        [Decimal("1.5"), Decimal("-0.25")],
+        [Decimal("0.0000005")],  # rounds half away from zero, as a scalar does
+        [Decimal("-0.0000004")],  # an unsigned zero
+        [Decimal("0"), None],
+    ],
+)
+LIST_FLOAT = _lists("lf", [[], [1.5, 1e15 + 0.5], [-0.0], [0.1, None], [2.0**53 + 2]])
+LIST_BOOL = _lists("lb", [[], [True, False, None], [False], [True], [None]])
+LIST_INTERVAL = _lists(
+    "lv", [[], [(0, 1, 0)], [(0, 0, 86_400_000_000)], [(1, 0, 0), None], [(0, 30, 0)]]
+)
+#: PostgreSQL arrays whose shape is part of the value: every one holds the
+#: elements 1, 2, 3, 4 (or a part of them) in a different shape.
+LIST_SHAPED = (
+    [Val("ls:<NULL>", None)]
+    + [
+        Val(f"ls:{dims}={items!r}", ShapedList(dims, items))
+        for dims, items in (
+            ("[0:1]", (1, 2)),
+            ("[2:3]", (1, 2)),
+            ("[-2:-1]", (1, None)),
+            ("[1:2][1:2]", (1, 2, 3, 4)),
+            ("[1:1][1:4]", (1, 2, 3, 4)),
+            ("[1:4][1:1]", (1, 2, 3, 4)),
+            ("[0:1][1:2]", (1, 2, 3, 4)),
+            ("[1:2][1:1][1:2]", (1, 2, 3, 4)),
+            ("[1:1][1:1]", (None,)),
+        )
+    ]
+    + [Val("ls:[1,2,3,4]", [1, 2, 3, 4])]
+)
+
+#: SQL Server sql_variant values as (base type, value in the form
+#: `canonical_variant_text` takes); the binder casts each to its base type.
+VARIANTS = [Val("va:<NULL>", None)] + [
+    Val(f"va:{base} {value!r}"[:90], (base, value))
+    for base, value in (
+        ("int", 1),
+        ("bigint", 1),
+        ("tinyint", 255),
+        ("smallint", -32768),
+        ("bigint", -(2**63)),
+        ("bit", 1),
+        ("nvarchar", "1"),
+        ("varchar", "1"),
+        ("char", "1   "),
+        ("nchar", "é  "),
+        ("nvarchar", "\\N"),
+        ("nvarchar", "a\x1fb"),
+        ("nvarchar", "\U0001f600"),
+        ("float", 1.5),
+        ("float", -0.1),
+        ("float", -1e-300),  # style 3 raised "Arithmetic overflow" (COV-8)
+        ("float", -0.0),  # so did this
+        ("float", 1626983080611305.75),  # and printed this one wrongly rounded
+        ("float", 5e-324),
+        ("float", 1.7976931348623157e308),
+        ("real", 1.5),
+        ("real", 0.10000000149011612),
+        ("decimal", Decimal("1.5")),
+        ("decimal", Decimal("1.50")),
+        ("decimal", Decimal("-99999999999999999999999999999999999999")),
+        ("numeric", Decimal("0.00000000000000000000000000000000000001")),
+        ("money", Decimal("-922337203685477.5808")),
+        ("money", Decimal("1.5")),
+        ("smallmoney", Decimal("2.25")),
+        ("date", dt.date(1, 1, 2)),
+        ("date", dt.date(9999, 12, 31)),
+        ("datetime", (dt.date(2024, 1, 2), 11_045_007_000_000)),  # 03:04:05.007
+        ("datetime", (dt.date(1753, 1, 1), 86_399_997_000_000)),
+        ("smalldatetime", (dt.date(2024, 1, 2), 11_040_000_000_000)),
+        ("datetime2", (dt.date(2024, 1, 2), 11_045_123_456_700)),
+        ("datetime2", (dt.date(1, 1, 1), 0)),
+        ("datetime2", (dt.date(9999, 12, 31), 86_399_999_999_900)),
+        ("datetimeoffset", (dt.date(2024, 1, 2), 11_045_123_456_700, -345)),
+        ("datetimeoffset", (dt.date(2024, 1, 2), 11_045_123_456_700, 840)),
+        ("time", 86_399_999_999_900),
+        ("time", 0),
+        ("binary", b"\x00\xab\x00"),
+        ("varbinary", b""),
+        ("varbinary", b"\x00\xab"),
+        ("uniqueidentifier", "6f9619ff-8b86-d011-b42d-00c04fc964ff"),
+    )
+]
+
 GROUPS: dict[str, list[Val]] = {
     "int": _ints(),
     "dec": _decs(),
@@ -518,6 +767,19 @@ GROUPS: dict[str, list[Val]] = {
     "bytes": BYTES,
     "json": JSONS,
     "json_forms": JSONS_FORMS,
+    "bits": BITS,
+    "interval": INTERVALS,
+    "timetz": TIMETZS,
+    "inet": INETS,
+    "list_text": LIST_TEXT,
+    "list_int": LIST_INT,
+    "list_date": LIST_DATE,
+    "list_dec": LIST_DEC,
+    "list_float": LIST_FLOAT,
+    "list_bool": LIST_BOOL,
+    "list_interval": LIST_INTERVAL,
+    "list_shaped": LIST_SHAPED,
+    "variant": VARIANTS,
 }
 
 #: Groups whose values the rules (`parity.reference`) cover.
@@ -545,6 +807,19 @@ RULED = {
     "bytes",
     "json",
     "json_forms",
+    "bits",
+    "interval",
+    "timetz",
+    "inet",
+    "list_text",
+    "list_int",
+    "list_date",
+    "list_dec",
+    "list_float",
+    "list_bool",
+    "list_interval",
+    "list_shaped",
+    "variant",
 }
 
 #: Ruled groups whose canonical text depends on the engine's own normal form

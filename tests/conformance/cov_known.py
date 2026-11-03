@@ -64,6 +64,26 @@ FINDINGS: dict[str, str] = {
         "and BigQuery. A FALSE MATCH, Snowflake to Snowflake and Snowflake to "
         "any engine."
     ),
+    "COV-7": (
+        "FIXED 2026-11-03 - DuckDB TIMETZ renders `canonical_timetz_text` from its "
+        "clock fields and `datepart('timezone')`, the TIMETZ rule PostgreSQL follows "
+        "too; the sample reads the driver's datetime.time, which carries the offset "
+        "whole. Was: DuckDB TIME WITH TIME ZONE (UNKNOWN-mapped) rendered through "
+        "its varchar cast, which drops an offset's minutes when it has seconds: "
+        "12:00:00+05:00:30 printed `12:00:00+05:30`, exactly as 12:00:00+05:30 does "
+        "(offsets 18030 s and 19800 s; DuckDB's own `=` calls them different). A "
+        "FALSE MATCH, DuckDB to DuckDB and DuckDB to PostgreSQL."
+    ),
+    "COV-8": (
+        "FIXED 2026-11-03 - a sql_variant float or real renders its IEEE bits in "
+        "hex (`canonical_variant_text`). Was: style 3, which raised `Arithmetic "
+        "overflow error converting expression to data type nvarchar` for -0.0 and "
+        "for every negative double below 1e-99 (its text would be 24 characters), "
+        "killing the whole diff on an ordinary value - loud, not a false match - "
+        "and is not correctly rounded (1626983080611305.75 printed "
+        "`1.6269830806113057e+015`; the nearest 17 digits end in 8), so no rule "
+        "could state it."
+    ),
 }
 
 #: (engine, native, group) -> COV id, for disagreements the sweep tolerates.

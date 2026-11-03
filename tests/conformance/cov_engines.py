@@ -175,6 +175,105 @@ def max_bytes(n: int) -> Callable[[Val], bool]:
     return lambda v: v.value is None or len(v.value) <= n
 
 
+def width(n: int) -> Callable[[Val], bool]:
+    """Bit strings of exactly `n` digits (a bit(n) pads or refuses others)."""
+    return lambda v: v.value is None or len(v.value) == n
+
+
+def nonempty(v: Val) -> bool:
+    """Bit strings with at least one digit (DuckDB's BIT cannot be empty)."""
+    return v.value is None or len(v.value) > 0
+
+
+def is_network(v: Val) -> bool:
+    """inet values that are networks, which is all a cidr can hold."""
+    import ipaddress
+
+    if v.value is None:
+        return True
+    try:
+        ipaddress.ip_network(v.value, strict=True)
+    except ValueError:
+        return False
+    return True
+
+
+def pg_name_ok(v: Val) -> bool:
+    """Text a PostgreSQL `name` holds whole: 63 bytes, no NUL."""
+    return v.value is None or (len(v.value.encode()) <= 63 and "\x00" not in v.value)
+
+
+def finite_interval(v: Val) -> bool:
+    """Intervals other than PostgreSQL 17's infinities."""
+    return not isinstance(v.value, str)
+
+
+def interval_input(x: Any) -> Any:
+    """An interval (months, days, microseconds) as text both engines parse
+    into exactly those components; NULL and infinities as they are."""
+    if not isinstance(x, tuple):
+        return x
+    m, d, us = x
+    return f"{m} months {d} days {us} microseconds"
+
+
+def pg_shaped_literal(value: Any) -> str:
+    """A PostgreSQL array literal of a `ShapedList`: its dimensions, then its
+    elements nested to them - `[0:1][1:2]={{1,2},{3,4}}`."""
+    import re
+
+    from parity.dialects.base import ShapedList
+
+    if not isinstance(value, ShapedList):
+        return pg_array_literal(value)
+    lengths = [
+        int(u) - int(lo) + 1 for lo, u in re.findall(r"\[(-?\d+):(-?\d+)\]", value.dims)
+    ]
+    flat = pg_array_literal(value.items)[1:-1].split(",")
+
+    def nest(level: int, start: int) -> str:
+        """The braces of dimension `level` from element `start` on."""
+        if level == len(lengths) - 1:
+            return "{" + ",".join(flat[start : start + lengths[level]]) + "}"
+        step = 1
+        for n in lengths[level + 1 :]:
+            step *= n
+        return (
+            "{"
+            + ",".join(nest(level + 1, start + k * step) for k in range(lengths[level]))
+            + "}"
+        )
+
+    return value.dims + "=" + nest(0, 0)
+
+
+def pg_array_literal(items: Sequence[Any]) -> str:
+    """A one-dimensional PostgreSQL array literal, every element quoted -
+    bound as text, which the column's type parses: no element is spliced
+    into SQL, and no Python-side type guess is involved."""
+
+    def one(x: Any) -> str:
+        """One element, quoted and escaped; NULL bare."""
+        if x is None:
+            return "NULL"
+        if isinstance(x, bool):
+            text = "t" if x else "f"
+        elif isinstance(x, float):
+            if math.isnan(x):
+                text = "NaN"
+            elif math.isinf(x):
+                text = "Infinity" if x > 0 else "-Infinity"
+            else:
+                text = repr(x)
+        elif isinstance(x, tuple):
+            text = interval_input(x)
+        else:
+            text = str(x)  # int, Decimal, date, str
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    return "{" + ",".join(one(x) for x in items) + "}"
+
+
 def json_not(*texts: str) -> Callable[[Val], bool]:
     """JSON values other than these (an engine refuses them on load)."""
     return lambda v: v.value not in texts
@@ -326,14 +425,25 @@ class PostgresCov(CovEngine):
                     lambda v: v.value is None or abs(v.value) < 90071992547409,
                 ),
             ),
-            Native("interval", "pg_interval"),
-            Native("inet", "pg_inet"),
-            Native("bit(8)", "pg_bit"),
-            Native("integer[]", "pg_intarr"),
-            Native("text[]", "pg_textarr"),
             Native(f"{PG_SCHEMA}.{PREFIX}_mood", "pg_enum"),
-            Native("timetz", "pg_timetz"),
-            Native("name", "pg_name"),
+            Native("name", "str", pg_name_ok),
+            Native("bit(8)", "bits", width(8)),
+            Native("bit varying", "bits"),
+            Native("interval", "interval"),
+            Native("timetz", "timetz"),
+            Native("inet", "inet"),
+            Native("cidr", "inet", is_network),
+            Native("integer[]", "list_int"),
+            Native("text[]", "list_text"),
+            Native("date[]", "list_date"),
+            Native("numeric[]", "list_dec"),
+            Native("double precision[]", "list_float"),
+            Native("boolean[]", "list_bool"),
+            Native("interval[]", "list_interval"),
+            Native("integer[]", "list_shaped"),
+            # UNKNOWN: compared through ::text, escaped.
+            Native("int4range", "pg_range"),
+            Native("jsonb[]", "pg_jsonarr"),
         ]
 
     def bind(self, native: Native, v: Val) -> Any:
@@ -344,6 +454,12 @@ class PostgresCov(CovEngine):
             # As the text itself: Json(json.loads(...)) re-serialised it in
             # Python first, losing duplicate keys and number spellings.
             return (Jsonb if native.ddl == "jsonb" else Json)(v.value, dumps=lambda x: x)
+        if native.group == "list_shaped" and v.value is not None:
+            return pg_shaped_literal(v.value)
+        if native.group.startswith("list_") and v.value is not None:
+            return pg_array_literal(v.value)
+        if native.group == "interval":
+            return interval_input(v.value)
         return v.value
 
     def build(self, table, columns, rows):
@@ -376,36 +492,24 @@ class PostgresCov(CovEngine):
 
 
 PG_EXTRA: dict[str, list[Val]] = {
-    "pg_interval": [
-        Val("iv:<NULL>", None),
-        Val("iv:1 day", "1 day"),
-        Val("iv:24 hours", "24 hours"),
-        Val("iv:-1 us", "-00:00:00.000001"),
+    # Still UNKNOWN: ranges, and arrays of JSON. Each value distinct (`[1,2]`
+    # is `[1,3)` and jsonb `[1,2]` is `[1, 2]`: one value, rightly one text).
+    "pg_range": [
+        Val("rg:<NULL>", None),
+        Val("rg:[1,3)", "[1,3)"),
+        Val("rg:[1,4)", "[1,4)"),
+        Val("rg:empty", "empty"),
+        Val("rg:(,)", "(,)"),
+        Val("rg:(,1)", "(,1)"),
     ],
-    "pg_inet": [
-        Val("in:<NULL>", None),
-        Val("in:10.0.0.1", "10.0.0.1"),
-        Val("in:10.0.0.1/8", "10.0.0.1/8"),
-        Val("in:::1", "::1"),
-    ],
-    "pg_bit": [
-        Val("bt:<NULL>", None),
-        Val("bt:00000101", "00000101"),
-        Val("bt:10100000", "10100000"),
-    ],
-    "pg_intarr": [
-        Val("ia:<NULL>", None),
-        Val("ia:[]", []),
-        Val("ia:[1,2]", [1, 2]),
-        Val("ia:[None]", [None]),
-    ],
-    "pg_textarr": [
-        Val("ta:<NULL>", None),
-        Val("ta:['a,b']", ["a,b"]),
-        Val("ta:['a','b']", ["a", "b"]),
-        Val("ta:['NULL']", ["NULL"]),
-        Val("ta:[None]", [None]),
-        Val("ta:['\\\\N']", ["\\N"]),
+    "pg_jsonarr": [
+        Val("ja:<NULL>", None),
+        Val("ja:{}", "{}"),
+        Val('ja:{"{}"}', '{"{}"}'),
+        Val('ja:{"[1, 2]"}', '{"[1, 2]"}'),
+        Val('ja:{"[2, 1]"}', '{"[2, 1]"}'),
+        Val('ja:{"{}","[]"}', '{"{}","[]"}'),
+        Val("ja:{NULL}", "{NULL}"),
     ],
     "pg_enum": [
         Val("en:<NULL>", None),
@@ -413,12 +517,6 @@ PG_EXTRA: dict[str, list[Val]] = {
         Val("en:ok", "ok"),
         Val("en:Ok", "Ok"),
     ],
-    "pg_timetz": [
-        Val("tt:<NULL>", None),
-        Val("tt:12:00+05:45", "12:00:00+05:45"),
-        Val("tt:06:15+00", "06:15:00+00"),
-    ],
-    "pg_name": [Val("nm:<NULL>", None), Val("nm:abc", "abc"), Val("nm:\\N", "\\N")],
 }
 
 
@@ -476,11 +574,20 @@ class DuckDBCov(CovEngine):
             Native("BLOB", "bytes"),
             Native("JSON", "json"),
             Native("JSON", "json_forms"),
-            Native("INTERVAL", "pg_interval"),
-            Native("INTEGER[]", "pg_intarr"),
-            Native("VARCHAR[]", "pg_textarr"),
             Native(f"{PREFIX}_mood", "pg_enum"),
-            Native("BIT", "pg_bit"),
+            Native("BIT", "bits", nonempty),
+            Native("INTERVAL", "interval", finite_interval),
+            Native("TIME WITH TIME ZONE", "timetz"),
+            Native("INTEGER[]", "list_int"),
+            Native("VARCHAR[]", "list_text"),
+            Native("DATE[]", "list_date"),
+            Native("DECIMAL(18,7)[]", "list_dec"),
+            Native("DOUBLE[]", "list_float"),
+            Native("BOOLEAN[]", "list_bool"),
+            Native("INTERVAL[]", "list_interval"),
+            # UNKNOWN: compared through their varchar cast, escaped.
+            Native("INTEGER[][]", "duck_nested"),
+            Native("STRUCT(a INTEGER, b VARCHAR)", "duck_struct"),
         ]
 
     def bind(self, native: Native, v: Val) -> Any:
@@ -496,6 +603,10 @@ class DuckDBCov(CovEngine):
             return f"{day} (BC)" + (f" {rest}" if rest else "")
         if native.group == "uuid":
             return uuidlib.UUID(x)
+        if native.group == "interval":
+            return interval_input(x)
+        if native.group == "list_interval":
+            return [interval_input(i) for i in x]
         return x
 
     def build(self, table, columns, rows):
@@ -583,7 +694,9 @@ class MySQLCov(CovEngine):
             Native("blob", "bytes"),
             Native("json", "json"),
             Native("json", "json_forms"),
-            Native("bit(8)", "my_bit"),
+            Native("bit(8)", "bits", width(8)),
+            Native("bit(64)", "bits", width(64)),
+            Native("bit(1)", "bits", width(1)),
             Native("enum('sad','ok','Ok') collate utf8mb4_bin", "my_enum"),
             Native("year", "my_year"),
         ]
@@ -596,8 +709,10 @@ class MySQLCov(CovEngine):
             return None
         if native.group == "tstz":
             return x.astimezone(dt.timezone.utc).replace(tzinfo=None)
-        if native.group == "my_bit":
-            return bytes([int(x, 2)])
+        if native.group == "bits":
+            # As the big-endian bytes of the value: a str would be read as
+            # the characters '0' and '1'.
+            return int(x, 2).to_bytes((len(x) + 7) // 8, "big")
         if isinstance(x, Decimal):
             # The connector's Decimal binding keeps ~23 significant digits:
             # 0.00000049999999999999999999 was stored as 0.0000005. As text
@@ -641,7 +756,6 @@ class MySQLCov(CovEngine):
 
 
 MYSQL_EXTRA: dict[str, list[Val]] = {
-    "my_bit": PG_EXTRA["pg_bit"],
     "my_enum": PG_EXTRA["pg_enum"],
     "my_year": [Val("yr:<NULL>", None), Val("yr:1901", 1901), Val("yr:2155", 2155)],
 }
@@ -725,7 +839,7 @@ class MSSQLCov(CovEngine):
             Native("varbinary(max)", "bytes"),
             Native("varbinary(300)", "bytes"),
             Native("image", "bytes"),
-            Native("sql_variant", "ms_variant"),
+            Native("sql_variant", "variant"),
         ]
 
     def bind(self, native: Native, v: Val) -> Any:
@@ -742,6 +856,8 @@ class MSSQLCov(CovEngine):
             # range for SQL Server") though `date` holds 0001..9999; as ISO
             # text it binds and converts exactly.
             return x.isoformat()
+        if native.group == "variant":
+            return variant_bind(*x)
         return x
 
     def build(self, table, columns, rows):
@@ -753,13 +869,15 @@ class MSSQLCov(CovEngine):
         cur.execute(f"create table {q} ({cols})")
         cur.close()
         self.tables.append(q)
-        marks = ", ".join(["?"] * len(columns))
 
         def one(r: Sequence[Any]) -> None:
-            """Insert one row."""
+            """Insert one row; a `Cast` value through its own cast, so a
+            sql_variant column receives the base type it names."""
+            marks = ", ".join(x.sql if isinstance(x, Cast) else "?" for x in r)
+            params = [x.value if isinstance(x, Cast) else x for x in r]
             c = self.con.cursor()
             try:
-                c.execute(f"insert into {q} values ({marks})", list(r))
+                c.execute(f"insert into {q} values ({marks})", params)
             finally:
                 c.close()
 
@@ -799,15 +917,65 @@ class MSSQLCov(CovEngine):
             master.close()
 
 
-MSSQL_EXTRA: dict[str, list[Val]] = {
-    "ms_variant": [
-        Val("va:<NULL>", None),
-        Val("va:int 1", 1),
-        Val("va:str 1", "1"),
-        Val("va:float 1.5", 1.5),
-        Val("va:dec 1.5", Decimal("1.5")),
-    ],
-}
+MSSQL_EXTRA: dict[str, list[Val]] = {}
+
+
+@dataclass(frozen=True)
+class Cast:
+    """A bound value with the SQL that casts it: `cast(? as money)`."""
+
+    sql: str
+    value: Any
+
+
+def variant_bind(base: str, value: Any) -> Cast:
+    """A sql_variant value as its base type: the parameter is cast to it in
+    the INSERT, from the driver's own type or from exact text."""
+    text = "cast(cast(? as nvarchar(4000)) as {})"
+
+    def clock(ns: int, digits: int) -> str:
+        """`HH:MM:SS[.f]` of nanoseconds since midnight, `digits` places."""
+        seconds, frac = divmod(ns, 1_000_000_000)
+        out = f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        return out + ("." + f"{frac:09d}"[:digits] if digits else "")
+
+    if base in ("tinyint", "smallint", "int", "bigint", "bit", "float", "real"):
+        return Cast(f"cast(? as {base})", value)
+    if base in ("decimal", "numeric"):
+        t = value.as_tuple()
+        scale = max(0, -t.exponent)
+        precision = max(len(t.digits), scale, 1)
+        return Cast(text.format(f"{base}({precision},{scale})"), format(value, "f"))
+    if base in ("money", "smallmoney"):
+        return Cast(text.format(base), format(value, "f"))
+    if base in ("nvarchar", "varchar"):
+        return Cast(f"cast(? as {base}(100))", value)
+    if base in ("nchar", "char"):
+        return Cast(f"cast(? as {base}({len(value)}))", value)
+    if base == "date":
+        return Cast(text.format("date"), value.isoformat())
+    if base in ("datetime", "smalldatetime", "datetime2"):
+        d, ns = value
+        digits = {"datetime": 3, "smalldatetime": 0, "datetime2": 7}[base]
+        target = "datetime2(7)" if base == "datetime2" else base
+        return Cast(text.format(target), f"{d.isoformat()} {clock(ns, digits)}")
+    if base == "datetimeoffset":
+        d, ns, offset = value
+        sign = "-" if offset < 0 else "+"
+        hh, mm = divmod(abs(offset), 60)
+        return Cast(
+            text.format("datetimeoffset(7)"),
+            f"{d.isoformat()} {clock(ns, 7)} {sign}{hh:02d}:{mm:02d}",
+        )
+    if base == "time":
+        return Cast(text.format("time(7)"), clock(value, 7))
+    if base == "binary":
+        return Cast(f"cast(? as binary({len(value)}))", value)
+    if base == "varbinary":
+        return Cast("cast(? as varbinary(100))", value)
+    if base == "uniqueidentifier":
+        return Cast(text.format("uniqueidentifier"), value)
+    raise ValueError(f"no binder for sql_variant base type {base!r}")
 
 
 class BigQueryCov(CovEngine):
@@ -1030,5 +1198,25 @@ class SnowflakeCov(CovEngine):
             self.w.close()
 
 
+#: Still UNKNOWN on DuckDB: a nested list and a struct.
+DUCK_EXTRA: dict[str, list[Val]] = {
+    "duck_nested": [
+        Val("dn:<NULL>", None),
+        Val("dn:[]", []),
+        Val("dn:[[]]", [[]]),
+        Val("dn:[[1, 2]]", [[1, 2]]),
+        Val("dn:[[1], [2]]", [[1], [2]]),
+        Val("dn:[None]", [None]),
+        Val("dn:[[None]]", [[None]]),
+    ],
+    "duck_struct": [
+        Val("ds:<NULL>", None),
+        Val("ds:{a: 1, b: 'x'}", {"a": 1, "b": "x"}),
+        Val("ds:{a: None, b: None}", {"a": None, "b": None}),
+        Val("ds:{a: 1, b: 'NULL'}", {"a": 1, "b": "NULL"}),
+        Val("ds:{a: 1, b: \"x', b: 'y\"}", {"a": 1, "b": "x', b: 'y"}),
+    ],
+}
+
 #: Ad hoc values for engine-specific UNKNOWN types, by group.
-EXTRA: dict[str, list[Val]] = {**PG_EXTRA, **MYSQL_EXTRA, **MSSQL_EXTRA}
+EXTRA: dict[str, list[Val]] = {**PG_EXTRA, **MYSQL_EXTRA, **MSSQL_EXTRA, **DUCK_EXTRA}

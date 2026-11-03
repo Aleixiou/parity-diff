@@ -468,6 +468,16 @@ class MySQLDialect(Dialect):
             return f"cast({self.quote(column.name)} as char)"
         return super().sample_select(column)
 
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """A BIT(n) arrives as an unsigned integer, which has lost the width
+        that is part of the value; restore it from the declared `bit(n)`, so
+        the reference reads the n digits the column holds."""
+        if column.logical_type is LogicalType.BITS and isinstance(value, int):
+            width = re.search(r"\((\d+)\)", column.raw_type)
+            digits = format(value, "b")
+            return digits.rjust(int(width.group(1)), "0") if width else digits
+        return value
+
     def json_semantics(self, column: Column) -> str:
         """MySQL's JSON normal form."""
         return (
@@ -610,7 +620,7 @@ class MySQLDialect(Dialect):
             # The stored bytes - SRID, then WKB - in full: exact, and
             # MySQL-to-MySQL only. ST_AsText would round the coordinates.
             expr = self._binary_text(column, c, prefix=False)
-        elif raw == "bit":
+        elif t is LogicalType.BITS:
             expr = self._bit_text(column, c)
         else:
             # STRING, and every unmapped type (json, time, ...) through its
@@ -886,6 +896,10 @@ def map_type_mysql(raw: str) -> LogicalType:
         return LogicalType.BINARY
     if t == "json":
         return LogicalType.JSON
+    if t == "bit":
+        # BIT(n), a bit string of n digits - not a boolean (MySQL's BOOLEAN
+        # is TINYINT(1)), and rendered as PostgreSQL renders bit(n).
+        return LogicalType.BITS
     if t in {
         "char",
         "varchar",
