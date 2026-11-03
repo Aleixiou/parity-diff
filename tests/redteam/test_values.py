@@ -405,11 +405,6 @@ def _mentions_precision(warnings: list[str]) -> bool:
 
 
 @pytest.mark.parametrize("other", ["duckdb", "postgres"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A7: DuckDB TIMESTAMP_NS loses its nanoseconds in strftime('%f') "
-    "and, unlike SQL Server's datetime2(7), no caveat says so",
-)
 def test_rt_a7_duckdb_nanoseconds_vanish_silently(engines, other):
     """SQL Server's dialect warns that its 100 ns ticks are truncated; DuckDB's
     TIMESTAMP_NS loses three digits with no word in the output (section 8).
@@ -466,11 +461,6 @@ def test_rt_a8_mysql_binary_not_utf8_is_null(engines, typ, va, vb):
 
 
 @pytest.mark.parametrize("other", ["mssql", "duckdb"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A9: mssql-python drops trailing NUL characters from nvarchar(max) "
-    "results, so 'a\\x00' fetches as 'a' and a real difference is discarded",
-)
 def test_rt_a9_mssql_trailing_nul_dropped_on_fetch(engines, other):
     """The checksums *do* differ (the server hashes 'a\\x00' correctly), the
     range is downloaded, and then the Python comparison of the fetched text
@@ -566,11 +556,6 @@ def test_rt_a11_mssql_lone_surrogate_matches_replacement_char(engines):
 # =====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A12: DuckDB UNION(n int, s varchar) renders 1::int and '1' as "
-    "the same text '1'",
-)
 def test_rt_a12_duckdb_union_tag_is_lost(engines):
     ddl = "id int, u union(n int, s varchar)"
     r = run_pair(
@@ -970,12 +955,6 @@ def test_bigquery_bytes_are_distinct_and_not_null(engines):
     ],
     ids=["int_vs_nvarchar", "float_vs_decimal"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A16: SQL Server sql_variant renders through cast(nvarchar(max)), "
-    "which drops the base type, so int 1 and N'1' (or float 1.5 and decimal "
-    "1.5) are the same text - a false match on one engine",
-)
 def test_rt_a16_mssql_sql_variant_type_is_lost(engines, va, vb):
     """The sibling of RT-A12 (DuckDB UNION). The 'unmapped types' warning says
     raw text "may differ across engines"; here two different values on the
@@ -1041,29 +1020,37 @@ def test_rt_a17_mysql_row_over_max_allowed_packet_is_invisible(engines):
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("a", "b"),
-    [
-        (
-            ("duckdb", "k decimal(18,8), x int", [("1.00000001", 1)]),
-            ("postgres", "k numeric(18,8), x int", [("1.00000002", 1)]),
-        ),
-        (
-            ("duckdb", "k double, x int", [(0.1 + 0.2, 1)]),
-            ("postgres", "k float8, x int", [(0.3, 1)]),
-        ),
-        (
-            ("duckdb", "k timestamp_ns, x int", [("2024-01-01 00:00:00.000000001", 1)]),
-            ("duckdb", "k timestamp_ns, x int", [("2024-01-01 00:00:00.000000002", 1)]),
-        ),
-    ],
-    ids=["decimal8", "double", "timestamp_ns"],
-)
-@pytest.mark.xfail(
+_RT_A18 = pytest.mark.xfail(
     strict=True,
     reason="RT-A18: a hashed key is matched by its canonical text, which rounds "
     "DECIMAL/FLOAT to 6 places and timestamps to microseconds, so two different "
     "keys are matched as one row and the pair reads identical",
+)
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        pytest.param(
+            ("duckdb", "k decimal(18,8), x int", [("1.00000001", 1)]),
+            ("postgres", "k numeric(18,8), x int", [("1.00000002", 1)]),
+            marks=_RT_A18,
+            id="decimal8",
+        ),
+        pytest.param(
+            ("duckdb", "k double, x int", [(0.1 + 0.2, 1)]),
+            ("postgres", "k float8, x int", [(0.3, 1)]),
+            marks=_RT_A18,
+            id="double",
+        ),
+        # Fixed with RT-A7: a TIMESTAMP_NS renders its nanoseconds when it
+        # has any, so the two keys are two identities.
+        pytest.param(
+            ("duckdb", "k timestamp_ns, x int", [("2024-01-01 00:00:00.000000001", 1)]),
+            ("duckdb", "k timestamp_ns, x int", [("2024-01-01 00:00:00.000000002", 1)]),
+            id="timestamp_ns",
+        ),
+    ],
 )
 def test_rt_a18_rounded_key_identity_merges_distinct_keys(engines, a, b, request):
     """'Comparing floats and decimals at 6 decimal places' is printed, but it
@@ -1100,12 +1087,6 @@ def test_rt_a18_unique_decimal_key_refused_as_duplicate(engines):
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="RT-A19: HUGEINT keys are bisected unhashed, and `wide_int` is hugeint "
-    "itself, so `k - lo` overflows INT128 once the key span passes 2^127",
-)
 def test_rt_a19_duckdb_hugeint_key_span_overflows(engines):
     """The int64 overflow of CLAUDE.md 4.5 again, one type wider: widening to
     hugeint is no widening for a hugeint column. A crash, not a wrong answer.

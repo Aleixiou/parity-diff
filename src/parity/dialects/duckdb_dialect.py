@@ -20,7 +20,7 @@ from parity.dialects.base import (
     float_zero_text,
     sql_literal,
 )
-from parity.types import Column, LogicalType
+from parity.types import Column, KeySpec, LogicalType
 
 
 def duckdb_path(connection_string: str) -> str:
@@ -63,6 +63,7 @@ class DuckDBDialect(Dialect):
             # An in-memory database holds no user data to protect, and a
             # read-only in-memory database is empty by definition.
             self._conn = duckdb.connect(":memory:")
+            self._no_extension_downloads()
             self._pin_utc()
             return
         if not os.path.exists(path):
@@ -73,7 +74,26 @@ class DuckDBDialect(Dialect):
         # connection means no bug in query building can ever write to a user's
         # database. It also lets several parity runs share one file.
         self._conn = duckdb.connect(path, read_only=True)
+        self._no_extension_downloads()
         self._pin_utc()
+
+    def _no_extension_downloads(self) -> None:
+        """Never fetch or load an extension behind the user's back (RT-F13).
+
+        CLAUDE.md section 6: no network calls, ever. With autoinstall on - the
+        default - a query touching a feature from an uninstalled extension
+        downloads it from extensions.duckdb.org, in C++ below any Python
+        socket guard; a view over an `https://` or `s3://` file in the user's
+        database is enough. With autoload off as well, an extension installed
+        earlier is not loaded on demand either, so such a view fails loudly
+        instead of reaching out to the network. Set on the connection rather
+        than in `duckdb.connect(config=...)`, which DuckDB refuses for a file
+        another connection in the process opened with a different config.
+        The extensions the comparison itself uses (ICU for the UTC pin, JSON)
+        are built into the Python wheel and need neither.
+        """
+        self._conn.execute("set autoinstall_known_extensions = false")
+        self._conn.execute("set autoload_known_extensions = false")
 
     def _pin_utc(self) -> None:
         """Render `timestamptz` in UTC regardless of the machine's timezone.
@@ -185,6 +205,38 @@ class DuckDBDialect(Dialect):
             expr = f"strftime({c}, '%Y-%m-%d')"
         elif t is LogicalType.TIMESTAMP:
             expr = f"strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"
+            if column.raw_type.upper().startswith("TIMESTAMP_NS"):
+                # `%f` is microseconds, so .000000001 and .000000999 rendered
+                # alike, silently (RT-A7/C1/E7). A whole-microsecond value
+                # still renders exactly as before - the six digits every other
+                # engine prints, so no checksum moves and it still matches a
+                # microsecond column elsewhere. Any other value appends its
+                # three nanosecond digits: exact against another TIMESTAMP_NS,
+                # and against an engine that holds only microseconds a
+                # *reported* difference, which it is - that engine cannot hold
+                # the value. `%f` floors (pre-1970 included), so the remainder
+                # is taken non-negative to match. Built from epoch_ns rather
+                # than strftime's `%n`, which older DuckDB releases lack.
+                ns = f"((epoch_ns({c}) % 1000) + 1000) % 1000"
+                expr = (
+                    f"case when {ns} = 0 then {expr} "
+                    f"else {expr} || lpad(cast({ns} as varchar), 3, '0') end"
+                )
+        elif column.raw_type.upper().startswith("UNION("):
+            # A plain varchar cast prints the member value and drops its tag,
+            # so UNION(n int, s varchar) rendered 1::int and '1' alike - a
+            # false match (RT-A12/C14). JSON carries both: `{"n":1}` against
+            # `{"s":"1"}`, the tag as a quoted key and a string in quotes.
+            expr = f"cast(cast({c} as json) as varchar)"
+        elif column.raw_type.upper() == "VARIANT":
+            # The same tag loss: a VARIANT INTEGER 1 and VARCHAR '1' both cast
+            # to `1`. `variant_typeof` names the stored type and JSON keeps a
+            # string's quotes (a DATE and the VARCHAR spelling it print the
+            # same JSON, which the type name tells apart).
+            expr = (
+                f"case when {c} is not null then "
+                f"variant_typeof({c}) || ':' || cast(cast({c} as json) as varchar) end"
+            )
         else:
             expr = f"cast({c} as varchar)"
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
@@ -205,8 +257,69 @@ class DuckDBDialect(Dialect):
 
     def wide_int(self, expr: str) -> str:
         """Widen an integer past 64 bits, before any arithmetic touches it."""
-        # hugeint is 128-bit, which the key offset cannot overflow.
+        # hugeint is 128-bit, which a 64-bit key offset cannot overflow. A
+        # HUGEINT key is the exception, handled by `bucket_expr`.
         return f"cast(({expr}) as hugeint)"
+
+    def bucket_expr(self, key: KeySpec, k: str, lo: int, hi: int, n_segments: int) -> str:
+        """The shared bucket expression, unless it would overflow INT128.
+
+        `wide_int` is hugeint, which is no widening for a HUGEINT key: `k - lo`
+        passes 2^127 once the key span does, and `(k - lo) * n` once the span
+        passes 2^127 / n - both raw OutOfRange crashes naming no side (RT-A19,
+        RT-B13). DuckDB has nothing wider (DECIMAL stops at 38 digits, short of
+        2^128), so for such a span the same floor is computed without forming
+        that product.
+
+        With s = hi - lo = n*D + R (D, R computed here in Python), the bucket
+        `floor(off * n / s)` is the largest q with ceil(q * s / n) <= off, and
+        ceil(q * s / n) = q*D + ceil(q*R / n). Every term fits UHUGEINT: off
+        < s <= 2^128, q*D <= off, q*R < n^2. A span this wide makes D vastly
+        larger than n, and then the answer is q0 = min(n - 1, off // D) or one
+        less - since q*D <= ceil(q*s/n) <= q*(D + 1), the true q lies between
+        off // (D + 1) and off // D, which differ by at most one once off <
+        D*(D + 1). So one comparison decides it, and the result is exactly
+        what the shared expression would give, and what `bucket_bounds`
+        inverts - for every key, which `test_engine.py` style property tests
+        check against Python's integers.
+        """
+        span = hi - lo
+        if (
+            key.hashed
+            or key.columns[0].raw_type.upper() != "HUGEINT"
+            or span * n_segments <= 2**127 - 1
+        ):
+            # Every key's offset is below the span, so neither `k - lo` nor
+            # its product with n can pass INT128: the shared SQL, unchanged.
+            return super().bucket_expr(key, k, lo, hi, n_segments)
+        d, r = divmod(span, n_segments)
+        if d <= n_segments:
+            # Unreachable for any sane bisection factor (D > 2^127 / n^2), but
+            # the one-step correction below relies on it, so never guess.
+            raise self._err(
+                f"key {key.label}: a key span of {span} cannot be split into "
+                f"{n_segments} buckets exactly; lower --bisection-factor"
+            )
+
+        def u(value: int) -> str:
+            """A UHUGEINT constant, via a string: past 2^127 a bare literal
+            would not parse as one."""
+            return f"cast('{value}' as uhugeint)"
+
+        # off = k - lo, in UHUGEINT without ever forming an out-of-range value:
+        # for k >= 0 add |lo| (or subtract lo) as unsigned; for k < 0 (only
+        # possible when lo < 0 too) `k - lo` lies in [0, 2^127) as HUGEINT.
+        if lo < 0:
+            off = (
+                f"(case when {k} >= 0 then cast({k} as uhugeint) + {u(-lo)} "
+                f"else cast({k} - ({lo}) as uhugeint) end)"
+            )
+        else:
+            off = f"(cast({k} as uhugeint) - {u(lo)})"
+        q0 = f"least({u(n_segments - 1)}, {off} // {u(d)})"
+        # ceil(q0*R / n) > off - q0*D  <=>  q0 is one too many.
+        too_far = f"({q0} * {u(r)} + {u(n_segments - 1)}) // {u(n_segments)} > {off} - {q0} * {u(d)}"
+        return f"cast({q0} - case when {too_far} then 1 else 0 end as hugeint)"
 
     def sum_wide(self, expr: str) -> str:
         """Sum row hashes without overflowing, and return 0 for an empty group."""

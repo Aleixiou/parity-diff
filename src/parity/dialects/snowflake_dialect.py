@@ -27,11 +27,32 @@ The Snowflake-specific decisions, each confirmed by that run:
 - **One-snapshot isolation is not available.** Snowflake offers only READ
   COMMITTED, so unlike PostgreSQL the walk cannot be pinned to a single
   snapshot; a source table mutating mid-diff can produce an inconsistent
-  result. This is a genuine limitation, documented rather than hidden.
+  result. This is a genuine limitation, documented rather than hidden, and
+  `caveats` prints it on every run.
+
+Changed after that run, from Snowflake's documentation alone and **not yet
+verified live** (no account was available; each needs one query to confirm):
+
+- **Client telemetry is switched off** at login (the
+  `CLIENT_TELEMETRY_ENABLED` session parameter, plus the connector's own
+  switches): CLAUDE.md section 6.
+- **TIMESTAMP_TZ / TIMESTAMP_LTZ are instants** (`Column.tz_aware`), and a
+  TIMESTAMP_TZ is moved to UTC before it is printed: `TO_CHAR` prints it in
+  its *stored* offset, which the session TIMEZONE pin does not touch, so two
+  instants hours apart could print the same text.
+- **Timestamps finer than microseconds get a caveat**, since FF6 is what
+  every other engine can compare.
+- **VARIANT / OBJECT / ARRAY render as `TYPEOF` plus `TO_JSON`**, which keeps
+  a string's quotes: a plain varchar cast prints the number 1 and the string
+  "1" alike.
+- **`int_div` divides an exact multiple**, as SQL Server's does: NUMBER
+  division rounds its quotient to 6 places, so `floor(n / d)` could put a key
+  one bucket high.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -74,6 +95,13 @@ class SnowflakeDialect(Dialect):
             self.default_schema = schema
 
         self._conn = snowflake.connector.connect(
+            # CLAUDE.md section 6: no telemetry, ever. The connector reports
+            # driver usage (imported packages, connection shape) to Snowflake
+            # unless told not to, and does so *during* connect - so the session
+            # parameter has to ride in the login request; setting it afterwards
+            # would be too late. Not verified live.
+            session_parameters={"CLIENT_TELEMETRY_ENABLED": False},
+            log_imported_packages_in_telemetry=False,
             account=url.hostname,
             user=unquote(url.username) if url.username else None,
             password=unquote(url.password) if url.password else None,
@@ -83,6 +111,8 @@ class SnowflakeDialect(Dialect):
             role=opt("role"),
             autocommit=True,
         )
+        # Belt and braces: the client-side switch, for anything logged later.
+        self._conn.telemetry_enabled = False
         cur = self._conn.cursor()
         try:
             # Timestamps render through this; pin it so two accounts in
@@ -115,7 +145,7 @@ class SnowflakeDialect(Dialect):
         """
         schema, name = self.split_table(table, self.default_schema)
         rows = self.query(
-            "select column_name, data_type, numeric_scale "
+            "select column_name, data_type, numeric_scale, datetime_precision "
             "from information_schema.columns "
             f"where table_schema = {sql_literal(schema)} "
             f"and table_name = {sql_literal(name)} "
@@ -123,10 +153,7 @@ class SnowflakeDialect(Dialect):
         )
         if not rows:
             raise self._err(self._not_found(table, schema, name))
-        return [
-            Column(str(r[0]), map_type_snowflake(str(r[1]), r[2]), str(r[1]))
-            for r in rows
-        ]
+        return [_column(str(r[0]), str(r[1]), r[2], r[3]) for r in rows]
 
     def quote(self, identifier: str) -> str:
         """Wrap an identifier in double quotes, doubling any it contains.
@@ -137,6 +164,34 @@ class SnowflakeDialect(Dialect):
         names `columns()` read back.
         """
         return '"' + identifier.replace('"', '""') + '"'
+
+    def caveats(self, columns: Sequence[Column]) -> list[str]:
+        """What makes this side's comparison less than exact, for the output.
+
+        CLAUDE.md section 8: the gaps this module's docstring admits to must
+        reach the output too, as SQL Server's dialect does for the same two.
+        """
+        out = [
+            (
+                "Snowflake offers only READ COMMITTED, so each query of the walk "
+                "sees the table as of its own start, not one snapshot: rows written "
+                "during the diff can be reported as differences that never existed "
+                "at one point in time, or missed. Diff a quiet table or a clone for "
+                "a single-snapshot result"
+            )
+        ]
+        fine = sorted(
+            c.name
+            for c in columns
+            if c.logical_type is LogicalType.TIMESTAMP and _sub_micro(c.raw_type)
+        )
+        if fine:
+            out.append(
+                f"columns {fine} can hold nanoseconds; they are compared at "
+                "microseconds (FF6: the digits past the sixth are dropped), so a "
+                "difference below one microsecond is not seen"
+            )
+        return out
 
     # ----------------------------------------------------------- rendering
 
@@ -182,8 +237,24 @@ class SnowflakeDialect(Dialect):
         elif t is LogicalType.DATE:
             expr = f"to_char({c}, 'YYYY-MM-DD')"
         elif t is LogicalType.TIMESTAMP:
-            # FF6 is microseconds, matching the other engines' six digits.
+            # FF6 is microseconds, matching the other engines' six digits;
+            # `caveats` says so when the column holds more.
+            if _base(column.raw_type) == "TIMESTAMP_TZ":
+                # A TIMESTAMP_TZ prints in its own stored offset, which the
+                # session TIMEZONE pin does not move (it governs LTZ only), so
+                # 12:00 +00:00 and 12:00 +05:00 - instants five hours apart -
+                # would print alike. Move it to UTC first; the two-argument
+                # form converts an instant. From the docs, not verified live.
+                c = f"convert_timezone('UTC', {c})"
             expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
+        elif _base(column.raw_type) in ("VARIANT", "OBJECT", "ARRAY"):
+            # A plain varchar cast of a VARIANT prints a string without its
+            # JSON quotes, so the number 1 and the string "1" render alike - a
+            # false match on the very type semi-structured data lands in.
+            # TO_JSON keeps the quotes, and TYPEOF keeps what JSON cannot say
+            # (a TIMESTAMP and the VARCHAR spelling it print the same JSON).
+            # From the docs, not verified live.
+            expr = f"typeof({c}) || ':' || to_json({c})"
         else:
             expr = f"cast({c} as varchar)"
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
@@ -198,13 +269,18 @@ class SnowflakeDialect(Dialect):
         return f"floor(md5_number_upper64({text_expr}) / 16)"
 
     def int_div(self, numerator: str, denominator: str) -> str:
-        """Truncating integer division.
+        """Exact truncating division on NUMBER operands - never a bare `/`.
 
-        Operands are NUMBER (via `wide_int`), so `/` is exact decimal and
-        `floor` truncates exactly for the non-negative operands used here -
-        unlike a float `/`, which CLAUDE.md 4.5 warns loses precision.
+        Snowflake gives a NUMBER(38,0) / NUMBER(38,0) quotient six decimal
+        places and *rounds* it (`2/3` is 0.666667), so `floor(n / d)` turns a
+        quotient of q.9999996 into q + 1 and the row lands in the next bucket
+        on this side only - the flaw SQL Server's `int_div` had. `n - mod(n,
+        d)` is an exact multiple of `d`, so its quotient is an integer and
+        nothing can round; the operands are non-negative, so this is floor.
+        From the docs, not verified live.
         """
-        return f"floor(({numerator}) / ({denominator}))"
+        n, d = f"({numerator})", f"({denominator})"
+        return f"cast(({n} - mod({n}, {d})) / {d} as number(38,0))"
 
     def wide_int(self, expr: str) -> str:
         """Widen past 64 bits before arithmetic. NUMBER(38,0) holds 38 digits,
@@ -217,6 +293,46 @@ class SnowflakeDialect(Dialect):
         NUMBER(38,0) is far beyond any row count times 2^60.
         """
         return f"coalesce(sum(cast(({expr}) as number(38,0))), 0)"
+
+
+def _base(raw: str) -> str:
+    """The type name without parameters, upper case: `TIMESTAMP_TZ(9)` ->
+    `TIMESTAMP_TZ`."""
+    return raw.upper().split("(")[0].strip()
+
+
+def _sub_micro(raw: str) -> bool:
+    """Whether a timestamp type can hold digits past microseconds.
+
+    `_column` folds the precision in (`TIMESTAMP_NTZ(9)`). Without one the
+    answer is yes: Snowflake's default fractional precision is 9.
+    """
+    inside = raw.partition("(")[2].rstrip(")").strip()
+    return not inside.isdigit() or int(inside) > 6
+
+
+def _column(name: str, raw: str, numeric_scale: Any, precision: Any) -> Column:
+    """Build a Column from one information_schema row.
+
+    Marks TIMESTAMP_TZ and TIMESTAMP_LTZ as instants and TIMESTAMP_NTZ as
+    naive. None of the three says `with time zone`, which is all the engine
+    can otherwise go on, so every Snowflake timestamp read as naive: no warning
+    for NTZ against a PostgreSQL timestamptz, a false one for TZ against it.
+    A timestamp's fractional precision is folded into `raw_type`, so `caveats`
+    can tell a TIMESTAMP(9) from a TIMESTAMP(6).
+    """
+    base = _base(raw)
+    tz: bool | None = None
+    if base in ("TIMESTAMP_TZ", "TIMESTAMP_LTZ"):
+        tz = True
+    elif base in ("TIMESTAMP_NTZ", "DATETIME"):
+        tz = False
+    if base.startswith("TIMESTAMP") and "(" not in raw and precision is not None:
+        try:
+            raw = f"{raw}({int(precision)})"
+        except (TypeError, ValueError):
+            pass
+    return Column(name, map_type_snowflake(raw, numeric_scale), raw, tz_aware=tz)
 
 
 def map_type_snowflake(raw: str, numeric_scale: Any) -> LogicalType:

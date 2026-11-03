@@ -23,11 +23,14 @@ from parity.dialects.base import Dialect, get_dialect
 from parity.dialects.bigquery_dialect import BigQueryDialect
 from parity.dialects.duckdb_dialect import DuckDBDialect
 from parity.dialects.mssql_dialect import (
+    HASH_GROUP_FROM,
     INVALID_UTF16_MARKER,
     MSSQL_FLOAT_MAX_SCALE,
     SQLServerDialect,
     _column,
+    is_single_select,
     map_type_mssql,
+    mssql_login_timeout,
     parse_mssql_url,
 )
 from parity.dialects.mysql_dialect import MySQLDialect
@@ -139,7 +142,7 @@ def _utf16_safe(expr: str) -> str:
             "mssql://u:p@h:1500/wh?instance=I&application_intent=readonly&login_timeout=5",
             (
                 "Server={h\\I,1500};Database={wh};UID={u};PWD={p};"
-                "ApplicationIntent={readonly};LoginTimeout={5}"
+                "ApplicationIntent={readonly}"
             ),
             "wh",
         ),
@@ -149,6 +152,17 @@ def _utf16_safe(expr: str) -> str:
 def test_connection_strings_become_braced_odbc_strings(url, odbc, database):
     """The grammar documented in the README, including its edge cases."""
     assert parse_mssql_url(url) == (odbc, database)
+
+
+def test_login_timeout_is_the_driver_argument_not_an_odbc_keyword():
+    """RT-F6: mssql-python rejects `LoginTimeout` in the connection string, so
+    `login_timeout` becomes `connect(timeout=...)` and stays out of it."""
+    url = "mssql://u:p@h/wh?login_timeout=7"
+    assert "imeout" not in parse_mssql_url(url)[0]
+    assert mssql_login_timeout(url) == 7
+    assert mssql_login_timeout("mssql://u:p@h/wh") == 0
+    with pytest.raises(ValueError, match="whole number"):
+        mssql_login_timeout("mssql://u:p@h/wh?login_timeout=soon")
 
 
 @pytest.mark.parametrize(
@@ -193,7 +207,7 @@ def fake_driver(monkeypatch):
     holder: list[FakeConn] = []
     module = types.ModuleType("mssql_python")
 
-    def connect(odbc, autocommit):
+    def connect(odbc, autocommit, timeout=0):
         """Record how the driver was called."""
         holder[0].odbc, holder[0].opened_autocommit = odbc, autocommit
         return holder[0]
@@ -257,11 +271,31 @@ def test_query_refuses_anything_but_select():
         "  insert into t values (1)",
         "exec sp_who",
         "with x as (select 1) delete from t",
+        # RT-F12: writes that *start* with select.
+        "select * into copy from t",
+        "SELECT a INTO #tmp FROM t",
+        "select 1; drop table t",
+        "select 1\ndrop table t",
+        "select 1 -- comment",
+        "select 1 /* x */",
+        "select [a] from t; exec('drop table t')",
+        "select 'unterminated",
+        "select [unterminated",
+        "select 1 waitfor delay '0:0:5'",
+        "select * from openrowset('SQLNCLI', 'x', 'y')",
+        'select "a" from t',
     ):
-        with pytest.raises(ValueError, match="non-SELECT"):
+        with pytest.raises(ValueError, match="single SELECT"):
             d.query(sql)
     assert d._conn.calls == []
     assert d.query("  SELECT 1") == []
+    # Identifiers and literals may hold any of those words and characters:
+    # they are the user's data, not the statement.
+    for sql in (
+        "select [into], [a;b], [x]]--y] from [drop] where [c] = N'select; drop'",
+        "select N'it''s -- /* into */' from [t]",
+    ):
+        assert d.query(sql) == []
 
 
 def test_query_turns_the_float_refusal_into_an_error_naming_the_side():
@@ -507,6 +541,7 @@ def test_checksum_and_stats_queries_use_t_sql_spellings():
     bucket = d.int_div(f"({d.wide_int('[id]')} - (1)) * 4", "(99)")
     assert bucket.startswith("cast((((cast(([id]) as decimal(38,0)) - (1)) * 4) - ")
     assert sql.startswith(f"select {bucket} as seg, count_big(*), ")
+    # Narrow: exactly the shared shape; no hint (RT-C8 hints wide ones only).
     assert sql.endswith(f"group by {bucket}")
     assert "group by 1" not in sql
     d.key_stats("s.t", INT_KEY)
@@ -557,7 +592,13 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     d.key_stats("s.t", TEXT_KEY)
     identity = d.key_identity(TEXT_KEY)
     assert f"count(*), count({identity}), count(distinct {identity}) from" in seen[-1]
-    assert d.caveats([Column("t", LogicalType.TIMESTAMP, "datetime2(7)")]) == []
+    notes = d.caveats([Column("t", LogicalType.TIMESTAMP, "datetime2(7)")])
+    if isinstance(d, SnowflakeDialect):
+        # Snowflake reports its own READ COMMITTED gap on every run (RT-D7),
+        # and its own sub-microsecond caveat for a 7-digit precision (RT-C7).
+        assert "READ COMMITTED" in notes[0] and "100-nanosecond" not in str(notes)
+    else:
+        assert notes == []
 
 
 def test_the_engine_prints_a_dialect_caveat_naming_the_side():
@@ -576,3 +617,38 @@ def test_the_engine_prints_a_dialect_caveat_naming_the_side():
     assert result.identical
     assert "side A (fake): saw ['id', 'v']" in result.warnings
     assert not [w for w in result.warnings if w.startswith("side B")]
+
+
+# ------------------------------------------------- wide tables (RT-C8)
+
+
+def test_only_a_wide_checksum_query_is_hash_aggregated():
+    """From HASH_GROUP_FROM columns the query asks for a hash aggregate, whose
+    worktable holds no per-column intermediates; below it the SQL is unchanged
+    (the hint costs mixed-type tables the expression-services limit)."""
+    d = _d()
+
+    def cols(n):
+        return [Column(f"c{i}", LogicalType.INTEGER, "int") for i in range(n)]
+
+    narrow = d._segment_sql("s.t", INT_KEY, cols(HASH_GROUP_FROM - 2), 1, 100, 4)
+    wide = d._segment_sql("s.t", INT_KEY, cols(HASH_GROUP_FROM - 1), 1, 100, 4)
+    assert "option" not in narrow
+    assert wide.endswith(" option (hash group)")
+    assert is_single_select(wide)
+
+
+def test_a_query_too_large_for_sql_server_names_the_side_and_table():
+    """Either server limit becomes an error naming side, table and the way out."""
+    for raw in (
+        (
+            "[SQL Server]Cannot create a row of size 10490 which is greater "
+            "than the allowable maximum row size of 8060."
+        ),
+        "[SQL Server]Internal error: An expression services limit has been reached.",
+    ):
+        d = _d(error=RuntimeError(raw))
+        with pytest.raises(ValueError) as caught:
+            d.segment_checksums("s.wide", INT_KEY, [], 1, 100, 4)
+        msg = str(caught.value)
+        assert "[side A: mssql]" in msg and "s.wide" in msg and "--columns" in msg

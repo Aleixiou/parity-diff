@@ -1017,11 +1017,6 @@ def test_duckdb_file_cannot_be_modified_by_another_process_mid_diff(
 # ------------------------------------------------------- BigQuery, Snowflake
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D7: a BigQuery view is read live at every level (time travel is "
-    "ignored on views) but the run prints no caveat",
-)
 def test_bigquery_view_run_says_it_is_not_one_snapshot(bigquery_url):
     """CLAUDE.md section 8: an approximation the docs admit to must reach the
     output. The README says views are not pinned; SQL Server's dialect turns
@@ -1050,11 +1045,27 @@ def test_bigquery_view_run_says_it_is_not_one_snapshot(bigquery_url):
         client.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D7: Snowflake runs READ COMMITTED only (per-statement snapshots) "
-    "but the run prints no caveat",
-)
+def test_bigquery_view_caveat_offline():
+    """RT-D7, offline: a view seen by `columns()` is named in a caveat, and a
+    base table - pinned with time travel - raises none."""
+    from parity.dialects.bigquery_dialect import BigQueryDialect
+
+    class Stub(BigQueryDialect):
+        kind = "VIEW"
+
+        def query(self, sql):  # type: ignore[override]
+            """One INFORMATION_SCHEMA row of the configured table type."""
+            return [("id", "INT64", self.kind, "2026-11-03 00:00:00.000000+00")]
+
+    base = Stub(side="A")
+    base.project, base.kind = "p", "BASE TABLE"
+    assert base.caveats(base.columns("ds.t")) == []
+    view = Stub(side="A")
+    view.project = "p"
+    (note,) = view.caveats(view.columns("ds.v"))
+    assert "p.ds.v" in note and "view" in note and "snapshot" in note
+
+
 def test_snowflake_run_says_it_is_not_one_snapshot():
     """Offline: the dialect's own docstring admits the gap; the output must too."""
     from parity.dialects.snowflake_dialect import SnowflakeDialect

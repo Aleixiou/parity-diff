@@ -41,9 +41,10 @@ def test_quote_doubles_embedded_quotes():
 
 
 def test_integer_division_and_widening():
-    """`/` is exact on NUMBER and `floor` truncates; NUMBER(38,0) cannot overflow."""
+    """Division of an exact multiple, which NUMBER's 6-place quotient cannot
+    round (RT-B7); NUMBER(38,0) cannot overflow."""
     d = _d()
-    assert d.int_div("x", "y") == "floor((x) / (y))"
+    assert d.int_div("x", "y") == "cast(((x) - mod((x), (y))) / (y) as number(38,0))"
     assert d.wide_int("k") == "cast((k) as number(38,0))"
     assert d.sum_wide("h") == "coalesce(sum(cast((h) as number(38,0))), 0)"
 
@@ -100,10 +101,12 @@ def test_columns_reads_numeric_scale_to_split_number():
             assert "information_schema.columns" in sql
             assert "PARITY_TEST" in sql or "ENC" in sql or "ORDERS" in sql
             return [
-                ("ID", "NUMBER", 0),
-                ("AMOUNT", "NUMBER", 2),
-                ("STATUS", "TEXT", None),
-                ("CREATED_AT", "TIMESTAMP_NTZ", None),
+                ("ID", "NUMBER", 0, None),
+                ("AMOUNT", "NUMBER", 2, None),
+                ("STATUS", "TEXT", None, None),
+                ("CREATED_AT", "TIMESTAMP_NTZ", None, 9),
+                ("SEEN_AT", "TIMESTAMP_TZ", None, 6),
+                ("LOCAL_AT", "TIMESTAMP_LTZ", None, 3),
             ]
 
     cols = Stubbed(side="A").columns("ENC.ORDERS")
@@ -112,4 +115,45 @@ def test_columns_reads_numeric_scale_to_split_number():
         ("AMOUNT", LogicalType.DECIMAL),
         ("STATUS", LogicalType.STRING),
         ("CREATED_AT", LogicalType.TIMESTAMP),
+        ("SEEN_AT", LogicalType.TIMESTAMP),
+        ("LOCAL_AT", LogicalType.TIMESTAMP),
     ]
+    # RT-C6: TZ and LTZ are instants, NTZ is naive - none says "with time zone".
+    assert [c.tz_aware for c in cols[3:]] == [False, True, True]
+    # The precision rides in raw_type, so only the 9-digit column is caveated.
+    assert [c.raw_type for c in cols[3:]] == [
+        "TIMESTAMP_NTZ(9)",
+        "TIMESTAMP_TZ(6)",
+        "TIMESTAMP_LTZ(3)",
+    ]
+    notes = Stubbed(side="A").caveats(cols)
+    assert any("CREATED_AT" in n and "microsecond" in n for n in notes), notes
+    assert not any("SEEN_AT" in n or "LOCAL_AT" in n for n in notes), notes
+
+
+def test_every_run_says_it_is_not_one_snapshot():
+    """RT-D7: READ COMMITTED only, said in the output and not just the docs."""
+    (note,) = _d().caveats([])
+    assert "READ COMMITTED" in note
+
+
+def test_timestamp_tz_is_moved_to_utc_and_ntz_is_not():
+    """RT-C11: TO_CHAR prints a TIMESTAMP_TZ in its stored offset; only TZ is
+    converted (NTZ is naive, LTZ already prints in the pinned UTC session)."""
+    d = _d()
+    fmt = "'YYYY-MM-DD HH24:MI:SS.FF6'"
+    tz = Column("T", LogicalType.TIMESTAMP, "TIMESTAMP_TZ(9)")
+    assert f"to_char(convert_timezone('UTC', \"T\"), {fmt})" in d.normalize(tz)
+    for raw in ("TIMESTAMP_NTZ(9)", "TIMESTAMP_LTZ(9)"):
+        col = Column("T", LogicalType.TIMESTAMP, raw)
+        assert "convert_timezone" not in d.normalize(col)
+
+
+def test_variant_keeps_its_json_type():
+    """RT-C15: TYPEOF plus TO_JSON, so the number 1 and the string "1" differ."""
+    d = _d()
+    for raw in ("VARIANT", "OBJECT", "ARRAY"):
+        col = Column("V", map_type_snowflake(raw, None), raw)
+        assert d.normalize(col) == (
+            "coalesce(typeof(\"V\") || ':' || to_json(\"V\"), (chr(92) || 'N'))"
+        )

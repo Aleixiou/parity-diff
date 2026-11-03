@@ -680,10 +680,7 @@ class Dialect(ABC):
         # dominated by MD5 over every row, not by integer arithmetic. Paying a
         # couple of percent to delete a second code path is the right trade in
         # the one function whose off-by-one would make the walker skip rows.
-        offset = f"({self.wide_int(k)} - ({self.int_literal(lo)}))"
-        bucket = self.int_div(
-            f"{offset} * {n_segments}", f"({self.int_literal(hi - lo)})"
-        )
+        bucket = self.bucket_expr(key, k, lo, hi, n_segments)
         # Fold the *key* into every row's hash, not just the comparable columns.
         # A count plus a content-only sum cannot see a same-content insert and
         # delete in one bucket: the counts balance (one in, one out) and equal
@@ -706,6 +703,30 @@ class Dialect(ABC):
             f"group by {self.group_by(1, bucket)}"
         )
 
+    def bucket_expr(self, key: KeySpec, k: str, lo: int, hi: int, n_segments: int) -> str:
+        """`floor((k - lo) * n_segments / (hi - lo))`, overflow-safe - see the
+        comment in `_segment_sql`. Must agree with `engine.bucket_bounds` for
+        every key, on every engine. Overridden only where a key type is as
+        wide as `wide_int` itself (DuckDB HUGEINT)."""
+        offset = f"({self.wide_int(k)} - ({self.int_literal(lo)}))"
+        return self.int_div(f"{offset} * {n_segments}", f"({self.int_literal(hi - lo)})")
+
+    def fetch_text(self, expr: str) -> str:
+        """How `fetch_range` selects one canonical-text expression.
+
+        Itself, everywhere but SQL Server, whose driver drops trailing NUL
+        characters from an nvarchar(max) result: the server hashed `'a' +
+        nchar(0)`, the checksums proved it differs, and the download then read
+        `'a'` - a proven difference reported as identical (RT-A9). A dialect
+        whose driver cannot carry text exactly selects bytes here instead.
+        """
+        return expr
+
+    def fetched(self, value: Any) -> Any:
+        """Turn one value `fetch_text` selected back into text. Identity
+        unless `fetch_text` is overridden."""
+        return value
+
     def fetch_range(
         self,
         table: str,
@@ -723,7 +744,9 @@ class Dialect(ABC):
         identity = self.key_identity(key)
         # With no comparable columns the row tuple is empty and only key
         # presence distinguishes the sides - see `row_text`.
-        exprs = "".join(", " + self.normalize(c) for c in columns)
+        exprs = "".join(", " + self.fetch_text(self.normalize(c)) for c in columns)
+        if key.hashed:
+            identity = self.fetch_text(identity)
         # Selected by identity, filtered and ordered by bucket. Those differ
         # for a hashed key, and the distinction is the whole safety property:
         # two rows may share a bucket, but they are still returned and compared
@@ -738,6 +761,7 @@ class Dialect(ABC):
         )
         out: dict[int | str, tuple[str, ...]] = {}
         for row in self.query(sql):
+            row = tuple(self.fetched(v) for v in row)
             rk: int | str = row[0] if key.hashed else int(row[0])
             if rk in out:
                 # Second line of defence behind the up-front uniqueness check

@@ -92,6 +92,12 @@ UTF8_COLLATION = "Latin1_General_100_BIN2_UTF8"
 #: place. Refused rather than rounded - nobody compares doubles at 19 places.
 MSSQL_FLOAT_MAX_SCALE = 18
 
+#: Compared columns (key included) from which the checksum query is
+#: hash-aggregated - see `SQLServerDialect._segment_sql`. The default plan
+#: overflows the 8,060-byte row limit at ~307 int columns; below 300 it has
+#: room, and the hint can cost it the expression-services limit.
+HASH_GROUP_FROM = 300
+
 #: `SERVERPROPERTY('EngineEdition')` values this dialect is verified for:
 #: 1-4 the boxed SQL Server editions (2 Standard, 3 Enterprise/Developer, 4
 #: Express), 5 Azure SQL Database, 8 Azure SQL Managed Instance. Synapse (6,
@@ -108,7 +114,11 @@ _URL_PARAMS = {
     "encrypt": "Encrypt",
     "trust_server_certificate": "TrustServerCertificate",
     "application_intent": "ApplicationIntent",
-    "login_timeout": "LoginTimeout",
+    # Not an ODBC keyword for mssql-python, which rejects `LoginTimeout`
+    # ("Unknown keyword ... is not recognized", RT-F6): it is the driver's
+    # `timeout=` argument instead (SQL_ATTR_LOGIN_TIMEOUT). See
+    # `mssql_login_timeout`.
+    "login_timeout": "",
     "instance": "",  # folded into Server=host\\instance
 }
 
@@ -120,6 +130,56 @@ _FLOAT_RANGE = re.compile(
 #: Leads the canonical text of an nvarchar value that is not valid UTF-16 (an
 #: unpaired surrogate), followed by its UTF-16LE bytes in hex. See `_utf16_safe`.
 INVALID_UTF16_MARKER = "parity: invalid UTF-16 "
+
+
+#: Words that never appear in the SQL this dialect generates outside a quoted
+#: identifier or a string literal, and that any statement able to write,
+#: execute or change the session needs. `into` is the one that matters most:
+#: `select ... into t` is a SELECT that creates a table.
+_WRITE_WORDS = re.compile(
+    r"\b(into|insert|update|delete|merge|drop|alter|create|truncate|exec|execute"
+    r"|grant|revoke|deny|declare|set|use|backup|restore|dbcc|waitfor|bulk|begin"
+    r"|commit|rollback|save|openrowset|opendatasource|openquery|openxml"
+    r"|shutdown|kill|reconfigure|xp_\w*|sp_\w*)\b",
+    re.IGNORECASE,
+)
+
+#: A bracketed identifier (`]]` escapes `]`) or a string literal, N-prefixed
+#: or not (`''` escapes `'`) - what `_skeleton` blanks out.
+_QUOTED = re.compile(r"\[(?:[^\]]|\]\])*\]|N?'(?:[^']|'')*'", re.IGNORECASE)
+
+
+def _skeleton(sql: str) -> str | None:
+    """`sql` with every bracketed identifier and string literal blanked out,
+    or None if one is unterminated.
+
+    Identifiers and literals come from the user's schema and the command line;
+    everything else is text this dialect wrote. So whatever remains is what
+    the statement *does*, and can be checked word by word.
+    """
+    rest = _QUOTED.sub(" q ", sql)
+    if "[" in rest or "'" in rest:
+        return None
+    return rest
+
+
+def is_single_select(sql: str) -> bool:
+    """Whether `sql` is one plain SELECT - no INTO, no second statement.
+
+    A prefix check let `select * into copy from t` (creates a table) and
+    `select 1; drop table t` through (RT-F12). This dialect only ever runs SQL
+    it generated itself, whose shape is known: one SELECT, no `;`, no comment,
+    and none of `_WRITE_WORDS` outside identifiers and literals. Anything else
+    is refused, even what might be harmless.
+    """
+    rest = _skeleton(sql)
+    if rest is None:
+        return False
+    if not rest.lstrip().lower().startswith("select"):
+        return False
+    if ";" in rest or "--" in rest or "/*" in rest or '"' in rest:
+        return False
+    return _WRITE_WORDS.search(rest) is None
 
 
 def _odbc_value(value: str) -> str:
@@ -176,8 +236,26 @@ def parse_mssql_url(connection_string: str) -> tuple[str, str]:
         f"UID={_odbc_value(unquote(url.username))}",
         f"PWD={_odbc_value(unquote(url.password or ''))}",
     ]
+    params.pop("login_timeout", None)
     parts += [f"{_URL_PARAMS[k]}={_odbc_value(v)}" for k, v in sorted(params.items())]
     return ";".join(parts), database
+
+
+def mssql_login_timeout(connection_string: str) -> int:
+    """`?login_timeout=` in seconds, or 0 (the driver default) when absent.
+
+    Passed to `mssql_python.connect(timeout=...)`, which sets
+    SQL_ATTR_LOGIN_TIMEOUT; the driver has no connection-string keyword for it.
+    """
+    values = parse_qs(urlparse(connection_string).query).get("login_timeout")
+    if not values:
+        return 0
+    raw = values[-1].strip()
+    if not raw.isdigit():
+        raise ValueError(
+            f"mssql login_timeout must be a whole number of seconds, got {raw!r}"
+        )
+    return int(raw)
 
 
 class SQLServerDialect(Dialect):
@@ -208,6 +286,7 @@ class SQLServerDialect(Dialect):
         """
         try:
             odbc, self.database = parse_mssql_url(connection_string)
+            login_timeout = mssql_login_timeout(connection_string)
         except ValueError as exc:
             # `get_dialect` passes a ValueError through untouched, trusting it
             # to name the side already - so it has to.
@@ -215,7 +294,7 @@ class SQLServerDialect(Dialect):
 
         import mssql_python
 
-        self._conn = mssql_python.connect(odbc, autocommit=True)
+        self._conn = mssql_python.connect(odbc, autocommit=True, timeout=login_timeout)
         edition, schema, snapshot_state, utf8 = self._probe()
         if edition not in SUPPORTED_EDITIONS:
             raise self._err(
@@ -265,12 +344,13 @@ class SQLServerDialect(Dialect):
     def query(self, sql: str) -> list[tuple[Any, ...]]:
         """Run one SELECT and return every row as a tuple.
 
-        Refuses anything that is not a SELECT before it reaches the server.
-        SQL Server has no read-only session to fall back on, so this is the
-        last line of defence behind a read-only login.
+        Refuses anything but one plain SELECT before it reaches the server
+        (`is_single_select`). SQL Server has no read-only session to fall back
+        on, so this guard, the transaction that is never committed, and a
+        read-only login are the defences.
         """
-        if not sql.lstrip().lower().startswith("select"):
-            raise self._err(f"refusing to run a non-SELECT statement: {sql[:60]!r}")
+        if not is_single_select(sql):
+            raise self._err(f"refusing to run anything but a single SELECT: {sql[:60]!r}")
         cur = self._conn.cursor()
         try:
             cur.execute(sql)
@@ -397,6 +477,90 @@ class SQLServerDialect(Dialect):
         """The expression itself: T-SQL has no GROUP BY ordinal or alias."""
         return expr
 
+    def _segment_sql(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        lo: int,
+        hi: int,
+        n_segments: int,
+    ) -> str:
+        """The shared checksum query, hash-aggregated when it is wide (RT-C8).
+
+        Left to choose, the optimizer sorts the rows by bucket and stream-
+        aggregates them, and the sort's worktable carries every column's
+        `nvarchar(max)` intermediate - about 26 bytes each - so past ~307
+        compared columns it overflows the 8,060-byte row limit and the diff
+        died, on a table SQL Server itself stores happily (up to 1,024
+        columns). A hash aggregate keeps only the group key and the running
+        count and sum: verified at 400 and 1,000 int columns and 400
+        nvarchar(max) ones, and on 300,000 rows it returned the same checksums
+        in the same time (1.5s against 1.65s).
+
+        Only from `HASH_GROUP_FROM` columns, though: the hint also changes how
+        the expressions are compiled, and a 130-column mix of ints, strings
+        and floats - which the default plan handles - then hit "an expression
+        services limit has been reached". Below the threshold the SQL is
+        exactly what it always was. Either limit, when it is still reached,
+        becomes an error naming the side and table (`segment_checksums`). The
+        row text and the hash are untouched, so no checksum moves.
+        """
+        sql = super()._segment_sql(table, key, columns, lo, hi, n_segments)
+        if len(key.columns) + len(columns) >= HASH_GROUP_FROM:
+            sql += " option (hash group)"
+        return sql
+
+    def segment_checksums(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        lo: int,
+        hi: int,
+        n_segments: int,
+    ) -> dict[int, tuple[int, int]]:
+        """The shared checksums, with SQL Server's query-size limits named.
+
+        A raw "Cannot create a row of size ..." or "expression services
+        limit" names neither side nor table; say which, and what to do.
+        """
+        try:
+            return super().segment_checksums(table, key, columns, lo, hi, n_segments)
+        except Exception as exc:
+            text = str(exc)
+            if "maximum row size" not in text and "expression services limit" not in text:
+                raise
+            raise self._err(
+                f"the checksum query over {table} ({len(columns)} compared "
+                "columns) is too large for SQL Server to compile or run "
+                f"({text.rsplit(']', 1)[-1].strip()}). Compare fewer columns "
+                "per run with --columns / --exclude"
+            ) from exc
+
+    def fetch_text(self, expr: str) -> str:
+        """Canonical text as its UTF-8 bytes, `varbinary(max)` (RT-A9).
+
+        mssql-python drops trailing NUL characters from an nvarchar(max)
+        result (verified: `N'a' + nchar(0)` fetched as `'a'`, while a NUL in
+        the middle survives), so a row whose checksum proved it different was
+        downloaded equal to the other side's and the difference discarded.
+        Bytes arrive intact (`b'a\\x00'`, verified to 100,001 bytes), and they
+        are exactly the bytes `hash_expr` hashes - so the downloaded text is
+        now, by construction, the text the checksum saw. Only the small ranges
+        `fetch_range` downloads pay for it.
+        """
+        return f"convert(varbinary(max), {self._utf8(expr)})"
+
+    def fetched(self, value: Any) -> Any:
+        """Decode what `fetch_text` selected. Strict UTF-8: the server built
+        it from valid UTF-16 (an unpaired surrogate is rendered as an ASCII
+        marker first, see `_utf16_safe`), so a decode error would be a bug to
+        surface, never text to guess at. An integer key passes through."""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8")
+        return value
+
     # ----------------------------------------------------------- rendering
 
     def separator_sql(self) -> str:
@@ -489,9 +653,51 @@ class SQLServerDialect(Dialect):
             expr = f"convert({text}, convert(varbinary(max), {c}), 1)"
         elif raw in ("geography", "geometry", "hierarchyid"):
             expr = f"{c}.ToString()"
+        elif raw == "sql_variant":
+            expr = self._variant_text(c)
         else:
             expr = f"cast({c} as {text})"
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _variant_text(self, c: str) -> str:
+        """A `sql_variant` as `<base type>:<exact value>` (RT-A16, RT-C5).
+
+        A plain cast to nvarchar(max) is lossy twice over: it drops the base
+        type, so int 1 and N'1' (or float 1.5 and decimal 1.5) rendered alike,
+        and it formats by the base type's *default* style, which keeps ~6
+        significant digits of a float and only the minutes of a datetime or
+        datetime2 (`Jan  1 2024 10:00AM`) - two different values on one engine
+        compared equal. So the base type leads, and each value is rendered by
+        an exact style: float/real round-trip (style 3), money to 4 places
+        (style 2), date-times to their full precision (style 121), binary as
+        hex. No other engine has the type, so this is about exactness on SQL
+        Server itself: a variant column against another engine's column
+        differs on every row, as the unmapped-type warning says.
+        """
+        text = "nvarchar(max)"
+        base = f"cast(sql_variant_property({c}, 'BaseType') as nvarchar(128))"
+        by_type = {
+            "float": f"convert({text}, cast({c} as float), 3)",
+            "real": f"convert({text}, cast({c} as real), 3)",
+            "money": f"convert({text}, cast({c} as money), 2)",
+            "smallmoney": f"convert({text}, cast({c} as smallmoney), 2)",
+            "datetime": f"convert({text}, cast({c} as datetime), 121)",
+            "smalldatetime": f"convert({text}, cast({c} as smalldatetime), 120)",
+            "datetime2": f"convert({text}, cast({c} as datetime2(7)), 121)",
+            "datetimeoffset": f"convert({text}, cast({c} as datetimeoffset(7)), 121)",
+            "date": f"convert({text}, cast({c} as date), 23)",
+            "time": f"convert({text}, cast({c} as time(7)))",
+            "binary": f"convert({text}, cast({c} as varbinary(8000)), 1)",
+            "varbinary": f"convert({text}, cast({c} as varbinary(8000)), 1)",
+            "uniqueidentifier": f"lower(convert({text}, {c}))",
+            "nvarchar": self._utf16_safe(f"cast({c} as {text})"),
+            "nchar": self._utf16_safe(f"cast({c} as {text})"),
+        }
+        whens = " ".join(f"when N'{t}' then {e}" for t, e in by_type.items())
+        # Integers, bit, decimal/numeric and char/varchar convert exactly by
+        # default: digits, and the decimal's own scale.
+        value = f"case {base} {whens} else convert({text}, {c}) end"
+        return f"{base} + N':' + {value}"
 
     def _timestamp_text(self, c: str, raw: str) -> str:
         """`yyyy-mm-dd hh:mi:ss.ffffff`, as the other engines print timestamps.

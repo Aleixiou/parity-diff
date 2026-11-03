@@ -584,6 +584,62 @@ def test_table_not_found_names_the_side_and_schema(duck):
     assert "side B" in msg and "no_such_table" in msg
 
 
+def _render_all(ddl: str, values: list[str]) -> list[tuple]:
+    """Canonical text of column `v` for each value, through the dialect.
+
+    In memory, the one DuckDB database the dialect opens writable - and the
+    only one that can hold a VARIANT without a 1.5 storage version.
+    """
+    d = get_dialect("duckdb:///:memory:", side="B")
+    try:
+        d.query(f"create table t (id int, v {ddl})")
+        for i, v in enumerate(values):
+            d.query(f"insert into t values ({i}, {v})")
+        (col,) = [c for c in d.columns("t") if c.name == "v"]
+        return d.query(f"select {d.normalize(col)} from t order by id")
+    finally:
+        d.close()
+
+
+@pytest.mark.duckdb
+def test_timestamp_ns_renders_nanoseconds_only_when_it_has_them():
+    """RT-A7: a whole-microsecond TIMESTAMP_NS renders exactly as a TIMESTAMP
+    always did - so no checksum moves and it still matches a microsecond
+    column on any engine - and anything finer carries all nine digits."""
+    values = [
+        "'2024-01-01 00:00:00.123456'",
+        "'2024-01-01 00:00:00.000000001'",
+        "'2024-01-01 00:00:00.000000999'",
+        "'1969-12-31 23:59:59.999999999'",
+        "'1900-01-01 00:00:00'",
+        "null",
+    ]
+    ns = [r[0] for r in _render_all("timestamp_ns", values)]
+    assert ns == [
+        "2024-01-01 00:00:00.123456",
+        "2024-01-01 00:00:00.000000001",
+        "2024-01-01 00:00:00.000000999",
+        "1969-12-31 23:59:59.999999999",
+        "1900-01-01 00:00:00.000000",
+        "\\N",
+    ]
+    us = [r[0] for r in _render_all("timestamp", [values[0], values[4]])]
+    assert us == [ns[0], ns[4]]
+
+
+@pytest.mark.duckdb
+def test_union_and_variant_keep_their_type_tag():
+    """RT-A12 / RT-C14: INTEGER 1 and VARCHAR '1' render differently inside a
+    UNION or a VARIANT, and NULL is still the sentinel."""
+    union = _render_all("union(n int, s varchar)", ["1::int", "'1'", "null"])
+    assert [r[0] for r in union] == ['{"n":1}', '{"s":"1"}', "\\N"]
+    duckdb = pytest.importorskip("duckdb")
+    if tuple(int(x) for x in duckdb.__version__.split(".")[:2]) < (1, 5):
+        pytest.skip("VARIANT needs DuckDB 1.5")
+    variant = _render_all("variant", ["1::int", "'1'", "null"])
+    assert [r[0] for r in variant] == ["INT32:1", 'VARCHAR:"1"', "\\N"]
+
+
 # --------------------------------------------------------------------------
 # 4. Pure Python - no database required, so these always run
 # --------------------------------------------------------------------------
