@@ -217,12 +217,6 @@ def test_rt_e2_the_field_separator_inside_text_is_not_a_boundary(tmp_path):
     assert _found(_run(a, b)) == [(1, "different", ["c1", "c2"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E6: a DECIMAL(10,0) key against a BIGINT key holding the same "
-    "integers matches no row - every row is only_in_a and only_in_b ('1.000000' "
-    "vs '1') - and no warning says the key types differ",
-)
 def test_rt_e6_an_integral_decimal_key_matches_an_integer_key(tmp_path):
     """RT-E6: DECIMAL(10,0) and BIGINT keys holding the same integers match,
     or a warning says the key types differ."""

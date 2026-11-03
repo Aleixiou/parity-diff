@@ -457,13 +457,31 @@ def _sided_tables():
     return a_table, b_table
 
 
-def test_columns_present_on_one_side_only_are_skipped_with_a_warning():
-    """A column only one side has is skipped and said aloud, not treated as a difference."""
+def test_columns_present_on_one_side_only_are_a_schema_difference():
+    """A column only one side has was never compared, so the tables are not
+    proven identical (RT-F1) - but no row is invented as different either."""
     result, _, _ = run(*_sided_tables())
-    assert result.identical, "one-sided columns must not create differences"
-    assert any("only_a" in w and "side A" in w for w in result.warnings)
-    assert any("only_b" in w and "side B" in w for w in result.warnings)
+    assert result.diffs == [], "one-sided columns must not create row differences"
+    assert not result.identical, "an uncompared column must not read as a match"
+    assert any("only_a" in w and "side A" in w for w in result.schema_differences)
+    assert any("only_b" in w and "side B" in w for w in result.schema_differences)
     assert [c.name for c in result.columns] == ["amount", "status"]
+
+
+def test_one_sided_columns_set_aside_by_the_user_still_allow_a_match():
+    """Excluding them, or narrowing with `columns`, is a deliberate choice: the
+    result is identical again, and the columns are still named as a note."""
+    for kwargs in ({"exclude": ["only_a", "only_b"]}, {"columns": ["amount"]}):
+        result, _, _ = run(*_sided_tables(), **kwargs)
+        assert result.identical, kwargs
+        assert result.schema_differences == []
+        assert any("only_a" in w and "side A" in w for w in result.warnings)
+    # Excluding only one of the two leaves the other a schema difference.
+    result, _, _ = run(*_sided_tables(), exclude=["only_a"])
+    assert not result.identical
+    assert result.schema_differences == [
+        "not compared, present only on side B: ['only_b']"
+    ]
 
 
 def test_exclude_drops_a_column_from_the_comparison():
@@ -959,3 +977,148 @@ def test_two_columns_differing_only_in_case_are_refused():
     b = FakeDialect(DictTable(list(COLS), {1: ("a", "b")}), side="B")
     with pytest.raises(ValueError, match="differ only in case"):
         diff(a, b, "t", "t", "id")
+
+
+# ---------------------------------------------------------------------------
+# Red-team fixes: unexplained mismatches, side-naming errors, key handling.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
+    """RT-A10, count variant: a side whose fetch drops a row its own checksum
+    counted. The surviving rows compare equal, so without the count check the
+    run reads identical although the checksums proved a difference."""
+
+    class DropsRowTwo(FakeDialect):
+        def fetch_range(self, table, key, columns, lo, hi):
+            out = super().fetch_range(table, key, columns, lo, hi)
+            out.pop(2, None)
+            return out
+
+    cols = [Column("v", LogicalType.STRING, "varchar")]
+    a = FakeDialect(DictTable(cols, {1: ("a",), 3: ("c",)}), side="A")
+    b = DropsRowTwo(DictTable(cols, {1: ("a",), 2: ("b",), 3: ("c",)}), side="B")
+    result = diff(a, b, "a.t", "b.t", "id")
+    assert result.diffs == []
+    assert not result.identical
+    [note] = result.unexplained
+    assert "side B (b.t) counted" in note and "returned" in note
+
+
+def test_a_lossy_fetch_is_named_with_both_tables_and_the_range():
+    """RT-A10: rows compare equal after a mismatched checksum - the result
+    names both tables and the key range, and is not identical. A real planted
+    difference elsewhere is still reported normally."""
+
+    class Lowercases(FakeDialect):
+        def fetch_range(self, table, key, columns, lo, hi):
+            out = super().fetch_range(table, key, columns, lo, hi)
+            return {k: tuple(v.lower() for v in row) for k, row in out.items()}
+
+    cols = [Column("v", LogicalType.STRING, "varchar")]
+    rows = {k: (f"v{k}",) for k in range(1, 101)}
+    a = FakeDialect(DictTable(cols, rows), side="A")
+    b = Lowercases(DictTable(cols, {**rows, 5: ("V5",), 90: ("changed",)}), side="B")
+    result = diff(a, b, "a.t", "b.t", "id", threshold=1)
+    assert kinds(result) == [(90, "different")]
+    assert not result.identical
+    [note] = result.unexplained
+    assert "a.t" in note and "b.t" in note and "[5, " in note
+
+
+def test_an_error_mid_walk_names_the_side_and_the_table():
+    """RT-D12: a driver error from a checksum query (a statement timeout, a
+    dropped connection) is re-raised naming side and table, chained."""
+
+    class TimesOut(FakeDialect):
+        def segment_checksums(self, *args):
+            raise RuntimeError("canceling statement due to statement timeout")
+
+    a = FakeDialect(SyntheticTable(100), side="A")
+    b = TimesOut(SyntheticTable(100), side="B")
+    with pytest.raises(ValueError) as exc:
+        diff(a, b, "a.t", "b.t", "id")
+    message = str(exc.value)
+    assert message.startswith("[side B: fake] query on b.t failed")
+    assert "statement timeout" in message
+    assert isinstance(exc.value.__cause__, RuntimeError)
+
+
+def test_a_dialect_error_already_naming_its_side_gains_only_the_table():
+    """No doubled `[side ...]` prefix; the table is added when missing."""
+
+    class Refuses(FakeDialect):
+        def fetch_range(self, *args):
+            raise self._err("FLOAT value out of the comparable range")
+
+    a = FakeDialect(DictTable(COLS, {1: ("1.00", "x")}), side="A")
+    b = Refuses(DictTable(COLS, {1: ("1.00", "y")}), side="B")
+    with pytest.raises(ValueError) as exc:
+        diff(a, b, "a.t", "b.t", "id")
+    assert str(exc.value) == (
+        "[side B: fake] FLOAT value out of the comparable range (table b.t)"
+    )
+
+
+def test_a_key_named_twice_in_two_cases_is_one_key():
+    """RT-F15: `ID` and `id` are one column - matching is case-insensitive,
+    so de-duplication must be too. The deleted row is still found."""
+    a = FakeDialect(SyntheticTable(100), side="A")
+    b = FakeDialect(SyntheticTable(100, deleted=[7]), side="B")
+    result = diff(a, b, "a.t", "b.t", ["ID", "id"])
+    assert kinds(result) == [(7, "only_in_a")]
+    assert not any("composite" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize(
+    "key_b, warned",
+    [
+        (Column("id", LogicalType.DECIMAL, "decimal(18,0)"), True),
+        (Column("id", LogicalType.FLOAT, "double"), True),
+        (Column("id", LogicalType.STRING, "varchar"), False),
+        (Column("id", LogicalType.INTEGER, "integer"), False),
+    ],
+)
+def test_a_key_type_that_cannot_match_is_named(key_b, warned):
+    """RT-A14/B8/E6: an integer key against a decimal or float key renders
+    '1' against '1.000000', so nothing can match. Text against an integer can
+    ('42' is '42'), so it is not warned about."""
+    a = FakeDialect(SyntheticTable(10), side="A")
+    b = FakeDialect(SyntheticTable(10, deleted=[3]), side="B", key_type_override=key_b)
+    result = diff(a, b, "a.t", "b.t", "id")
+    hits = [w for w in result.warnings if w.startswith("key column 'id' is bigint")]
+    assert bool(hits) is warned, result.warnings
+    if warned:
+        assert key_b.raw_type in hits[0] and "side B" in hits[0]
+
+
+def test_enum_against_text_is_not_predicted_to_differ():
+    """RT-C13: an enum (UNKNOWN) renders its label, exactly the text on the
+    other side; no "will very likely all differ". The planted change is found."""
+    a = FakeDialect(
+        DictTable(
+            [Column("v", LogicalType.UNKNOWN, "USER-DEFINED")], {1: ("x",), 2: ("y",)}
+        ),
+        side="A",
+    )
+    b = FakeDialect(
+        DictTable([Column("v", LogicalType.STRING, "text")], {1: ("x",), 2: ("z",)}),
+        side="B",
+    )
+    result = diff(a, b, "a.t", "b.t", "id")
+    assert kinds(result) == [(2, "different")]
+    assert not any("very likely all differ" in w for w in result.warnings)
+
+
+def test_a_dialect_closes_itself_as_a_context_manager():
+    """`with` closes it, also when the body raises (#11: diff never closes)."""
+    closed = []
+
+    class Tracks(FakeDialect):
+        def close(self):
+            closed.append(self.side)
+
+    with pytest.raises(RuntimeError), Tracks(SyntheticTable(1), side="A") as d:
+        assert isinstance(d, Tracks)
+        raise RuntimeError("boom")
+    assert closed == ["A"]

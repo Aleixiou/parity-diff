@@ -47,6 +47,21 @@ _NUMERIC_EQUIVALENT = frozenset({LogicalType.DECIMAL, LogicalType.FLOAT})
 #: check exists to catch, so it must survive it. Pass `None` for no limit.
 DEFAULT_MAX_DIFFS = 10_000
 
+#: Pairs of logical types whose canonical text can coincide even though the
+#: types differ, so a column of one type against a column of the other is not
+#: predicted to differ on every row. DECIMAL/FLOAT share one rounded encoding;
+#: an UNKNOWN type (a PostgreSQL or DuckDB enum, say) renders as its raw text,
+#: which is exactly what a STRING column on the other side holds.
+_RENDER_ALIKE = (
+    _NUMERIC_EQUIVALENT,
+    frozenset({LogicalType.STRING, LogicalType.UNKNOWN}),
+)
+
+#: For a *key*, text against anything can still line up - a varchar holding
+#: '42' matches a bigint 42 - so only a mismatch where neither side is text is
+#: certain to break every match.
+_TEXTUAL = frozenset({LogicalType.STRING, LogicalType.UNKNOWN})
+
 _A = TypeVar("_A")
 _B = TypeVar("_B")
 
@@ -111,6 +126,44 @@ def _cancel_on_interrupt(a: Dialect, b: Dialect) -> Iterator[None]:
                 # the KeyboardInterrupt below is what the caller needs.
                 pass
         raise
+
+
+def _renders_alike(ta: LogicalType, tb: LogicalType) -> bool:
+    """Whether two logical types can produce byte-identical canonical text."""
+    return ta is tb or any({ta, tb} <= pair for pair in _RENDER_ALIKE)
+
+
+def _type_label(column: Column) -> str:
+    """The engine's own type name when it has one, else the logical type."""
+    return column.raw_type or column.logical_type.value
+
+
+def _on_side(side: str, dialect: Dialect, method: str, table: str, *args: Any) -> Any:
+    """Call one dialect method, making any error it raises name side and table.
+
+    CLAUDE.md section 6: "table not found" is useless when two databases are
+    in play, and so is a bare `canceling statement due to statement timeout`
+    when both are PostgreSQL. The dialects name the side in the errors they
+    raise themselves, but a server error from a checksum or fetch query - a
+    timeout, a cancelled query, a dropped connection - arrives from the driver
+    bare. Wrapping here, at the one boundary every query crosses, covers every
+    engine at once without the engine knowing any of them.
+    """
+    try:
+        return getattr(dialect, method)(table, *args)
+    except Exception as exc:
+        text = str(exc)
+        if text.startswith("[side "):
+            # Already one of ours. Re-wrapping would print the prefix twice;
+            # only add the table when the message does not already name it.
+            if table in text:
+                raise
+            raise ValueError(f"{text} (table {table})") from exc
+        name = getattr(dialect, "name", "?")
+        raise ValueError(
+            f"[side {side}: {name}] query on {table} failed during {method}: "
+            f"{type(exc).__name__}: {text}"
+        ) from exc
 
 
 def _is_tz_aware(column: Column) -> bool:
@@ -185,7 +238,16 @@ def _resolve_key(
     `cols_a` and `cols_b` are keyed by case-folded name (see `_fold_columns`),
     so the same `--key id` finds `id` on PostgreSQL and `ID` on Snowflake.
     """
-    names = [key] if isinstance(key, str) else list(dict.fromkeys(key))
+    # De-duplicate the way matching works: case-insensitively. `--key ID,id`
+    # names one column twice, and de-duplicating case-sensitively would turn
+    # it into a two-part composite of the same column - hashed, and reported
+    # under a doubled key that no reader can look up.
+    names: list[str] = []
+    seen: set[str] = set()
+    for n in [key] if isinstance(key, str) else key:
+        if n.casefold() not in seen:
+            seen.add(n.casefold())
+            names.append(n)
     if not names:
         raise ValueError("--key needs at least one column")
 
@@ -210,12 +272,43 @@ def _resolve_key(
     )
     hashed = not single_integer
 
+    # A key whose type differs between the sides is matched on its canonical
+    # text, so a bigint 42 against a decimal(18,0) 42 is '42' against
+    # '42.000000': no row can match, and every row is reported missing from
+    # one side and present on the other. That reads as total data loss, so it
+    # is named as the schema difference it really is. A compared column with
+    # the same mismatch is already named in `_select_columns`.
+    for ca, cb in zip(a_key, b_key, strict=True):
+        ta, tb = ca.logical_type, cb.logical_type
+        if not _renders_alike(ta, tb) and not ({ta, tb} & _TEXTUAL):
+            warnings.append(
+                f"key column {ca.name!r} is {_type_label(ca)} on side A but "
+                f"{_type_label(cb)} on side B; the two types render the same "
+                f"key value as different text, so rows cannot match on their "
+                f"key and every row will report as only in A and only in B. "
+                f"Compare through a view that casts one side's key to the "
+                f"other's type."
+            )
+        elif _is_tz_aware(ca) is not _is_tz_aware(cb):
+            aware, naive = ("A", "B") if _is_tz_aware(ca) else ("B", "A")
+            warnings.append(
+                f"key column {ca.name!r} is timezone-aware on side {aware} but "
+                f"not on side {naive}; both are read in UTC, so a migration "
+                f"that stored local wall-clock time rather than UTC matches no "
+                f"row on its key and reports every row as only in A and only "
+                f"in B"
+            )
+
     if hashed:
-        what = (
-            "composite key"
-            if len(names) > 1
-            else f"non-integer key ({a_key[0].raw_type or a_key[0].logical_type.value})"
-        )
+        if len(names) > 1:
+            what = "composite key"
+        elif _type_label(a_key[0]) == _type_label(b_key[0]):
+            what = f"non-integer key ({_type_label(a_key[0])})"
+        else:
+            what = (
+                f"non-integer key ({_type_label(a_key[0])} on side A, "
+                f"{_type_label(b_key[0])} on side B)"
+            )
         warnings.append(
             f"{what}: bucketed by a 60-bit hash of {names}. Rows are still "
             f"matched and reported by their real key, so a hash collision "
@@ -232,8 +325,13 @@ def _select_columns(
     columns: Sequence[str] | None,
     exclude: Sequence[str],
     warnings: list[str],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Decide which columns to compare, explaining anything dropped.
+
+    Returns the folded names to compare, and the schema differences: columns
+    present on one side only that the user did not set aside. Those make the
+    result non-identical (see `DiffResult.schema_differences`), because their
+    contents were never compared.
 
     `cols_a`/`cols_b` are keyed by case-folded name and the returned list is
     folded names too, so matching is case-insensitive across engines (see
@@ -287,12 +385,25 @@ def _select_columns(
             raise ValueError(f"--columns and --exclude both name: {dropped}")
         shared = [f for f in shared if f in set(req)]
 
+    schema_differences: list[str] = []
     for side, cols, only in (
         ("A", cols_a, sorted(set(cols_a) - set(cols_b) - key_folds)),
         ("B", cols_b, sorted(set(cols_b) - set(cols_a) - key_folds)),
     ):
-        if only:
-            names = sorted(cols[f].name for f in only)
+        # A one-sided column the user set aside - by `--exclude`, or by
+        # narrowing with `--columns` - was deliberately left out, so it only
+        # earns a note. Any other one is a column whose contents nobody
+        # compared, and "identical" would be a claim about data never looked
+        # at: the dropped-column migration passing its CI gate.
+        set_aside = [f for f in only if columns or f in excluded]
+        unexamined = [f for f in only if f not in set_aside]
+        if unexamined:
+            names = sorted(cols[f].name for f in unexamined)
+            schema_differences.append(
+                f"not compared, present only on side {side}: {names}"
+            )
+        if set_aside:
+            names = sorted(cols[f].name for f in set_aside)
             warnings.append(f"not compared, present only on side {side}: {names}")
 
     # A column whose logical type differs between sides renders through a
@@ -304,11 +415,21 @@ def _select_columns(
         ta, tb = cols_a[f].logical_type, cols_b[f].logical_type
         if ta is tb or {ta, tb} <= _NUMERIC_EQUIVALENT:
             continue
-        warnings.append(
-            f"column {name!r} is {cols_a[f].raw_type or ta.value} on side A "
-            f"but {cols_b[f].raw_type or tb.value} on side B; values are "
-            f"compared as text and will very likely all differ"
+        what = (
+            f"column {name!r} is {_type_label(cols_a[f])} on side A but "
+            f"{_type_label(cols_b[f])} on side B; values are compared as text"
         )
+        if _renders_alike(ta, tb):
+            # Text against an unmapped type (an enum, json, inet): the raw
+            # text often matches exactly - an enum's labels always do - so
+            # predicting that every row differs would be wrong (RT-C13). The
+            # mismatch is still a schema fact worth naming.
+            warnings.append(
+                f"{what}, which matches only where both engines spell the "
+                f"value identically"
+            )
+            continue
+        warnings.append(f"{what} and will very likely all differ")
 
     # Timezone-awareness is invisible to the logical type - both sides map to
     # TIMESTAMP - but it is a real semantic difference and `timestamptz` to
@@ -347,7 +468,7 @@ def _select_columns(
             "no comparable columns: only the presence of each key is checked, "
             "not row contents"
         )
-    return shared
+    return shared, schema_differences
 
 
 def diff(
@@ -362,7 +483,18 @@ def diff(
     threshold: int = 10_000,
     max_diffs: int | None = DEFAULT_MAX_DIFFS,
 ) -> DiffResult:
-    """Compare ``a_table`` on side ``a`` with ``b_table`` on side ``b``."""
+    """Compare ``a_table`` on side ``a`` with ``b_table`` on side ``b``.
+
+    The caller owns both dialects and must close them, whether this returns
+    or raises: `diff` never closes what it was handed, so a dialect can be
+    reused for a second comparison. Close them in a ``finally``, or open them
+    with ``with get_dialect(...) as a:`` - a PostgreSQL side left open after
+    an error holds its REPEATABLE READ snapshot until the process exits.
+
+    Any error a dialect raises during the walk is re-raised as a
+    ``ValueError`` naming the side and table (see `_on_side`), chained to
+    the driver's original exception.
+    """
     started = time.perf_counter()
     stats = DiffStats()
     warnings: list[str] = []
@@ -371,6 +503,10 @@ def diff(
         raise ValueError(f"bisection_factor must be >= 2, got {bisection_factor}")
     if threshold < 1:
         raise ValueError(f"threshold must be >= 1, got {threshold}")
+    if max_diffs is not None and max_diffs < 0:
+        # A negative limit is "already reached" before the first bucket, so
+        # identical tables would come back "partial". `None` means no limit.
+        raise ValueError(f"max_diffs must be >= 0 or None, got {max_diffs}")
     # Checked before any query: two sides rounding floats differently would
     # report every float row as changed.
     require_matching_scales(a, b)
@@ -390,9 +526,13 @@ def diff(
             *args_a: Any,
             _args_b: tuple[Any, ...] | None = None,
         ) -> tuple[Any, Any]:
-            """Call the same method on both sides at once and wait for both."""
-            fa = pool.submit(getattr(a, fn_name), a_table, *args_a)
-            fb = pool.submit(getattr(b, fn_name), b_table, *(_args_b or args_a))
+            """Call the same method on both sides at once and wait for both.
+
+            Every query of the walk goes through here, so `_on_side` makes
+            each error, whichever engine raised it, name its side and table.
+            """
+            fa = pool.submit(_on_side, "A", a, fn_name, a_table, *args_a)
+            fb = pool.submit(_on_side, "B", b, fn_name, b_table, *(_args_b or args_a))
             stats.queries += 2
             return _gather(fa, fb)
 
@@ -413,7 +553,9 @@ def diff(
         key_a, key_b = _resolve_key(key, cols_a, cols_b, a_table, b_table, warnings)
         key_folds = {c.name.casefold() for c in key_a.columns}
 
-        shared = _select_columns(cols_a, cols_b, key_folds, columns, exclude, warnings)
+        shared, schema_differences = _select_columns(
+            cols_a, cols_b, key_folds, columns, exclude, warnings
+        )
         a_cols = [cols_a[f] for f in shared]
         b_cols = [cols_b[f] for f in shared]
         # A dialect whose FLOAT rendering is not verified against the shared
@@ -461,10 +603,77 @@ def diff(
 
         diffs: list[RowDiff] = []
         truncated = False
+        #: Checksum mismatches the downloaded rows could not account for.
+        unexplained: list[str] = []
         #: Differences or key ranges the walk knowingly did not look at. Any
         #: non-zero value means the answer is partial.
         unchecked = 0
         bounds = [v for v in (ks_a.lo, ks_a.hi, ks_b.lo, ks_b.hi) if v is not None]
+        what = "key-hash range" if key_a.hashed else "key range"
+
+        def checksums(
+            s_lo: int, s_hi: int, n: int
+        ) -> tuple[dict[int, tuple[int, int]], dict[int, tuple[int, int]]]:
+            """One checksum per bucket of `[s_lo, s_hi)`, from both sides."""
+            return both(
+                "segment_checksums",
+                key_a,
+                a_cols,
+                s_lo,
+                s_hi,
+                n,
+                _args_b=(key_b, b_cols, s_lo, s_hi, n),
+            )
+
+        def compare(
+            r_lo: int, r_hi: int, va: tuple[int, int], vb: tuple[int, int]
+        ) -> None:
+            """Download a range whose checksums differ and diff it locally.
+
+            `va`/`vb` are the two sides' (count, sum) for exactly this range.
+            The engines have *proved* the range differs, so the download has
+            to show why. If it cannot - the rows compare equal, or a side
+            hands back a different number of rows than its own checksum
+            counted - something between the server's hash and the local
+            comparison lost data: a driver dropping trailing bytes, a lossy
+            decode, a table changing between two queries. Silently reporting
+            "identical" there would be a false match built on evidence to
+            the contrary, so the range is recorded as unexplained instead.
+            """
+            rows_a, rows_b = both(
+                "fetch_range",
+                key_a,
+                a_cols,
+                r_lo,
+                r_hi,
+                _args_b=(key_b, b_cols, r_lo, r_hi),
+            )
+            stats.rows_downloaded += len(rows_a) + len(rows_b)
+            found = _compare_rows(rows_a, rows_b, [c.name for c in a_cols], diffs)
+            span = f"{what} [{r_lo}, {r_hi})"
+            miscounted = [
+                f"side {side} ({table}) counted {want:,} row(s) in its checksum "
+                f"but returned {len(got):,}"
+                for side, table, want, got in (
+                    ("A", a_table, va[0], rows_a),
+                    ("B", b_table, vb[0], rows_b),
+                )
+                if want != len(got)
+            ]
+            if miscounted:
+                unexplained.append(
+                    f"{span}: {'; '.join(miscounted)}, so rows were lost between "
+                    f"the server and the comparison and this range is unverified"
+                )
+            elif not found:
+                unexplained.append(
+                    f"{span}: the checksums of side A ({a_table}) and side B "
+                    f"({b_table}) disagree, but the {len(rows_a) + len(rows_b):,} "
+                    f"downloaded row(s) compare equal - the difference was lost "
+                    f"between the server and the comparison (a driver or decode "
+                    f"step altering values, or a table changing mid-run), so this "
+                    f"range is unverified"
+                )
 
         if bounds:
             # Half-open [lo, hi): +1 so the largest key is inside the range.
@@ -494,41 +703,14 @@ def diff(
                     # qualified rather than downloaded outright, or an identical
                     # one-row table moves rows and breaks the zero-download
                     # promise every other identical table keeps.
-                    fa = pool.submit(
-                        a.segment_checksums, a_table, key_a, a_cols, s_lo, s_hi, 1
-                    )
-                    fb = pool.submit(
-                        b.segment_checksums, b_table, key_b, b_cols, s_lo, s_hi, 1
-                    )
-                    cs_a, cs_b = _gather(fa, fb)
-                    stats.queries += 2
-                    if cs_a.get(0, EMPTY) != cs_b.get(0, EMPTY):
-                        _compare_rows(
-                            pool,
-                            a,
-                            b,
-                            a_table,
-                            b_table,
-                            key_a,
-                            key_b,
-                            a_cols,
-                            b_cols,
-                            s_lo,
-                            s_hi,
-                            diffs,
-                            stats,
-                        )
+                    cs_a, cs_b = checksums(s_lo, s_hi, 1)
+                    va, vb = cs_a.get(0, EMPTY), cs_b.get(0, EMPTY)
+                    if va != vb:
+                        compare(s_lo, s_hi, va, vb)
                     continue
 
                 n = min(bisection_factor, span)
-                fa = pool.submit(
-                    a.segment_checksums, a_table, key_a, a_cols, s_lo, s_hi, n
-                )
-                fb = pool.submit(
-                    b.segment_checksums, b_table, key_b, b_cols, s_lo, s_hi, n
-                )
-                cs_a, cs_b = _gather(fa, fb)
-                stats.queries += 2
+                cs_a, cs_b = checksums(s_lo, s_hi, n)
 
                 differing = [
                     i for i in range(n) if cs_a.get(i, EMPTY) != cs_b.get(i, EMPTY)
@@ -544,21 +726,7 @@ def diff(
                     va, vb = cs_a.get(i, EMPTY), cs_b.get(i, EMPTY)
                     b_lo_i, b_hi_i = bucket_bounds(i, s_lo, s_hi, n)
                     if max(va[0], vb[0]) <= threshold or b_hi_i - b_lo_i <= 1:
-                        _compare_rows(
-                            pool,
-                            a,
-                            b,
-                            a_table,
-                            b_table,
-                            key_a,
-                            key_b,
-                            a_cols,
-                            b_cols,
-                            b_lo_i,
-                            b_hi_i,
-                            diffs,
-                            stats,
-                        )
+                        compare(b_lo_i, b_hi_i, va, vb)
                     else:
                         queue.append((b_lo_i, b_hi_i))
 
@@ -586,32 +754,19 @@ def diff(
         warnings,
         truncated=truncated,
         float_scale=a.float_scale,
+        schema_differences=schema_differences,
+        unexplained=unexplained,
     )
 
 
 def _compare_rows(
-    pool: ThreadPoolExecutor,
-    a: Dialect,
-    b: Dialect,
-    a_table: str,
-    b_table: str,
-    key_a: KeySpec,
-    key_b: KeySpec,
-    a_cols: list[Column],
-    b_cols: list[Column],
-    lo: int,
-    hi: int,
+    rows_a: dict[int | str, tuple[str, ...]],
+    rows_b: dict[int | str, tuple[str, ...]],
+    names: list[str],
     diffs: list[RowDiff],
-    stats: DiffStats,
-) -> None:
-    """Download a proven-different range from both sides and diff it locally."""
-    fa = pool.submit(a.fetch_range, a_table, key_a, a_cols, lo, hi)
-    fb = pool.submit(b.fetch_range, b_table, key_b, b_cols, lo, hi)
-    rows_a, rows_b = _gather(fa, fb)
-    stats.queries += 2
-    stats.rows_downloaded += len(rows_a) + len(rows_b)
-
-    names = [c.name for c in a_cols]
+) -> int:
+    """Diff two downloaded ranges locally; return how many differences it added."""
+    before = len(diffs)
     # `strict=True` on every zip below is load-bearing, not tidiness. Both sides
     # render the same column list in the same order, so the tuples must be the
     # same length as `names`. If that invariant ever broke, a plain zip would
@@ -645,3 +800,4 @@ def _compare_rows(
                     {n: v for n, v in zip(names, rb, strict=True) if n in changed},
                 )
             )
+    return len(diffs) - before

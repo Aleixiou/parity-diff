@@ -110,11 +110,6 @@ def base(tmp_path_factory) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F1: a column dropped on side B exits 0 'identical' and --quiet "
-    "hides the only warning, so a CI gate passes a lossy migration",
-)
 def test_quiet_ci_gate_does_not_pass_a_dropped_column_silently(base, tmp_path):
     """The README's own CI recipe is `--quiet`, relying on the exit code alone.
 
@@ -128,24 +123,41 @@ def test_quiet_ci_gate_does_not_pass_a_dropped_column_silently(base, tmp_path):
     assert code != EXIT_IDENTICAL or "amount" in (out + err)
 
 
-def test_dropped_column_is_at_least_named_without_quiet(base, tmp_path):
-    """Without --quiet the skipped column is named, in both formats."""
+def test_dropped_column_is_named_and_not_identical(base, tmp_path):
+    """The skipped column is named, in both formats, and the verdict is not a
+    match (RT-F1): the headline does not say "no differences", JSON says
+    `identical: false` with the column under `schema_differences`, exit 1."""
     b = build(str(tmp_path / "rt_cli_b.duckdb"), 2_000, "alter table orders drop amount")
     code, out, _ = run_cli(*duck_args(base, b))
     assert "present only on side A: ['amount']" in out
+    assert "no differences" not in out.splitlines()[0]
     code_j, out_j, _ = run_cli(*duck_args(base, b, "--json"))
     payload = json.loads(out_j)
-    assert any("amount" in w for w in payload["warnings"])
+    assert any("amount" in w for w in payload["schema_differences"])
     assert "amount" not in payload["columns_compared"]
-    # Documented behaviour (README "Limitations"), but note: exit 0, identical.
-    assert code == code_j == EXIT_IDENTICAL and payload["identical"] is True
+    assert payload["differences"] == [] and payload["identical"] is False
+    assert code == code_j == EXIT_DIFFERENCES
+    # Setting the column aside deliberately is a match again.
+    code_x, out_x, _ = run_cli(*duck_args(base, b, "--exclude", "amount", "--json"))
+    assert code_x == EXIT_IDENTICAL, out_x
+    assert json.loads(out_x)["schema_differences"] == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F1: side B keeping only the key column exits 0 'no differences' "
-    "although every value on A changed - only a trailing warning says so",
-)
+def test_dropped_column_with_a_planted_row_difference_reports_both(base, tmp_path):
+    """A schema difference never hides a row difference, or the reverse."""
+    b = build(
+        str(tmp_path / "rt_cli_b2.duckdb"),
+        2_000,
+        "alter table orders drop amount",
+        "update orders set status = 'CHANGED' where id = 9",
+    )
+    code, out, _ = run_cli(*duck_args(base, b, "--json"))
+    payload = json.loads(out)
+    assert code == EXIT_DIFFERENCES
+    assert [(d["key"], d["columns"]) for d in payload["differences"]] == [(9, ["status"])]
+    assert payload["schema_differences"]
+
+
 def test_a_key_only_side_b_is_not_reported_identical(base, tmp_path):
     """The extreme of RT-F1: B lost every non-key column.
 
@@ -171,15 +183,32 @@ def test_quiet_wins_over_json_and_keeps_the_exit_code(base, mixed):
         "",
         "",
     )
-    assert run_cli(*duck_args(base, base, "--quiet", "--json")) == (EXIT_IDENTICAL, "", "")
+    assert run_cli(*duck_args(base, base, "--quiet", "--json")) == (
+        EXIT_IDENTICAL,
+        "",
+        "",
+    )
 
 
 @pytest.mark.parametrize(
     "argv",
     [
         ["diff", "--a", "duckdb:///:memory:"],  # required flags missing
-        ["diff", "--a", "x", "--a-table", "t", "--b", "y", "--b-table", "t",
-         "--key", "id", "--max-diffs", "ten"],
+        [
+            "diff",
+            "--a",
+            "x",
+            "--a-table",
+            "t",
+            "--b",
+            "y",
+            "--b-table",
+            "t",
+            "--key",
+            "id",
+            "--max-diffs",
+            "ten",
+        ],
         ["frobnicate"],
     ],
 )
@@ -255,16 +284,25 @@ def test_refused_keys_exit_two_with_quiet_and_json(base, tmp_path, plant, needle
         assert needle in err and "side B" in err
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F10: --max-diffs -1 is accepted and turns identical tables "
-    "into 'at least 0 differences', exit 1",
-)
 def test_negative_max_diffs_does_not_invent_a_difference(base):
-    """Identical tables must never exit 1. A negative limit should be refused."""
-    code, out, _ = run_cli(*duck_args(base, base, "--max-diffs", "-1"))
-    assert code != EXIT_DIFFERENCES
-    assert "at least 0" not in out
+    """Identical tables must never exit 1. A negative limit is refused as a
+    usage error (exit 2, like `--max-diffs ten`); 0 still means no limit."""
+    with pytest.raises(SystemExit) as exc:
+        run_cli(*duck_args(base, base, "--max-diffs", "-1"))
+    assert exc.value.code == EXIT_ERROR
+    assert run_cli(*duck_args(base, base, "--max-diffs", "0"))[0] == EXIT_IDENTICAL
+    # The library refuses it too, rather than calling identical tables partial.
+    from conftest import open_duckdb
+
+    from parity.engine import diff
+
+    a, b = open_duckdb(base, side="A"), open_duckdb(base, side="B")
+    try:
+        with pytest.raises(ValueError, match="max_diffs"):
+            diff(a, b, "main.orders", "main.orders", "id", max_diffs=-1)
+    finally:
+        a.close()
+        b.close()
 
 
 # ---------------------------------------------------------------------------
@@ -390,11 +428,6 @@ def test_key_with_spaces_and_repeats_is_one_key(base, tmp_path):
     assert not any("hash" in w for w in payload["warnings"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F15: --key de-duplicates case-sensitively but matches "
-    "case-insensitively, so `ID,id` becomes a hashed composite of one column",
-)
 def test_key_named_twice_in_two_cases_is_one_key(base, tmp_path):
     """The difference is still found, but keyed `33` and hashed."""
     b = build(
@@ -463,11 +496,6 @@ def test_a_column_whose_name_has_a_comma_is_still_compared_by_default(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F7: data reaches the terminal raw, so a value containing a "
-    "newline or ANSI escapes can forge a 'no differences' line",
-)
 def test_a_hostile_value_cannot_forge_the_verdict_in_human_output(base, tmp_path):
     """A changed text value is printed verbatim, control characters included.
 
@@ -488,11 +516,6 @@ def test_a_hostile_value_cannot_forge_the_verdict_in_human_output(base, tmp_path
     assert not any(line.startswith("✓ no differences") for line in out.splitlines())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F7: a text key reaches the terminal raw, so a hostile key on "
-    "one side can forge a 'no differences' line and carry ANSI escapes",
-)
 def test_a_hostile_key_cannot_forge_the_verdict_in_human_output(tmp_path):
     """Same as above through the key: an extra row on B whose key is the forgery."""
     a, b = str(tmp_path / "rt_cli_fa.duckdb"), str(tmp_path / "rt_cli_fb.duckdb")
@@ -518,12 +541,6 @@ def test_a_hostile_key_cannot_forge_the_verdict_in_human_output(tmp_path):
         ("", "''"),  # an empty string against two apostrophes
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F8: _display renders NULL as NULL and '' as '', so the strings "
-    "'NULL' and \"''\" print identically to them and the human report shows a "
-    "difference whose two sides look the same",
-)
 def test_display_never_shows_two_different_values_alike(tmp_path, a_value, b_value):
     """Row 5's note differs between the sides; the two printed values must too."""
     a = build(
@@ -545,11 +562,6 @@ def test_display_never_shows_two_different_values_alike(tmp_path, a_value, b_val
     assert a_val != b_val, line
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F16: a differing value the console encoding cannot represent "
-    "(cp1252 + CJK/emoji) kills the human report half-way with exit 2",
-)
 def test_unencodable_data_does_not_crash_the_human_report(base, tmp_path):
     """Windows writes redirected stdout (a CI log, `> report.txt`) in cp1252.
 
@@ -1325,9 +1337,7 @@ _TXN = re.compile(r"^\s*(begin|rollback|commit)\b", re.IGNORECASE)
 
 
 @pytest.mark.postgres
-def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(
-    pg_url, duck_orders
-):
+def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(pg_url, duck_orders):
     """Every frontend message psycopg sends during a full diff, decoded off the wire.
 
     Proves three things the driver-level capture could not: no statement of
@@ -1364,7 +1374,9 @@ def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(
         _assert_found_the_two_planted(code, out)
         texts = [t for kind, t in tap.log if kind in ("query", "parse")]
         print("postgres wire:", tap.connections, "connection(s),", len(texts), "stmts")
-        print(sorted({t.strip()[:60] for t in texts if not t.lower().startswith("select")}))
+        print(
+            sorted({t.strip()[:60] for t in texts if not t.lower().startswith("select")})
+        )
         assert tap.connections == 1
         assert [k for k, _ in tap.log if k not in ("query", "parse")] == []
         assert [t for t in texts if not (_READ.match(t) or _TXN.match(t))] == []
@@ -1388,7 +1400,9 @@ def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
     `transaction_read_only` - the wire confirms RT-F11 from the server's side.
     """
     u = urlparse(mysql_url)
-    tap = _WireTap((u.hostname or "127.0.0.1", u.port or 3306), _mysql_parser, _mysql_greeting)
+    tap = _WireTap(
+        (u.hostname or "127.0.0.1", u.port or 3306), _mysql_parser, _mysql_greeting
+    )
     try:
         tapped = f"{u.scheme}://{u.netloc.rsplit('@', 1)[0]}@127.0.0.1:{tap.port}{u.path}"
         code, out, err = run_cli(
@@ -1398,7 +1412,12 @@ def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
         )  # fmt: skip
         _assert_found_the_two_planted(code, out)
         texts = [t for kind, t in tap.log if kind == "query"]
-        print("mysql wire:", len(texts), "stmts", sorted({t[:60] for t in texts if not t.lower().startswith("select")}))
+        print(
+            "mysql wire:",
+            len(texts),
+            "stmts",
+            sorted({t[:60] for t in texts if not t.lower().startswith("select")}),
+        )
         assert tap.connections == 1
         assert {t for k, t in tap.log if k == "command"} <= {"ping", "quit"}
         assert [t for t in texts if not _READ.match(t)] == []

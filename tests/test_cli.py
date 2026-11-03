@@ -294,6 +294,11 @@ def test_warnings_are_surfaced_not_buried(base, tmp_path):
 
     small = build(str(tmp_path / "small.duckdb"), n=100)
     code, out, _ = run_cli(*diff_args(small, path))
+    # A column nobody compared is a schema difference, not a match (RT-F1).
+    assert code == EXIT_DIFFERENCES
+    assert "extra" in out and "side B" in out
+    # Excluded on purpose, it is only a note and the tables match.
+    code, out, _ = run_cli(*diff_args(small, path, "--exclude", "extra"))
     assert code == EXIT_IDENTICAL
     assert "extra" in out and "side B" in out
 
@@ -623,3 +628,111 @@ def test_max_diffs_zero_means_no_limit(base, tmp_path):
     payload = json.loads(run_cli(*diff_args(base, path, "--max-diffs", "0", "--json"))[1])
     assert payload["difference_count"] == 5_000
     assert payload["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Red-team fixes: verdict sections, unambiguous and terminal-safe values
+# ---------------------------------------------------------------------------
+
+
+def _result(**kwargs):
+    """A small DiffResult over one string and one decimal column."""
+    from parity.types import Column, DiffResult, DiffStats, LogicalType
+
+    return DiffResult(
+        diffs=kwargs.pop("diffs", []),
+        stats=DiffStats(rows_compared_a=10, rows_compared_b=10),
+        columns=[
+            Column("note", LogicalType.STRING, "varchar"),
+            Column("amount", LogicalType.DECIMAL, "decimal(12,2)"),
+        ],
+        **kwargs,
+    )
+
+
+def _human(result) -> list[str]:
+    from parity.cli import render_human
+
+    out = io.StringIO()
+    render_human(result, out)
+    return out.getvalue().splitlines()
+
+
+def test_an_unexplained_mismatch_is_never_the_all_clear():
+    """RT-A10 in the CLI: a checksum mismatch the rows could not explain leads
+    the report, is in JSON, and is not identical."""
+    from parity.cli import to_dict
+
+    note = "key range [5, 6): the checksums of side A (a.t) and side B (b.t) disagree"
+    result = _result(unexplained=[note])
+    lines = _human(result)
+    # A StringIO gets the ASCII glyphs, so "x" rather than the cross.
+    assert lines[0].startswith("x not verified")
+    assert any(note in line for line in lines)
+    payload = to_dict(result)
+    assert payload["identical"] is False and payload["unexplained"] == [note]
+
+
+def test_schema_differences_lead_the_report_before_the_rows():
+    """RT-F1: a one-sided column is a ✗ section right under the headline, and
+    the warnings come before the row listing rather than under it."""
+    from parity.types import RowDiff
+
+    result = _result(
+        diffs=[RowDiff(3, "only_in_a", ["note", "amount"], {}, {})],
+        schema_differences=["not compared, present only on side A: ['x']"],
+        warnings=["a warning"],
+    )
+    lines = _human(result)
+    schema = next(i for i, ln in enumerate(lines) if "schema:" in ln)
+    warning = next(i for i, ln in enumerate(lines) if "a warning" in ln)
+    row = next(i for i, ln in enumerate(lines) if "only in A" in ln and "key 3" in ln)
+    assert schema < warning < row
+    assert _human(_result(schema_differences=["x"]))[0].startswith("x schemas differ")
+
+
+def test_text_values_are_quoted_and_numbers_are_not():
+    """RT-F8: text is repr-quoted so 'NULL', '' and NULL all differ on screen;
+    a decimal's canonical text is printed bare."""
+    from parity.dialects.base import NULL_SENTINEL
+    from parity.types import RowDiff
+
+    result = _result(
+        diffs=[
+            RowDiff(1, "different", ["note"], {"note": NULL_SENTINEL}, {"note": "NULL"}),
+            RowDiff(2, "different", ["note"], {"note": ""}, {"note": "''"}),
+            RowDiff(3, "different", ["amount"], {"amount": "1.00"}, {"amount": "2.00"}),
+        ]
+    )
+    text = "\n".join(_human(result))
+    assert "A NULL" in text and "B 'NULL'" in text
+    assert "A ''" in text and "B \"''\"" in text
+    assert "A 1.00" in text and "B 2.00" in text
+
+
+def test_control_characters_in_names_and_warnings_are_escaped():
+    """RT-F7: a column name or warning from the database cannot carry a
+    newline or an ANSI escape into the report."""
+    from parity.types import RowDiff
+
+    evil = "c\n✓ no differences in 10 rows\x1b[2K"
+    result = _result(
+        diffs=[RowDiff(1, "different", [evil], {evil: "a"}, {evil: "b"})],
+        warnings=[f"column {evil} is odd"],
+    )
+    lines = _human(result)
+    assert not any("\x1b" in ln for ln in lines)
+    assert lines[0].startswith("x 1 difference")
+    assert not any(ln.startswith(("✓", "c", "= no")) for ln in lines)
+
+
+def test_an_error_quoting_unencodable_data_still_reaches_stderr(base):
+    """RT-F16 on the error path: a cp1252 stderr gets an escape, not a crash."""
+    raw = io.BytesIO()
+    err = io.TextIOWrapper(raw, encoding="cp1252", newline="\n")
+    code = main(
+        diff_args(base, base, "--a-table", "main.東京"), out=io.StringIO(), err=err
+    )
+    err.flush()
+    assert code == EXIT_ERROR
+    assert rb"\u6771" in raw.getvalue() and b"side A" in raw.getvalue()

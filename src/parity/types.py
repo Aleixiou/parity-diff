@@ -162,11 +162,31 @@ class DiffResult:
     #: Decimal places at which DECIMAL/FLOAT columns were compared. Surfaced
     #: in output so a reader knows the comparison was rounded, not exact.
     float_scale: int = 6
+    #: Columns one side has and the other lacks, that the user did not set
+    #: aside with ``exclude`` or ``columns``. Their contents were never
+    #: compared, so the tables cannot be called identical however well the
+    #: shared columns agree: a migration that dropped a column outright is the
+    #: most destructive defect there is, and "no differences" over the columns
+    #: that survived must not read as a pass.
+    schema_differences: list[str] = field(default_factory=list)
+    #: Key ranges whose checksums disagreed but whose downloaded rows could not
+    #: account for it - they compared equal, or a side returned a different
+    #: number of rows than its own checksum counted. The engines proved a
+    #: difference exists there; something between the server and the local
+    #: comparison (a driver dropping bytes, a lossy decode, a live table
+    #: changing between queries) lost it. Never a reason to say "identical".
+    unexplained: list[str] = field(default_factory=list)
 
     @property
     def identical(self) -> bool:
-        """No differences found *and* the whole key space was walked."""
-        return not self.diffs and not self.truncated
+        """Proven to match: no differences, the whole key space walked, every
+        column on both sides compared, and every checksum mismatch explained."""
+        return (
+            not self.diffs
+            and not self.truncated
+            and not self.schema_differences
+            and not self.unexplained
+        )
 
     def by_kind(self, kind: str) -> list[RowDiff]:
         """The differences of one kind: only_in_a, only_in_b or different."""
