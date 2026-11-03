@@ -692,6 +692,98 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# ---------------------------------------------------------------------------
+# Row filters (`--where`)
+# ---------------------------------------------------------------------------
+#
+# A row filter is the user's own SQL, run against the user's own database, so
+# this is not a security boundary - the user can already run any SQL they
+# like there. What it must guarantee is that the tool's read stays one read:
+# the predicate is pasted, parenthesised, into the WHERE clause of every query
+# that reads the table, so it must not be able to end that statement (`;`),
+# hide the rest of it (a comment), or close the parentheses it is wrapped in
+# and so escape the bucket bounds it is ANDed with (`1=1) or (1=1`). The
+# sessions are read-only besides (CLAUDE.md 4.9, 4.11), which is what keeps
+# a predicate that calls a writing function from writing.
+
+#: Quote characters a predicate may use: string literals everywhere, quoted
+#: identifiers (`"` standard, `` ` `` MySQL and BigQuery). A quote of one kind
+#: ends only at the same kind; doubling it (`'it''s'`) closes and reopens, on
+#: every engine alike. `[` opens a SQL Server identifier (or a subscript) and
+#: is skipped to the first `]`: the engine's own region is never shorter.
+_FILTER_QUOTES = {"'": "'", '"': '"', "`": "`", "[": "]"}
+
+#: Text that changes where a quoted region ends on some engines and not on
+#: others, so the scan below could disagree with an engine about which
+#: parentheses are code: a backslash before a quote (an escape on MySQL,
+#: BigQuery and Snowflake, a plain character elsewhere), BigQuery's
+#: triple-quoted strings, and dollar quoting (`$$...$$`, `$tag$...$tag$`) on
+#: PostgreSQL and Snowflake.
+_FILTER_AMBIGUOUS = re.compile(r"""\\['"`]|'''|\"\"\"|\$\w*\$""")
+
+
+def _filter_scan(predicate: str) -> str | None:
+    """Find what would let `predicate` escape its parentheses, or None.
+
+    Every quoted region is skipped as the engines skip it - whatever could
+    make them disagree is refused first (`_FILTER_AMBIGUOUS`) - so the
+    parentheses counted here are the ones every engine parses as code.
+    """
+    depth = 0
+    close = ""
+    for ch in predicate:
+        if close:
+            if ch == close:
+                close = ""
+        elif ch in _FILTER_QUOTES:
+            close = _FILTER_QUOTES[ch]
+        elif ch == "#":
+            # MySQL reads `#` to the end of the line as a comment.
+            return "contains '#' outside a quoted string (MySQL reads it as a comment)"
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return (
+                    "closes a parenthesis it never opened, which would let it "
+                    "escape the parentheses it is wrapped in"
+                )
+    if close:
+        return f"has an unterminated quote (no closing {close})"
+    if depth:
+        return "has an unclosed parenthesis"
+    return None
+
+
+def row_filter_problem(predicate: str) -> str | None:
+    """Why `predicate` cannot be used as a row filter, or None if it can.
+
+    A sanity check, not a parser: it refuses what could end or escape the
+    statement the predicate is pasted into, and anything engines tokenise
+    differently. It is deliberately stricter than SQL - `;` or `--` inside a
+    string literal is refused too - because a refusal is an inconvenience
+    and a predicate read differently from how it was checked is not.
+    """
+    if not predicate.strip():
+        return "is empty"
+    if any(ord(c) < 32 and c not in "\t\n\r" for c in predicate):
+        return "contains a control character"
+    if ";" in predicate:
+        return "contains ';' (one predicate, not a statement; refused even in a string)"
+    for marker in ("--", "/*", "*/"):
+        if marker in predicate:
+            return f"contains {marker!r}, a SQL comment marker (refused even in a string)"
+    found = _FILTER_AMBIGUOUS.search(predicate)
+    if found:
+        return (
+            f"contains {found.group(0)!r}, which engines quote differently (a "
+            "backslash before a quote, a triple-quoted or a dollar-quoted "
+            "string); spell the value another way, with chr() for instance"
+        )
+    return _filter_scan(predicate)
+
+
 class Dialect(ABC):
     """One database engine's half of a comparison."""
 
@@ -1286,7 +1378,34 @@ class Dialect(ABC):
 
     # ------------------------------------------------------------- queries
 
-    def key_stats(self, table: str, key: KeySpec) -> KeyStats:
+    def check_where(self, where: str) -> None:
+        """Refuse a row filter this side cannot run as one read (`--where`).
+
+        Called by the engine before any query. The shared check
+        (`row_filter_problem`) refuses what could end or escape the statement;
+        a dialect with its own guard on what it runs (SQL Server) adds to it.
+        """
+        problem = row_filter_problem(where)
+        if problem:
+            raise self._err(f"row filter {where!r} {problem}")
+
+    def rows_from(self, table: str, where: str | None, *conditions: str) -> str:
+        """`from <table> where (<filter>) and <conditions...>`.
+
+        The one place a query that reads the table's rows names it, so a row
+        filter reaches every such query - the key stats, every checksum level,
+        every download and the sample - or none. The filter is parenthesised
+        and comes first, ANDed with the tool's own conditions, so `a or b`
+        cannot widen the bucket bounds. With no filter the text is exactly
+        what the queries always emitted, so no unfiltered SQL changed.
+        """
+        conds = ([f"({where.strip()})"] if where else []) + list(conditions)
+        sql = f"from {self.qualify(table)}"
+        if conds:
+            sql += " where " + " and ".join(conds)
+        return sql
+
+    def key_stats(self, table: str, key: KeySpec, where: str | None = None) -> KeyStats:
         """Key range plus row and distinct-key counts, in one scan.
 
         The range is over the *bucketing* value, which is the column itself for
@@ -1322,7 +1441,7 @@ class Dialect(ABC):
         sql = (
             f"select min({bucket}), max({bucket}), {self.count()}, "
             f"{non_null_sql}, {self.count_distinct_key(key, identity)} "
-            f"from {self.qualify(table)}"
+            f"{self.rows_from(table, where)}"
         )
         lo, hi, rows, non_null, distinct = self.query(sql)[0]
         if lo is None:
@@ -1347,6 +1466,7 @@ class Dialect(ABC):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> dict[int, tuple[int, int]]:
         """Return ``{segment_index: (row_count, checksum)}`` for ``[lo, hi)``.
 
@@ -1357,7 +1477,7 @@ class Dialect(ABC):
         return {
             int(seg): (int(count), int(checksum or 0))
             for seg, count, checksum in self.query(
-                self._segment_sql(table, key, columns, lo, hi, n_segments)
+                self._segment_sql(table, key, columns, lo, hi, n_segments, where)
             )
         }
 
@@ -1369,6 +1489,7 @@ class Dialect(ABC):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> str:
         """The checksum query. Split out so its shape can be tested directly."""
         k = self.key_bucket(key)
@@ -1409,11 +1530,14 @@ class Dialect(ABC):
         content = self.hash_parts(
             [*self._key_parts(key), *(self.normalize(c) for c in columns)]
         )
+        in_range = (
+            f"{k} >= {self.int_literal(lo)}",
+            f"{k} <= {self.int_literal(hi - 1)}",
+        )
         return (
             f"select {bucket} as seg, {self.count()}, "
             f"{self.sum_wide(content)} "
-            f"from {self.qualify(table)} "
-            f"where {k} >= {self.int_literal(lo)} and {k} <= {self.int_literal(hi - 1)} "
+            f"{self.rows_from(table, where, *in_range)} "
             f"group by {self.group_by(1, bucket)}"
         )
 
@@ -1448,6 +1572,7 @@ class Dialect(ABC):
         columns: Sequence[Column],
         lo: int,
         hi: int,
+        where: str | None = None,
     ) -> dict[int | str, tuple[str, ...]]:
         """Download canonical text for every row in ``[lo, hi)``.
 
@@ -1469,9 +1594,11 @@ class Dialect(ABC):
         # Inclusive upper bound, for the same reason as the checksum query:
         # `hi` is `max_key + 1`, which for a table holding the largest bigint is
         # one past what the column type can represent.
+        in_range = (f"{bucket} >= {lo}", f"{bucket} <= {hi - 1}")
         sql = (
-            f"select {identity}{exprs} from {self.qualify(table)} "
-            f"where {bucket} >= {lo} and {bucket} <= {hi - 1} order by {bucket}"
+            f"select {identity}{exprs} "
+            f"{self.rows_from(table, where, *in_range)} "
+            f"order by {bucket}"
         )
         out: dict[int | str, tuple[str, ...]] = {}
         for row in self.query(sql):
@@ -1608,6 +1735,7 @@ class Dialect(ABC):
         columns: Sequence[Column],
         modulus: int,
         residue: int,
+        where: str | None = None,
     ) -> dict[int | str, tuple[Any, ...]]:
         """Raw values of the rows whose key hash is `residue` modulo `modulus`.
 
@@ -1621,12 +1749,14 @@ class Dialect(ABC):
         if key.hashed:
             identity = self.fetch_text(identity)
         exprs = "".join(", " + self.sample_select(c) for c in columns)
-        where = ""
+        chosen: list[str] = []
         if modulus > 1:
             h = self.hash_expr(self._concat(self._key_parts(key)))
             rem = f"(({h}) - {self.int_div(h, str(modulus))} * {modulus})"
-            where = f" where {rem} = {residue}"
-        sql = f"select {identity}{exprs} from {self.qualify(table)}{where}"
+            chosen.append(f"{rem} = {residue}")
+        # Filtered like every other read: a sampled row outside the filter
+        # would be one the walk never saw, and read as a contradiction.
+        sql = f"select {identity}{exprs} {self.rows_from(table, where, *chosen)}"
         out: dict[int | str, tuple[Any, ...]] = {}
         for row in self.query(sql):
             rk: int | str = self.fetched(row[0]) if key.hashed else int(row[0])

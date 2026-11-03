@@ -444,6 +444,25 @@ class SQLServerDialect(Dialect):
         """
         return "[" + identifier.replace("]", "]]") + "]"
 
+    def check_where(self, where: str) -> None:
+        """The shared check, then this dialect's SELECT guard, up front.
+
+        Every filtered query has to pass `is_single_select`, which refuses a
+        double quote and the words that could write or change the session
+        (`_WRITE_WORDS`) outside brackets and string literals. Checking the
+        predicate here names it, before any query, instead of failing on the
+        first filtered query with the guard's generic refusal.
+        """
+        super().check_where(where)
+        if not is_single_select(f"select 1 where ({where})"):
+            raise self._err(
+                f"row filter {where!r} is refused by this dialect's SELECT guard: "
+                "on SQL Server it may not contain a double quote (bracket "
+                "identifiers instead) or, outside [brackets] and 'literals', "
+                "any of the words that could write or change the session "
+                "(into, insert, update, delete, exec, set, declare, ...)"
+            )
+
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """What makes this side's comparison less than exact, for the output."""
         out: list[str] = []
@@ -496,6 +515,7 @@ class SQLServerDialect(Dialect):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> str:
         """The shared checksum query, hash-aggregated when it is wide (RT-C8).
 
@@ -517,7 +537,7 @@ class SQLServerDialect(Dialect):
         becomes an error naming the side and table (`segment_checksums`). The
         row text and the hash are untouched, so no checksum moves.
         """
-        sql = super()._segment_sql(table, key, columns, lo, hi, n_segments)
+        sql = super()._segment_sql(table, key, columns, lo, hi, n_segments, where)
         if len(key.columns) + len(columns) >= HASH_GROUP_FROM:
             sql += " option (hash group)"
         return sql
@@ -530,6 +550,7 @@ class SQLServerDialect(Dialect):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> dict[int, tuple[int, int]]:
         """The shared checksums, with SQL Server's query-size limits named.
 
@@ -537,7 +558,9 @@ class SQLServerDialect(Dialect):
         limit" names neither side nor table; say which, and what to do.
         """
         try:
-            return super().segment_checksums(table, key, columns, lo, hi, n_segments)
+            return super().segment_checksums(
+                table, key, columns, lo, hi, n_segments, where
+            )
         except Exception as exc:
             text = str(exc)
             if "maximum row size" not in text and "expression services limit" not in text:
