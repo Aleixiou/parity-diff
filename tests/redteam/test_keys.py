@@ -95,6 +95,9 @@ def _duck_diff(tmp_path, ddl, rows_a, rows_b, key, ddl_b=None, **kw):
 
 @pytest.mark.duckdb
 def test_rt_b1_null_text_key_is_not_the_string_backslash_n(tmp_path):
+    r"""RT-B1/B2, fixed: a NULL text key is refused, never matched to a `\N` key.
+
+    A real text key `\N` (a dump's NULL marker) stays an ordinary, distinct key."""
     rows_a = [(None, 1), ("x", 2)]
     rows_b = [("\\N", 1), ("x", 2)]  # the NULL became the dump marker
     # Fixed by refusing: a NULL in a hashed key is refused like a NULL integer
@@ -110,6 +113,8 @@ def test_rt_b1_null_text_key_is_not_the_string_backslash_n(tmp_path):
 
 @pytest.mark.duckdb
 def test_rt_b1_null_composite_key_part_is_not_backslash_n(tmp_path):
+    r"""RT-B1/B2, fixed: a NULL part of a composite key is refused, not
+    rendered as `\N` and matched to a real `\N` on the other side."""
     rows_a = [(None, "x", 1), ("a", "y", 2)]
     rows_b = [("\\N", "x", 1), ("a", "y", 2)]
     # Fixed by refusing the NULL key part (RT-B2).
@@ -159,6 +164,8 @@ def test_control_null_integer_key_is_refused(tmp_path):
 
 @pytest.mark.duckdb
 def test_rt_b3_composite_keys_split_differently_are_different_rows(tmp_path):
+    """RT-B3: ('a<US>b', 'c') and ('a', 'b<US>c') join to the same bytes but
+    are different rows; the diff must not call them identical."""
     rows_a = [("a\x1fb", "c", 1)]
     rows_b = [("a", "b\x1fc", 1)]
     result = _duck_diff(
@@ -256,6 +263,10 @@ def test_rt_b4_precondition_the_eight_values_really_cancel():
     reason="RT-B4: 8 crafted row changes cancel in the additive bucket sum -> identical",
 )
 def test_rt_b4_crafted_changes_cannot_cancel_in_one_bucket(tmp_path):
+    """RT-B4 (open): eight crafted values cancel in one bucket's additive sum.
+
+    A tamper-evident checksum would find all eight; the strict xfail pins that
+    this one does not."""
     rows_a = [(k, "orig") for k in range(1, 1001)]
     rows_b = [(k, WAGNER_VALUES[k - 1] if k <= 8 else "orig") for k in range(1, 1001)]
     result = _duck_diff(tmp_path, "k bigint, v varchar", rows_a, rows_b, "k")
@@ -318,6 +329,8 @@ def test_rt_b4_the_attack_is_cheap():
     reason="RT-B4: crafted cancelling changes also pass PostgreSQL <-> DuckDB",
 )
 def test_rt_b4_live_postgres_duckdb(pg_rt, tmp_path):
+    """RT-B4 (open) across real engines: the same crafted values also read
+    identical PostgreSQL <-> DuckDB, so the collision is not a DuckDB artefact."""
     rows_a = [(k, "orig") for k in range(1, 1001)]
     rows_b = [(k, WAGNER_VALUES[k - 1] if k <= 8 else "orig") for k in range(1, 1001)]
     t = _pg_table(pg_rt, "rt_key_wagner", "k bigint, v text", rows_a)
@@ -348,6 +361,8 @@ def test_rt_b4_control_one_of_the_eight_changes_alone_is_found(tmp_path):
 
 @pytest.mark.duckdb
 def test_rt_b5_decimal_keys_differing_past_the_scale_are_different_rows(tmp_path):
+    """RT-B5: decimal keys that differ only past the float scale are two rows,
+    or at least a warning must say the key was rounded."""
     result = _duck_diff(
         tmp_path,
         "k decimal(20,10), v int",
@@ -362,6 +377,8 @@ def test_rt_b5_decimal_keys_differing_past_the_scale_are_different_rows(tmp_path
 
 @pytest.mark.duckdb
 def test_rt_b5_double_keys_differing_past_the_scale_are_different_rows(tmp_path):
+    """RT-B5, fixed by refusing: a FLOAT key is rejected, since no rendering of
+    a double is exact on every engine and nearby keys would merge."""
     # Fixed by refusing: no rendering of a double is exact on every engine.
     with pytest.raises(ValueError, match="FLOAT column 'k' cannot be used as a key"):
         _duck_diff(tmp_path, "k double, v int", [(1.0000001, 1)], [(1.0000004, 1)], "k")
@@ -660,6 +677,8 @@ def test_threshold_edges(tmp_path, n_rows, changed):
     ids=["both-empty", "b-empty", "a-empty", "opposite-ends", "one-row", "null-vs-empty"],
 )
 def test_degenerate_tables(tmp_path, rows_a, rows_b, want):
+    """Empty tables, one-row tables and keys at both ends of bigint each
+    report exactly their planted difference - including NULL versus ''."""
     result = _duck_diff(tmp_path, "k bigint, v varchar", rows_a, rows_b, "k")
     assert _found(result) == want
 
@@ -672,6 +691,7 @@ def test_moves_swaps_and_same_content_reshuffles(tmp_path, hashed):
     see them. Each must be found exactly."""
 
     def key(i):
+        """The i-th key as an integer or, for the hashed case, as text."""
         return f"key-{i}" if hashed else i
 
     ddl = ("k varchar" if hashed else "k bigint") + ", v varchar, w int"
@@ -716,6 +736,8 @@ def test_moves_swaps_and_same_content_reshuffles(tmp_path, hashed):
     ids=["case", "trailing-space", "leading-zero", "nfc-vs-nfd", "zero-width"],
 )
 def test_text_keys_that_look_alike_are_different_rows(tmp_path, ka, kb):
+    """Text keys that only look alike (case, padding, zero-width, NFC/NFD)
+    are two different rows, never matched to each other."""
     result = _duck_diff(tmp_path, "k varchar, v int", [(ka, 1)], [(kb, 1)], "k")
     assert sorted(_found(result)) == sorted([(ka, "only_in_a"), (kb, "only_in_b")])
 
@@ -736,6 +758,8 @@ def test_composite_parts_cannot_smear_without_the_separator(tmp_path):
 @pytest.mark.duckdb
 @pytest.mark.parametrize("hashed", [False, True], ids=["int-key", "text-key"])
 def test_duplicate_key_on_one_side_only_is_refused(tmp_path, hashed):
+    """A key duplicated on one side only is refused, for integer and hashed
+    keys alike - a duplicate would make the bucket counts meaningless."""
     k = "dup" if hashed else 7
     ddl = ("k varchar" if hashed else "k bigint") + ", v int"
     with pytest.raises(ValueError, match="not unique"):
@@ -748,6 +772,7 @@ def test_duplicate_key_on_one_side_only_is_refused(tmp_path, hashed):
 
 
 def _mysql_con():
+    """An autocommit fixture writer on the MySQL test database."""
     import mysql.connector
 
     u = urlparse(MYSQL_URL)
@@ -775,6 +800,7 @@ def pg_rt(pg_url):
 
 
 def _pg_table(con, name: str, ddl: str, rows: list[tuple]) -> str:
+    """Recreate `name` in our own schema with `rows`; return its qualified name."""
     q = f"{PG_RT_SCHEMA}.{name}"
     con.execute(f"drop table if exists {q}")
     con.execute(f"create table {q} ({ddl})")
@@ -787,6 +813,7 @@ def _pg_table(con, name: str, ddl: str, rows: list[tuple]) -> str:
 
 @pytest.fixture(scope="module")
 def mysql_rt(mysql_url):
+    """A MySQL writer plus the tables it made, dropped at the end of the module."""
     con = _mysql_con()
     made: list[str] = []
     yield con, made
@@ -797,6 +824,7 @@ def mysql_rt(mysql_url):
 
 
 def _mysql_table(rt, name: str, ddl: str, rows: list[tuple]) -> str:
+    """Recreate `name` on MySQL with `rows`, recording it for cleanup."""
     con, made = rt
     cur = con.cursor()
     cur.execute(f"drop table if exists `{name}`")
@@ -810,6 +838,7 @@ def _mysql_table(rt, name: str, ddl: str, rows: list[tuple]) -> str:
 
 @pytest.fixture(scope="module")
 def mssql_rt(mssql_url):
+    """A SQL Server schema of our own and the tables in it, dropped afterwards."""
     import mssql_python
 
     from parity.dialects.mssql_dialect import parse_mssql_url
@@ -831,6 +860,7 @@ def mssql_rt(mssql_url):
 
 
 def _mssql_table(rt, name: str, ddl: str, rows: list[tuple]) -> str:
+    """Recreate `name` in our SQL Server schema with `rows`, recorded for cleanup."""
     con, made = rt
     cur = con.cursor()
     q = f"[{MSSQL_RT_SCHEMA}].[{name}]"
@@ -844,6 +874,7 @@ def _mssql_table(rt, name: str, ddl: str, rows: list[tuple]) -> str:
 
 
 def _live_diff(url_a, t_a, url_b, t_b, key, **kw):
+    """Open both sides from their URLs, diff, and always close both dialects."""
     a = get_dialect(url_a, side="A")
     b = get_dialect(url_b, side="B")
     try:
@@ -859,6 +890,7 @@ def _live_diff(url_a, t_a, url_b, t_b, key, **kw):
 @pytest.mark.postgres
 @pytest.mark.duckdb
 def test_rt_b1_live_postgres_null_key_vs_duckdb_backslash_n(pg_rt, tmp_path):
+    r"""RT-B1/B2 live: a PostgreSQL NULL key is refused, not matched to DuckDB's `\N`."""
     t = _pg_table(pg_rt, "rt_key_nullk", "k text, v int", [(None, 1), ("x", 2)])
     p = _duck(tmp_path, "b", "k varchar, v int", [("\\N", 1), ("x", 2)])
     # Fixed by refusing the NULL key (RT-B2).
@@ -869,6 +901,7 @@ def test_rt_b1_live_postgres_null_key_vs_duckdb_backslash_n(pg_rt, tmp_path):
 @pytest.mark.postgres
 @pytest.mark.mysql
 def test_rt_b1_live_mysql_null_part_vs_postgres_backslash_n(pg_rt, mysql_rt):
+    r"""RT-B1/B2 live: a NULL MySQL key part is refused, not matched to PostgreSQL's `\N`."""
     tm = _mysql_table(
         mysql_rt,
         "rt_key_nullc",
@@ -886,6 +919,8 @@ def test_rt_b1_live_mysql_null_part_vs_postgres_backslash_n(pg_rt, mysql_rt):
 @pytest.mark.mssql
 @pytest.mark.postgres
 def test_rt_b1_b3_live_mssql_against_postgres(pg_rt, mssql_rt):
+    r"""RT-B1/B3 live, SQL Server against PostgreSQL: keys split differently around
+    0x1f are distinct rows, and a NULL key part is refused rather than read as `\N`."""
     ms = _mssql_table(
         mssql_rt,
         "rt_key_mix",
@@ -959,6 +994,8 @@ LIVE_KEYS = sorted(
 
 
 def _plant(keys):
+    """Plant nine seeded changes, deletes and inserts; return both sides and
+    the sorted differences the walk must find."""
     a = {k: f"v{k % 5}" for k in keys}
     b = dict(a)
     picks = random.Random(11).sample(keys, 9)
@@ -980,6 +1017,8 @@ def _plant(keys):
 @pytest.mark.mysql
 @pytest.mark.parametrize("bf", [2, 7, 32])
 def test_live_walk_postgres_mysql_boundaries_and_extremes(pg_rt, mysql_rt, bf):
+    """The bucket walk, PostgreSQL against MySQL, over boundary and extreme
+    bigint keys: every planted difference is found at several factors."""
     rows_a, rows_b, want = _plant(LIVE_KEYS)
     tp = _pg_table(pg_rt, "rt_key_walk", "k bigint, v text", rows_a)
     tm = _mysql_table(mysql_rt, "rt_key_walk", "k bigint, v varchar(20)", rows_b)
@@ -991,6 +1030,8 @@ def test_live_walk_postgres_mysql_boundaries_and_extremes(pg_rt, mysql_rt, bf):
 @pytest.mark.mssql
 @pytest.mark.parametrize("bf", [3, 32])
 def test_live_walk_mssql_postgres_boundaries_and_extremes(pg_rt, mssql_rt, bf):
+    """The bucket walk, SQL Server against PostgreSQL, over boundary and extreme
+    bigint keys: every planted difference is found."""
     rows_a, rows_b, want = _plant(LIVE_KEYS)
     ms = _mssql_table(mssql_rt, "rt_key_walk", "k bigint, v nvarchar(20)", rows_a)
     tp = _pg_table(pg_rt, "rt_key_walk2", "k bigint, v text", rows_b)
@@ -1108,7 +1149,6 @@ def test_rt_b8_timezone_aware_key_against_naive_key_is_named(pg_rt, tmp_path):
     )
     result = _live_diff(PG_URL, t, f"duckdb:///{p}", "main.t", "k")
     assert result.identical or any("timezone" in w for w in result.warnings), (
-
         _found(result),
         result.warnings,
     )
@@ -1163,6 +1203,7 @@ def test_rt_b11_postgres_infinity_values_are_not_null(pg_rt):
 @pytest.mark.postgres
 @pytest.mark.duckdb
 def test_rt_b11_postgres_infinity_against_duckdb_null(pg_rt, tmp_path):
+    """RT-B11: a PostgreSQL date of 'infinity' is not the NULL DuckDB holds."""
     ta = _pg_table(
         pg_rt, "rt_key_inf_c", "k int, d date", [(1, "infinity"), (2, "2024-01-01")]
     )
@@ -1173,6 +1214,8 @@ def test_rt_b11_postgres_infinity_against_duckdb_null(pg_rt, tmp_path):
 
 @pytest.mark.postgres
 def test_rt_b11_postgres_infinity_keys_are_distinct(pg_rt):
+    """RT-B11: 'infinity' and '-infinity' timestamp keys stay distinct keys, so
+    the uniqueness check does not refuse them and the tables match."""
     rows = [("infinity", 1), ("-infinity", 2), ("2024-01-01", 3)]
     ta = _pg_table(pg_rt, "rt_key_infk_a", "k timestamp, v int", rows)
     tb = _pg_table(pg_rt, "rt_key_infk_b", "k timestamp, v int", rows)
@@ -1483,6 +1526,7 @@ def test_live_mssql_key_shapes_against_postgres(
 
 @pytest.mark.mssql
 def test_rt_b1_live_mssql_to_mssql(mssql_rt):
+    r"""RT-B1/B2 on SQL Server alone: a NULL text key is refused, not matched to `\N`."""
     ta = _mssql_table(
         mssql_rt, "rt_key_nk_a", "k nvarchar(10), v int", [(None, 1), ("x", 2)]
     )
@@ -1496,6 +1540,8 @@ def test_rt_b1_live_mssql_to_mssql(mssql_rt):
 
 @pytest.mark.mssql
 def test_rt_b3_live_mssql_to_mssql(mssql_rt):
+    """RT-B3 on SQL Server alone: composite keys split differently around 0x1f
+    are different rows, not one."""
     ddl = "k1 nvarchar(10), k2 nvarchar(10), v int"
     ta = _mssql_table(mssql_rt, "rt_key_sep_a", ddl, [("a\x1fb", "c", 1)])
     tb = _mssql_table(mssql_rt, "rt_key_sep_b", ddl, [("a", "b\x1fc", 1)])

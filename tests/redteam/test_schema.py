@@ -92,6 +92,7 @@ def my(mysql_url):
     cur = con.cursor()
 
     def drop_all() -> None:
+        """Drop every `rt_sch_` table, so a failed earlier run leaves nothing."""
         cur.execute(
             "select table_name from information_schema.tables "
             "where table_schema = database() and table_name like 'rt\\_sch\\_%'"
@@ -114,6 +115,7 @@ def ms(mssql_url):
     adm = Admin(mssql_url)
 
     def drop_all() -> None:
+        """Drop every table in our schema, so a failed earlier run leaves nothing."""
         for (t,) in adm.run(
             MSSQL_DB,
             "select name from sys.tables where schema_name(schema_id) = ?",

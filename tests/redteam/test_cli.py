@@ -620,6 +620,7 @@ def test_ctrl_c_mid_walk_prints_no_verdict(base, tmp_path, monkeypatch):
     calls = {"n": 0}
 
     def interrupted(fa, fb):
+        """Pass the first two gathers through, then raise as a real Ctrl-C would."""
         calls["n"] += 1
         if calls["n"] == 3:  # columns, key_stats, then the first checksum level
             raise KeyboardInterrupt
@@ -724,6 +725,7 @@ def test_mysql_url_options_are_honoured_or_refused(monkeypatch):
     seen: dict[str, Any] = {}
 
     def fake_connect(**kwargs):
+        """Record the driver's keyword arguments and stop before any connect."""
         seen.update(kwargs)
         raise RuntimeError("stop before the network")
 
@@ -873,14 +875,17 @@ class _Recorder:
     """Wrap a DB-API connection or cursor and log every SQL string sent."""
 
     def __init__(self, target: Any, log: list[str]) -> None:
+        """Store the wrapped object without tripping our own `__setattr__`."""
         object.__setattr__(self, "_t", target)
         object.__setattr__(self, "_log", log)
 
     def __getattr__(self, name: str) -> Any:
+        """Log SQL on `execute`; wrap new cursors so their SQL is logged too."""
         value = getattr(self._t, name)
         if name in ("execute", "executemany"):
 
             def execute(sql: Any, *a: Any, **k: Any) -> Any:
+                """Log the SQL, run it, and keep returning the recorder, not the raw cursor."""
                 self._log.append(str(sql))
                 result = value(sql, *a, **k)
                 return result if result is not self._t else self
@@ -891,16 +896,20 @@ class _Recorder:
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:
+        """Forward attribute writes (e.g. `autocommit`) to the real object."""
         setattr(self._t, name, value)
 
     def __enter__(self) -> _Recorder:
+        """Enter the real object but hand back the recorder, so `with` still logs."""
         self._t.__enter__()
         return self
 
     def __exit__(self, *exc: Any) -> Any:
+        """Let the real object commit, roll back or close as it would unwrapped."""
         return self._t.__exit__(*exc)
 
     def __iter__(self) -> Iterator[Any]:
+        """Iterate the real cursor's rows, so fetching by iteration still works."""
         return iter(self._t)
 
 
@@ -1162,6 +1171,7 @@ class _WireTap:
     """
 
     def __init__(self, upstream: tuple[str, int], parser: Any, rewrite: Any = None):
+        """Listen on a free loopback port and start relaying to `upstream`."""
         import threading
 
         self._threading = threading
@@ -1176,9 +1186,11 @@ class _WireTap:
         threading.Thread(target=self._accept, daemon=True).start()
 
     def close(self) -> None:
+        """Close the listening socket, which ends the `_accept` loop."""
         self._srv.close()
 
     def _accept(self) -> None:
+        """Pair each client with a fresh upstream socket and pump both directions."""
         while True:
             try:
                 cli, _ = self._srv.accept()
@@ -1193,6 +1205,7 @@ class _WireTap:
 
     @staticmethod
     def _shut(*socks: socket.socket) -> None:
+        """Shut both ends down, so the opposite pump's `recv` returns and it exits."""
         for s in socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -1200,6 +1213,7 @@ class _WireTap:
                 pass
 
     def _c2s(self, cli: socket.socket, up: socket.socket, state: dict) -> None:
+        """Relay client to server, feeding every byte to `parser` on the way."""
         buf = bytearray()
         try:
             while data := cli.recv(65536):
@@ -1213,6 +1227,7 @@ class _WireTap:
             self._shut(cli, up)
 
     def _s2c(self, up: socket.socket, cli: socket.socket) -> None:
+        """Relay server to client, passing the first whole packet through `rewrite`."""
         first, buf = self.rewrite is not None, bytearray()
         try:
             while data := up.recv(65536):
@@ -1422,10 +1437,12 @@ def test_mssql_receives_only_selects_as_a_datareader(mssql_url, duck_orders):
     pw = "Rt!" + secrets.token_urlsafe(18)
 
     def admin(database: str):
+        """An autocommit admin connection to `database` on the test server."""
         url = f"{u.scheme}://{u.netloc}/{database}{q}"
         return mssql_python.connect(parse_mssql_url(url)[0], autocommit=True)
 
     def run(conn, sql: str):
+        """Run one admin statement, returning its rows (none for DDL)."""
         cur = conn.cursor()
         try:
             cur.execute(sql)
@@ -1566,16 +1583,19 @@ def test_mssql_select_guard_refuses_writes_spelled_as_select(sql):
         description = None
 
         def execute(self, s):
+            """Record what reached the driver - the test wants this to stay empty."""
             sent.append(s)
 
         def fetchall(self):
+            """No rows: only whether the statement was sent matters."""
             return []
 
         def close(self):
-            pass
+            """Nothing to release in the fake."""
 
     class FakeConn:
         def cursor(self):
+            """Every cursor records into the same `sent` list."""
             return FakeCursor()
 
     d = SQLServerDialect(side="A")
@@ -1599,6 +1619,7 @@ class _NetGuard:
     """
 
     def __init__(self, monkeypatch, allowed: set[str]) -> None:
+        """Patch `getaddrinfo`, `connect` and `connect_ex` to log every call."""
         self.allowed = allowed
         self.seen: list[tuple[str, Any]] = []
         self.resolved: dict[str, str] = {}
@@ -1608,6 +1629,7 @@ class _NetGuard:
         guard = self
 
         def getaddrinfo(host, port, *a, **k):
+            """Log the looked-up name and remember which name each address came from."""
             guard.seen.append(("dns", host))
             result = real_gai(host, port, *a, **k)
             # An address is only as trustworthy as the name it was resolved
@@ -1617,10 +1639,12 @@ class _NetGuard:
             return result
 
         def connect(sock, address):
+            """Log the address of a blocking connect, then really connect."""
             guard.seen.append(("connect", address))
             return real_connect(sock, address)
 
         def connect_ex(sock, address):
+            """Log the address of a non-blocking connect, then really connect."""
             guard.seen.append(("connect", address))
             return real_connect_ex(sock, address)
 
@@ -1643,6 +1667,7 @@ class _NetGuard:
         """Hosts touched that are not allowed, judging an address by its name."""
 
         def ok(h: str) -> bool:
+            """Whether `h`, or the name it was resolved from, is an allowed host."""
             name = self.resolved.get(h, h)
             return any(name == a or name.endswith("." + a) for a in self.allowed)
 
@@ -1765,6 +1790,7 @@ def test_snowflake_connection_disables_client_telemetry(monkeypatch):
     seen: dict[str, Any] = {}
 
     def fake_connect(**kwargs):
+        """Record the connector's keyword arguments and stop before any connect."""
         seen.update(kwargs)
         raise RuntimeError("stop before the network")
 

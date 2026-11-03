@@ -63,6 +63,7 @@ def engines(tmp_path_factory):
     }
 
     def get(name: str, slot: str) -> Engine:
+        """Build the engine for `(name, slot)` on first use, then reuse it."""
         if (name, slot) not in made:
             made[(name, slot)] = factory[name]()
         return made[(name, slot)]
@@ -124,6 +125,7 @@ def test_rt_a1_separator_inside_a_value_is_a_false_match(engines, ea, eb):
 
 @pytest.mark.bigquery
 def test_rt_a1_separator_collision_on_bigquery(engines):
+    """RT-A1 on BigQuery: chr(31) moved between columns is still a difference."""
     r = run_pair(
         engines,
         "a1_bq",
@@ -166,6 +168,7 @@ def test_rt_a2_backslash_n_string_equals_null(engines, ea, eb):
 
 @pytest.mark.bigquery
 def test_rt_a2_backslash_n_string_on_bigquery(engines):
+    r"""RT-A2 on BigQuery: the string `\N` is not the NULL DuckDB holds."""
     r = run_pair(
         engines,
         "a2_bq",
@@ -219,6 +222,8 @@ def test_rt_a4_composite_key_separator_collision(engines, ea, eb):
 
 
 def test_rt_a4_composite_key_collision_refused_as_duplicate(engines):
+    """RT-A4: keys that join to the same bytes around 0x1f stay two distinct
+    keys, so only the one planted change is reported."""
     rows = [(f"a{SEP}b", "c", 1), ("a", f"b{SEP}c", 2)]
     ddl = "k1 varchar, k2 varchar, x int"
     r = run_pair(
@@ -250,6 +255,7 @@ def test_rt_a3_composite_key_null_component(engines):
 
 @pytest.mark.parametrize("typ", ["date", "timestamp", "timestamptz"])
 def test_rt_a5_pg_infinity_equals_minus_infinity(engines, typ):
+    """RT-A5: PostgreSQL 'infinity' and '-infinity' are different values."""
     r = run_pair(
         engines,
         f"a5_{typ}",
@@ -260,6 +266,7 @@ def test_rt_a5_pg_infinity_equals_minus_infinity(engines, typ):
 
 
 def test_rt_a5_pg_infinity_matches_null_on_duckdb(engines):
+    """RT-A5: a PostgreSQL 'infinity' timestamp is not DuckDB's NULL."""
     r = run_pair(
         engines,
         "a5_null",
@@ -275,6 +282,7 @@ def test_rt_a5_pg_infinity_matches_null_on_duckdb(engines):
 
 
 def test_rt_a5_infinity_on_both_sides_is_a_false_difference(engines):
+    """RT-A5: 'infinity' on both sides matches; only the planted row differs."""
     ins = ["insert into {t} values (1, 'infinity'), (2, '2024-01-01')"]
     r = run_pair(
         engines,
@@ -292,6 +300,7 @@ def test_rt_a5_infinity_on_both_sides_is_a_false_difference(engines):
 
 @pytest.mark.parametrize("typ", ["date", "timestamp", "timestamptz"])
 def test_rt_a6_pg_bc_equals_ad(engines, typ):
+    """RT-A6: a PostgreSQL BC date is not the same AD date."""
     v = "0044-03-15" if typ == "date" else "0044-03-15 12:00:00"
     if typ == "timestamptz":
         v += "+00"
@@ -305,6 +314,7 @@ def test_rt_a6_pg_bc_equals_ad(engines, typ):
 
 
 def test_rt_a6_pg_bc_matches_duckdb_ad(engines):
+    """RT-A6: a PostgreSQL BC date is not DuckDB's AD date of the same digits."""
     r = run_pair(
         engines,
         "a6_duck",
@@ -320,6 +330,7 @@ def test_rt_a6_pg_bc_matches_duckdb_ad(engines):
 
 
 def test_rt_a6_bc_on_both_sides_is_a_false_difference(engines):
+    """RT-A6: the same BC date on both sides matches; only the planted row differs."""
     r = run_pair(
         engines,
         "a6_both",
@@ -345,6 +356,7 @@ def test_rt_a6_bc_on_both_sides_is_a_false_difference(engines):
 
 
 def _mentions_precision(warnings: list[str]) -> bool:
+    """Whether some warning tells the user timestamps lose sub-second digits."""
     return any("nanosecond" in w.lower() or "microsecond" in w.lower() for w in warnings)
 
 
@@ -443,6 +455,7 @@ def test_rt_a10_checksum_mismatch_with_equal_rows_reads_identical():
 
     class LossyFetch(FakeDialect):
         def fetch_range(self, table, key, columns, lo, hi):
+            """The real rows, but every value lower-cased - the lossy step."""
             out = super().fetch_range(table, key, columns, lo, hi)
             return {k: tuple(v.lower() for v in row) for k, row in out.items()}
 
@@ -481,6 +494,7 @@ def test_rt_a11_mssql_lone_surrogates_collide(engines):
 
 
 def test_rt_a11_mssql_lone_surrogate_matches_replacement_char(engines):
+    """RT-A11: a lone surrogate on SQL Server is not a real U+FFFD on DuckDB."""
     r = run_pair(
         engines,
         "a11_duck",
@@ -501,6 +515,7 @@ def test_rt_a11_mssql_lone_surrogate_matches_replacement_char(engines):
 
 
 def test_rt_a12_duckdb_union_tag_is_lost(engines):
+    """RT-A12: DuckDB UNION values 1 (int) and '1' (varchar) are different."""
     ddl = "id int, u union(n int, s varchar)"
     r = run_pair(
         engines,
@@ -583,6 +598,7 @@ def test_rt_a14_integer_key_vs_decimal_key(engines, a, b):
 
 
 def test_rt_a15_cli_prints_backslash_n_as_null(engines):
+    r"""RT-A15: a real `\N` string is found and not printed as NULL in the report."""
     r = run_pair(
         engines,
         "a15",

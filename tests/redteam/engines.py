@@ -62,10 +62,12 @@ class DuckDBEngine(Engine):
     placeholder = "?"
 
     def __init__(self, directory: str) -> None:
+        """Remember where each side's DuckDB file goes; `build` sets the path."""
         self.directory = directory
         self.path = ""
 
     def build(self, table, ddl, rows=(), raw=()):
+        """Write a fresh DuckDB file holding `table`, so `open` reads only it."""
         import duckdb
 
         self.path = os.path.join(self.directory, f"{table}.duckdb")
@@ -84,6 +86,7 @@ class DuckDBEngine(Engine):
         return table
 
     def open(self, side):
+        """Open the file `build` wrote, read-only, as parity would."""
         return get_dialect(f"duckdb:///{self.path}", side=side)
 
 
@@ -91,6 +94,7 @@ class PostgresEngine(Engine):
     name = "postgres"
 
     def __init__(self) -> None:
+        """Connect an autocommit fixture writer, or skip when no server answers."""
         import psycopg
 
         try:
@@ -100,6 +104,7 @@ class PostgresEngine(Engine):
         self.tables: list[str] = []
 
     def build(self, table, ddl, rows=(), raw=()):
+        """Recreate `public.<table>` and fill it via bound rows and raw statements."""
         q = f'public."{table}"'
         self.con.execute(f"drop table if exists {q}")
         self.con.execute(f"create table {q} ({ddl})")
@@ -112,12 +117,15 @@ class PostgresEngine(Engine):
         return table
 
     def ref(self, table):
+        """PostgreSQL tables live in `public`, so parity gets the qualified name."""
         return f"public.{table}"
 
     def open(self, side):
+        """A fresh parity dialect on the test server, with its own snapshot."""
         return get_dialect(PG_URL, side=side)
 
     def drop_all(self):
+        """Drop every table `build` made, then close the fixture connection."""
         for q in self.tables:
             self.con.execute(f"drop table if exists {q}")
         self.con.close()
@@ -127,6 +135,7 @@ class MySQLEngine(Engine):
     name = "mysql"
 
     def __init__(self) -> None:
+        """Open a MySQL dialect and unlock it for writing, or skip without a server."""
         try:
             self.d = get_dialect(MYSQL_URL, side="W")
         except Exception as exc:
@@ -136,12 +145,14 @@ class MySQLEngine(Engine):
         self.tables: list[str] = []
 
     def _run(self, sql, params=None):
+        """Run one fixture statement on the writable connection and commit it."""
         cur = self.d._conn.cursor()
         cur.execute(sql, params)
         cur.close()
         self.d._conn.commit()
 
     def build(self, table, ddl, rows=(), raw=()):
+        """Recreate `table` as utf8mb4, so the charset is not the server default's."""
         self._run(f"drop table if exists `{table}`")
         self._run(f"create table `{table}` ({ddl}) default charset=utf8mb4")
         self.tables.append(table)
@@ -152,9 +163,11 @@ class MySQLEngine(Engine):
         return table
 
     def open(self, side):
+        """A fresh, read-only parity dialect - not the writer used for fixtures."""
         return get_dialect(MYSQL_URL, side=side)
 
     def drop_all(self):
+        """Drop every table `build` made, then close the writer."""
         for t in self.tables:
             self._run(f"drop table if exists `{t}`")
         self.d.close()
@@ -166,6 +179,7 @@ class BigQueryEngine(Engine):
     name = "bigquery"
 
     def __init__(self) -> None:
+        """Open a BigQuery client on the test dataset, or skip when none is set up."""
         if not BIGQUERY_URL:
             pytest.skip("PARITY_TEST_BIGQUERY not set")
         from google.cloud import bigquery
@@ -180,6 +194,7 @@ class BigQueryEngine(Engine):
         self.tables: list[str] = []
 
     def build(self, table, ddl, rows=(), raw=()):
+        """Create `table` and insert literal rows only; bound `rows` are refused."""
         if rows:
             raise ValueError("BigQueryEngine takes literal `raw` inserts only")
         q = f"`{self.project}`.`{self.dataset}`.`{table}`"
@@ -190,12 +205,15 @@ class BigQueryEngine(Engine):
         return table
 
     def ref(self, table):
+        """Parity resolves an unqualified name against the URL's dataset."""
         return table
 
     def open(self, side):
+        """A parity dialect on the test dataset, as the CLI would open it."""
         return get_dialect(BIGQUERY_URL, side=side)
 
     def drop_all(self):
+        """Delete every table `build` made - BigQuery storage is billed."""
         for t in self.tables:
             self.client.delete_table(
                 f"{self.project}.{self.dataset}.{t}", not_found_ok=True
@@ -204,6 +222,7 @@ class BigQueryEngine(Engine):
 
 
 def _mssql_db_url() -> str:
+    """The test URL pointed at our own `rt_val_db`, not its default database."""
     u = urlparse(MSSQL_URL)
     return urlunparse(u._replace(path="/" + MSSQL_DB))
 
@@ -213,6 +232,9 @@ class MSSQLEngine(Engine):
     placeholder = "?"
 
     def __init__(self) -> None:
+        """Create `rt_val_db` (UTF-8, snapshot allowed) once, then connect to it.
+
+        Skips when no SQL Server is configured or reachable."""
         if not MSSQL_URL:
             pytest.skip("PARITY_TEST_MSSQL not set")
         import mssql_python
@@ -236,6 +258,7 @@ class MSSQLEngine(Engine):
         self.tables: list[str] = []
 
     def _run(self, sql, params=None):
+        """Run one fixture statement, binding `params` only when there are some."""
         cur = self.con.cursor()
         if params is None:
             cur.execute(sql)
@@ -244,6 +267,7 @@ class MSSQLEngine(Engine):
         cur.close()
 
     def build(self, table, ddl, rows=(), raw=()):
+        """Recreate `dbo.<table>` and fill it via bound rows and raw statements."""
         q = f"dbo.[{table}]"
         self._run(f"drop table if exists {q}")
         self._run(f"create table {q} ({ddl})")
@@ -255,12 +279,15 @@ class MSSQLEngine(Engine):
         return table
 
     def ref(self, table):
+        """SQL Server tables live in `dbo`, so parity gets the qualified name."""
         return f"dbo.{table}"
 
     def open(self, side):
+        """A parity dialect on `rt_val_db`, where `build` put the tables."""
         return get_dialect(_mssql_db_url(), side=side)
 
     def drop_all(self):
+        """Drop every table `build` made, then close the fixture connection."""
         for q in self.tables:
             self._run(f"drop table if exists {q}")
         self.con.close()

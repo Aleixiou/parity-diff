@@ -65,6 +65,7 @@ def after_first_checksum(dialect, action: Callable[[], None]) -> list[bool]:
     fired: list[bool] = []
 
     def wrapped(*args, **kwargs):
+        """Run the real checksum query, then fire `action` once after the first."""
         out = original(*args, **kwargs)
         if not fired:
             fired.append(True)
@@ -226,6 +227,7 @@ DST_ROWS = [
 
 
 def _pg_dst_table(pgw, name: str) -> str:
+    """Create the DST-edge table on PostgreSQL from `DST_ROWS`."""
     t = f"{SCHEMA}.{name}"
     pgw.execute(
         f"create table {t} (id int primary key, ts timestamptz, nts timestamp, "
@@ -240,6 +242,7 @@ def _pg_dst_table(pgw, name: str) -> str:
 
 
 def _duck_dst(tmp_path) -> str:
+    """The same DST-edge rows in a DuckDB file, with the planted change in `s`."""
     path = str(tmp_path / "dst.duckdb")
     con = duckdb_write(path)
     try:
@@ -371,6 +374,7 @@ def test_pg_mid_walk_writes_stay_invisible_to_the_whole_diff(pg_url, pgw, tmp_pa
     a = open_pg(pg_url)
 
     def write() -> None:
+        """Commit every `MID_WALK_PG` write between levels 1 and 2."""
         for sql in MID_WALK_PG:
             pgw.execute(sql.format(t=t))
 
@@ -425,6 +429,7 @@ CLI_ENVIRONMENTS: dict[str, dict[str, str | None]] = {
 
 
 def _cli_cases():
+    """One case per environment and output format, for the CLI verdict test."""
     # RT-D9 (fixed): human output to a stdout that cannot encode a differing
     # value (cp1252, the Windows default for a redirected stdout before Python
     # 3.15) used to crash with exit 2; the python-cp1252 and
@@ -503,6 +508,7 @@ def myw(mysql_url):
     made: list[str] = []
 
     def run(sql: str, rows=None) -> None:
+        """Run `sql` once, or once per row of `rows` when given."""
         cur = conn.cursor()
         try:
             if rows is None:
@@ -513,6 +519,7 @@ def myw(mysql_url):
             cur.close()
 
     def table(base: str) -> str:
+        """A unique table name for this run, recorded so cleanup drops it."""
         name = f"rt_live_{base}_{RUN}"
         made.append(name)
         return name
@@ -524,6 +531,7 @@ def myw(mysql_url):
 
 
 def _mysql_walk_table(myw, base: str, engine: str) -> str:
+    """A ROWS-row MySQL table on storage engine `engine`, for the walk tests."""
     run, table = myw
     t = table(base)
     run(
@@ -535,6 +543,7 @@ def _mysql_walk_table(myw, base: str, engine: str) -> str:
 
 
 def _duck_walk(tmp_path) -> str:
+    """The DuckDB side of the walk tests: the same rows, with key 10 changed."""
     return duck_file(
         tmp_path,
         "create table t (id int, v varchar)",
@@ -574,6 +583,7 @@ def test_mysql_non_transactional_table_changed_mid_walk(mysql_url, myw, tmp_path
     a = open_mysql(mysql_url)
 
     def write() -> None:
+        """Repair key 10 and break key 200, whose bucket level 1 already passed."""
         run(f"update `{t}` set v = 'v10-on-b' where id = 10")
         run(f"update `{t}` set v = 'broken after level 1' where id = 200")
 
@@ -600,6 +610,7 @@ def _mysql_with_init_connect(monkeypatch, statement: str) -> None:
     real = MySQLConnectionAbstract._post_connection
 
     def post_connection(self) -> None:
+        """Run `statement` where `init_connect` would, then the real setup."""
         self._execute_query(statement)
         real(self)
 
@@ -710,6 +721,7 @@ def test_mysql_server_defaults_that_do_not_move_the_verdict(
 
 
 def _mssql_db_url(url: str, database: str, user: str = "", password: str = "") -> str:
+    """The test URL pointed at `database`, optionally logging in as `user`."""
     u = urlparse(url)
     if user:
         host = f"{u.hostname}:{u.port}" if u.port else str(u.hostname)
@@ -721,9 +733,11 @@ class MssqlAdmin:
     """Autocommit sa connections per database, for fixtures."""
 
     def __init__(self, url: str) -> None:
+        """Keep the admin URL; each `run` opens its own connection."""
         self.url = url
 
     def run(self, database: str, sql: str):
+        """Run one statement in `database` on a fresh connection; return its rows."""
         import mssql_python
 
         from parity.dialects.mssql_dialect import parse_mssql_url
@@ -740,6 +754,7 @@ class MssqlAdmin:
             conn.close()
 
     def drop_database(self, name: str) -> None:
+        """Drop `name` if it exists, kicking out sessions still connected to it."""
         self.run(
             "master",
             f"if db_id('{name}') is not null begin alter database [{name}] "
@@ -806,6 +821,7 @@ DUCK_VALUES = (
 
 
 def _mssql_types_table(adm, db: str, name: str) -> str:
+    """Create the mixed-type table in `db` and fill it with `MSSQL_VALUES`."""
     adm.run(
         db,
         f"create table dbo.{name} (id bigint primary key, d date, dt datetime, "
@@ -818,6 +834,7 @@ def _mssql_types_table(adm, db: str, name: str) -> str:
 
 
 def _duck_types(tmp_path) -> str:
+    """The DuckDB twin of `_mssql_types_table`, holding `DUCK_VALUES`."""
     return duck_file(
         tmp_path,
         "create table t (id bigint, d date, dt timestamp, dt2 timestamp, "
@@ -870,6 +887,7 @@ def test_mssql_numeric_roundabort_database_still_diffs(mss, tmp_path):
 
 
 def _mssql_walk_table(adm, db: str, name: str, values_on_b: bool = False) -> str:
+    """A ROWS-row SQL Server table in `db`, for the mid-walk tests."""
     adm.run(db, f"create table dbo.{name} (id int primary key, v nvarchar(40))")
     adm.run(
         db,
@@ -908,6 +926,7 @@ def test_mssql_read_committed_false_match_is_at_least_warned(mss, tmp_path):
     a = open_mssql(url(MSSQL_RC_DB))
 
     def write() -> None:
+        """Repair key 10 and break key 200 between levels, under READ COMMITTED."""
         adm.run(MSSQL_RC_DB, f"update dbo.{t} set v = N'v10-on-b' where id = 10")
         adm.run(MSSQL_RC_DB, f"update dbo.{t} set v = N'broken' where id = 200")
 
@@ -979,6 +998,7 @@ def test_duckdb_file_cannot_be_modified_by_another_process_mid_diff(
     outcome: list[str] = []
 
     def write() -> None:
+        """Try to write the DuckDB file from another process; record the outcome."""
         proc = subprocess.run(  # noqa: S603 - our own interpreter, fixed script
             [sys.executable, "-c", _TRY_WRITE, path],
             capture_output=True,
@@ -1206,6 +1226,7 @@ def test_pg_truncate_mid_walk_is_blocked_by_the_snapshot_lock(pg_url, pgw, tmp_p
     outcome: list[str] = []
 
     def write() -> None:
+        """Try a TRUNCATE between levels with a short lock_timeout; record it."""
         with psycopg.connect(pg_url, autocommit=True) as w:
             w.execute("set lock_timeout = '500ms'")
             try:
@@ -1221,6 +1242,7 @@ def test_pg_truncate_mid_walk_is_blocked_by_the_snapshot_lock(pg_url, pgw, tmp_p
 
 
 def _mysql_writer(mysql_url: str):
+    """A separate autocommit MySQL connection, outside the diff's transaction."""
     import mysql.connector
 
     u = urlparse(mysql_url)
@@ -1246,6 +1268,7 @@ def test_mysql_innodb_truncate_mid_walk_is_blocked_by_the_metadata_lock(
     outcome: list[str] = []
 
     def write() -> None:
+        """Try a TRUNCATE between levels with a short lock wait; record it."""
         w = _mysql_writer(mysql_url)
         cur = w.cursor()
         try:
@@ -1282,6 +1305,7 @@ def test_mysql_innodb_view_and_partitioned_table_mid_walk(mysql_url, myw, tmp_pa
     a = open_mysql(mysql_url)
 
     def write() -> None:
+        """Repair key 10 and break key 200 through the base table, after level 1."""
         run(f"update `{base}` set v = 'v10-on-b' where id = 10")
         run(f"update `{base}` set v = 'broken after level 1' where id = 200")
 

@@ -651,6 +651,7 @@ def _result(**kwargs):
 
 
 def _human(result) -> list[str]:
+    """The human report for `result`, as lines."""
     from parity.cli import render_human
 
     out = io.StringIO()

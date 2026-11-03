@@ -643,6 +643,7 @@ def test_only_a_wide_checksum_query_is_hash_aggregated():
     d = _d()
 
     def cols(n):
+        """`n` integer columns, to cross the hash-group threshold."""
         return [Column(f"c{i}", LogicalType.INTEGER, "int") for i in range(n)]
 
     narrow = d._segment_sql("s.t", INT_KEY, cols(HASH_GROUP_FROM - 2), 1, 100, 4)

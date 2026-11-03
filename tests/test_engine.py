@@ -991,6 +991,7 @@ def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
 
     class DropsRowTwo(FakeDialect):
         def fetch_range(self, table, key, columns, lo, hi):
+            """The real rows, minus key 2 - the row this side's checksum counted."""
             out = super().fetch_range(table, key, columns, lo, hi)
             out.pop(2, None)
             return out
@@ -1012,6 +1013,7 @@ def test_a_lossy_fetch_is_named_with_both_tables_and_the_range():
 
     class Lowercases(FakeDialect):
         def fetch_range(self, table, key, columns, lo, hi):
+            """The real rows, lower-cased - so 'V5' comes back equal to 'v5'."""
             out = super().fetch_range(table, key, columns, lo, hi)
             return {k: tuple(v.lower() for v in row) for k, row in out.items()}
 
@@ -1032,6 +1034,7 @@ def test_an_error_mid_walk_names_the_side_and_the_table():
 
     class TimesOut(FakeDialect):
         def segment_checksums(self, *args):
+            """Fail the way a statement timeout would, mid-walk."""
             raise RuntimeError("canceling statement due to statement timeout")
 
     a = FakeDialect(SyntheticTable(100), side="A")
@@ -1049,6 +1052,7 @@ def test_a_dialect_error_already_naming_its_side_gains_only_the_table():
 
     class Refuses(FakeDialect):
         def fetch_range(self, *args):
+            """Raise an error that already names its side, as dialects do."""
             raise self._err("FLOAT value out of the comparable range")
 
     a = FakeDialect(DictTable(COLS, {1: ("1.00", "x")}), side="A")
@@ -1116,6 +1120,7 @@ def test_a_dialect_closes_itself_as_a_context_manager():
 
     class Tracks(FakeDialect):
         def close(self):
+            """Record the close, so the test sees `with` call it."""
             closed.append(self.side)
 
     with pytest.raises(RuntimeError), Tracks(SyntheticTable(1), side="A") as d:
