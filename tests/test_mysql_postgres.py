@@ -165,5 +165,6 @@ def test_binary_bit_and_timestamp_agree_with_postgres(pg_url, mysql_url):
         (4, ["t"]),
         (5, ["b"]),
     ]
-    assert result.diffs[0].values_b == {"b": "\\xff02"}
+    # Canonical text: PostgreSQL's bytea `\xff02`, its backslash escaped.
+    assert result.diffs[0].values_b == {"b": "\\\\xff02"}
     assert not [w for w in result.warnings if "timezone-aware" in w], result.warnings

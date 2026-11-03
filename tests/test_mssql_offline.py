@@ -605,7 +605,14 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     # A hashed key counts rows whose every key column is set (RT-B2): its
     # identity is coalesced text, which is never NULL.
     keyed = f"count(case when {d.quote('code')} is not null then 1 end)"
-    assert f"count(*), {keyed}, count(distinct {identity}) from" in seen[-1]
+    # PostgreSQL counts a hashed key's bytes (RT-B10/D11): a nondeterministic
+    # ICU collation would fold 'a'/'A' into one key.
+    distinct = (
+        f'count(distinct ({identity}) collate pg_catalog."C")'
+        if isinstance(d, PostgresDialect)
+        else f"count(distinct {identity})"
+    )
+    assert f"count(*), {keyed}, {distinct} from" in seen[-1]
     notes = d.caveats([Column("t", LogicalType.TIMESTAMP, "datetime2(7)")])
     if isinstance(d, SnowflakeDialect):
         # Snowflake reports its own READ COMMITTED gap on every run (RT-D7),

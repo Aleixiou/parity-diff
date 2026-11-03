@@ -565,7 +565,7 @@ class MySQLDialect(Dialect):
 
         Checksums move for binary columns whose bytes *were* valid UTF-8,
         which used to render as that text; no other column's text changes.
-        With `prefix` the form is PostgreSQL's bytea text, `\x0aff`.
+        With `prefix` the form is PostgreSQL's bytea text as escaped text.
 
         Hex doubles the length, and MySQL string functions return NULL (again
         with only a warning) once a result passes max_allowed_packet. A NULL
@@ -575,7 +575,11 @@ class MySQLDialect(Dialect):
         """
         text = f"lower(hex({c}))"
         if prefix:
-            text = f"concat(convert(0x5c78 using utf8mb4), {text})"
+            # PostgreSQL renders bytea as the text `\x0aff`, and that text goes
+            # through `escape_text` like every unmapped type, which doubles the
+            # backslash. So the canonical form is `\\x0aff` (0x5c5c78), the
+            # escaped spelling of exactly what PostgreSQL prints.
+            text = f"concat(convert(0x5c5c78 using utf8mb4), {text})"
         where = f" bytes in column {column.name!r}".encode()
         refuse = (
             f"cast(uuid_to_bin(concat('{TOO_LONG_MARKER}', length({c}), "
@@ -596,7 +600,7 @@ class MySQLDialect(Dialect):
         digits = f"bin({c} + 0)"
         return f"lpad({digits}, {width.group(1)}, '0')" if width else digits
 
-    def row_hash(self, columns: Sequence[Column]) -> str:
+    def hash_parts(self, parts: list[str]) -> str:
         """The row hash, with a fallback for a row too wide to join.
 
         MySQL's `concat_ws` returns NULL - warning 1301 only - once the joined
@@ -612,13 +616,12 @@ class MySQLDialect(Dialect):
         fallback hash never matches its real one, so the bucket is fetched and
         compared value by value: a slower path, never a false match. Rows
         that fit render exactly as before - the coalesce only fires on NULL -
-        so no checksum moves.
+        so no checksum moves. This overrides `hash_parts`, not `row_hash`, so
+        the segment checksum - which folds the key text in - is guarded too.
         """
-        primary = super().row_hash(columns)
-        if not columns:
-            return primary
-        parts = ["'parity: wide row'", *(f"md5({self.normalize(c)})" for c in columns)]
-        return f"coalesce({primary}, {self.hash_expr(self._concat(parts))})"
+        primary = super().hash_parts(parts)
+        fallback = ["'parity: wide row'", *(f"md5({p})" for p in parts)]
+        return f"coalesce({primary}, {self.hash_expr(self._concat(fallback))})"
 
     def backslash_sql(self) -> str:
         r"""`char(92 using utf8mb4)`: a backslash whatever sql_mode says about

@@ -653,7 +653,22 @@ class Dialect(ABC):
         This is what makes the tool cheap: summed per bucket, it means a few
         integers cross the network instead of the table.
         """
-        return self.hash_expr(self.row_text(columns))
+        if not columns:
+            return self.hash_expr(self.row_text(columns))
+        return self.hash_parts([self.normalize(c) for c in columns])
+
+    def hash_parts(self, parts: list[str]) -> str:
+        """Hash already-rendered canonical fields joined as row text.
+
+        The one place a row's fields become its hash, used by `row_hash` and
+        by the segment checksum (which folds the key text in first), so a
+        dialect that must guard the join - MySQL, whose `concat_ws` returns
+        NULL past max_allowed_packet - overrides exactly one method and every
+        checksum gets the guard. When the checksum briefly built its own hash
+        inline, MySQL's guard was bypassed and a row too wide to join dropped
+        out of the sum again (RT-A17).
+        """
+        return self.hash_expr(self._concat(parts))
 
     def key_spec(self, table: str, *names: str) -> KeySpec:
         """Build a `KeySpec` for these columns of this table.
@@ -874,8 +889,8 @@ class Dialect(ABC):
         # the only thing hashed. `columns` never contains the key, so the key is
         # hashed exactly once - as its exact key text (`normalize_key`), or two
         # keys that round alike would hash alike here too.
-        content = self.hash_expr(
-            self._concat([*self._key_parts(key), *(self.normalize(c) for c in columns)])
+        content = self.hash_parts(
+            [*self._key_parts(key), *(self.normalize(c) for c in columns)]
         )
         return (
             f"select {bucket} as seg, {self.count()}, "

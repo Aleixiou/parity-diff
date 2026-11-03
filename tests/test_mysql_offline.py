@@ -219,7 +219,9 @@ def test_binary_renders_as_bytea_style_hex(raw):
     """RT-A8/C4: bytes render as backslash-x hex, never through a UTF-8 cast that yields NULL."""
     sql = _render(raw)
     assert "lower(hex(`v`))" in sql
-    assert "convert(0x5c78 using utf8mb4)" in sql  # the `\x` prefix
+    # The escaped `\x` prefix: PostgreSQL's bytea text `\x0aff` goes through
+    # escape_text like any unmapped type, which doubles its backslash.
+    assert "convert(0x5c5c78 using utf8mb4)" in sql
     assert "cast(`v` as char)" not in sql
     assert "uuid_to_bin" in sql  # NULL from a too-long hex raises
 
@@ -228,7 +230,7 @@ def test_binary_renders_as_bytea_style_hex(raw):
 def test_spatial_renders_its_stored_bytes(raw):
     """RT-C4: geometry is its stored SRID+WKB bytes as hex."""
     sql = _render(raw)
-    assert "lower(hex(`v`))" in sql and "0x5c78" not in sql
+    assert "lower(hex(`v`))" in sql and "0x5c5c78" not in sql
 
 
 def test_bit_renders_its_bits_at_full_width():
@@ -238,8 +240,14 @@ def test_bit_renders_its_bits_at_full_width():
 
 
 def test_ordinary_text_renders_as_before():
-    """No checksum moves for text: the fallback branch is untouched."""
-    assert _render("json") == "coalesce(cast(`v` as char), convert(0x5c4e using utf8mb4))"
+    """The fallback branch is the plain char cast, escaped like every text
+    (backslash doubled, chr(31) as `\\s`), so text holding neither renders
+    exactly as before and no ordinary checksum moves."""
+    bs = "char(92 using utf8mb4)"
+    assert _render("json") == (
+        f"coalesce(replace(replace(cast(`v` as char), {bs}, concat({bs}, {bs})), "
+        f"char(31 using utf8mb4), concat({bs}, 's')), convert(0x5c4e using utf8mb4))"
+    )
 
 
 def test_timestamp_is_an_instant_and_datetime_is_not():

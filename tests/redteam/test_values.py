@@ -979,6 +979,29 @@ def test_rt_a17_mysql_row_over_max_allowed_packet_is_invisible(engines):
     assert found(r) == [(1, "different"), (2, "different")]
 
 
+def test_mysql_wide_row_with_escaped_text_is_still_found(engines):
+    r"""RT-A17 again, with text the escaping has to rewrite. When the merged
+    fixes first met, the segment checksum built its hash inline and skipped
+    MySQL's wide-row fallback, so a row past max_allowed_packet dropped out of
+    the sum once more; `hash_parts` is now the single place every checksum is
+    built. A backslash in each 34 MB value makes REPLACE do real work on it.
+
+    Values: A = (1, '\' + 'a'*34e6, '\' + 'b'*34e6),
+            B = (1, '\' + 'a'*34e6, '\' + 'b'*(34e6-1) + 'c').
+    """
+    n = 34_000_000
+    ea = engines("mysql", "A")
+    limit = int(ea.d.query("select @@max_allowed_packet")[0][0])
+    if 2 * n < limit:
+        pytest.skip(f"max_allowed_packet is {limit}; this needs rows wider than it")
+    ddl = "id int, x longtext, y longtext"
+    x = f"concat(char(92), repeat('a', {n}))"
+    a = f"insert into {{t}} values (1, {x}, concat(char(92), repeat('b', {n})))"
+    b = f"insert into {{t}} values (1, {x}, concat(char(92), repeat('b', {n - 1}), 'c'))"
+    r = run_pair(engines, "a17esc", ("mysql", ddl, (), [a]), ("mysql", ddl, (), [b]))
+    assert found(r) == [(1, "different")]
+
+
 # ---------------------------------------------------------------------
 # RT-A18  A key's identity is its *rounded* canonical text
 # ---------------------------------------------------------------------
