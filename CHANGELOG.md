@@ -59,11 +59,14 @@ with the caveat that 0.x means the CLI surface may still move.
   keys, `VARIANT` keeping its type, schema-qualified tables, the exact bucket
   division (plain `/` was confirmed to round 9999999.99… up to 10000000) and
   escaped text, including under a case-insensitive collation.
-- **Snowflake: no cloud-metadata probes.** Connector 5.x probes the AWS, Azure
-  and GCP metadata services at every login to report its platform; the tool
-  now sets `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` (an explicit setting wins).
-  The connector still flushes a telemetry batch to the connected account at
-  logout; see the README's limitations.
+- **Snowflake: connector 4.x only, and no telemetry or cloud-metadata
+  probes.** Connector 5.x flushes a telemetry batch at every logout that no
+  switch stops, so the `[snowflake]` extra now requires
+  `snowflake-connector-python>=4.0,<5`. Connectors probe the AWS, Azure and
+  GCP metadata services at login to report their platform; the tool sets
+  `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` (an explicit setting wins). Verified
+  live on 4.8.1: a session contacts only the account's login, query and
+  logout endpoints, and a test fails if that changes.
 
 ## 0.4.0 — 2026-11-03
 

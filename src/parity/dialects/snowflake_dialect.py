@@ -121,8 +121,8 @@ class SnowflakeDialect(Dialect):
             # parameter has to ride in the login request; setting it afterwards
             # would be too late. The server does not list this parameter
             # (it is a client one); the connector's own state is False -
-            # verified live. Connector 5.x still flushes a session-telemetry
-            # batch at logout that no switch in 5.1.0 stops (README).
+            # verified live. Connector 5.x flushes a session-telemetry batch
+            # at logout that no switch stops, hence the `<5` pin (README).
             session_parameters={"CLIENT_TELEMETRY_ENABLED": False},
             log_imported_packages_in_telemetry=False,
             account=url.hostname,

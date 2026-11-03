@@ -240,6 +240,34 @@ def test_telemetry_is_off_in_the_session(snowflake_url):
         a.close()
 
 
+def test_a_session_contacts_only_the_account_and_sends_no_telemetry(
+    snowflake_url, caplog
+):
+    """CLAUDE.md section 6, end to end: everything the driver logs about its
+    network use during a session names the account's own login, query and
+    logout endpoints - no `/telemetry/send`, no cloud metadata service.
+    Driver 5.x failed this (it flushes a telemetry batch at logout and probes
+    169.254.169.254), which is why the extra pins 4.x."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        a = open_snowflake(snowflake_url, side="A")
+        try:
+            a.query("select 1")
+        finally:
+            a.close()
+    import snowflake.connector
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "/session/v1/login-request" in text  # the log really shows paths
+    assert "/telemetry" not in text
+    assert "logs to telemetry" not in text  # 4.x's send line
+    assert "flushing telemetry batch" not in text  # 5.x's, which names no path
+    assert "169.254.169.254" not in text and "metadata.google.internal" not in text
+    major = int(snowflake.connector.__version__.split(".")[0])
+    assert major < 5, "pyproject pins <5: 5.x sends telemetry no switch stops"
+
+
 def test_int_div_is_exact_where_number_division_rounds(snowflake_url):
     """NUMBER division rounds its quotient to 6 places, so a floor of `/`
     puts q.9999996 in bucket q + 1. `int_div` must equal Python's `//` on

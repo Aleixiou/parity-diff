@@ -723,10 +723,12 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   exact DECIMAL keys, `VARIANT` type tag, schema-qualified tables, the exact
   `int_div` (plain `/` rounds the quotient to 6 places - confirmed), escaping
   under an `en-ci` collation. **Telemetry:** `CLIENT_TELEMETRY_ENABLED` is a
-  client parameter (the server does not list it); connector 5.x probes cloud
+  client parameter (the server does not list it); connectors probe cloud
   metadata at login unless `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` is set (the
-  dialect sets it), and still flushes a session-telemetry batch to the
-  connected account at logout, which no switch in 5.1.0 was found to stop.
+  dialect sets it). Connector 5.x (a Rust core) flushes a session-telemetry
+  batch at logout that no switch in 5.1.0 stops, so the extra pins
+  `>=4.0,<5`; on 4.8.1 a live test confirms only login, query and logout
+  endpoints are contacted (`test_a_session_contacts_only_the_account_...`).
 - **The walk is checked by a second method** (`engine._verify`,
   `parity/reference.py`). About `verify_sample` rows, chosen by a hash of the
   key text (`fetch_sample`), are fetched as raw driver values and compared in

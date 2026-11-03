@@ -356,12 +356,14 @@ stated plainly rather than buried.
   caps `--float-scale` at 30 for DECIMAL columns), on DuckDB 38 − s, on
   BigQuery the column type's own range. PostgreSQL has no limit. The error
   names the side, the column and the value.
-- **Snowflake's driver sends usage telemetry to Snowflake.** The tool turns
-  off the connector's telemetry switch and its cloud-metadata probes
-  (`SNOWFLAKE_DISABLE_PLATFORM_DETECTION`), but connector 5.x still flushes a
-  small telemetry batch about the driver's own calls to your Snowflake account
-  when the session closes. No row data is in it, and it goes only to the
-  account you are already connected to.
+- **Snowflake needs connector 4.x** (`snowflake-connector-python>=4.0,<5`,
+  which the `[snowflake]` extra installs). Connector 5.x flushes a telemetry
+  batch to Snowflake at every logout that no setting stops, and the tool
+  sends no telemetry. With 4.x it switches the connector's telemetry and its
+  cloud-metadata probes (`SNOWFLAKE_DISABLE_PLATFORM_DETECTION`) off, and a
+  live test checks that a session contacts only the account's own login,
+  query and logout endpoints. The login itself names the driver, Python and
+  OS versions, as every Snowflake client's does.
 - **Keys must be unique.** A non-unique key is detected up front and rejected.
   Silently collapsing duplicate rows would hide real differences.
 - **`Infinity` and `NaN`** in float columns are compared as those literal
