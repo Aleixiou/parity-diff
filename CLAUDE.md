@@ -289,8 +289,11 @@ Every one of these was found by measurement, not by reading the docs:
   and dtoa do: 2^50 + 0.25 sits exactly between two 17-digit candidates that
   both round-trip.
 - **MySQL's CAST to an integer type clamps silently** on overflow, so two
-  different huge doubles would compare equal; its out-of-range branch calls
-  `exp(abs(c))`, which raises error 1690 even inside a SELECT.
+  different huge doubles would compare equal; its out-of-range branch raises
+  through `UUID_TO_BIN` like the DECIMAL guard, carrying the value and the
+  column, and `MySQLDialect.query` re-raises it naming the side. (It used to
+  call `exp(abs(c))` - error 1690, which named nothing a user could act on.)
+  Every engine's refusal past 2^116 now names side and column (RT-E10).
 - **SQL Server prints no shortest repr either** (style 3 is always 17 digits),
   but `cast(float as decimal(38, q))` is the exact binary value rounded half up
   and decimal to float is correctly rounded - both verified on every sample
