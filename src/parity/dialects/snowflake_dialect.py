@@ -137,6 +137,21 @@ class SnowflakeDialect(Dialect):
         finally:
             cur.close()
 
+    def qualify(self, table: str) -> str:
+        """Quote a table name, always schema-qualified.
+
+        `columns()` introspects an unqualified name in `default_schema` (the
+        URL's schema, else PUBLIC). Left unqualified in the data queries,
+        Snowflake resolved it in the session's current schema - the user's
+        DEFAULT_NAMESPACE - so the columns of one table and the rows of
+        another could be compared, and a real difference read identical
+        (RT-D2, the Snowflake form of PostgreSQL's search_path gap). Naming
+        the schema makes the rows come from the table that was introspected.
+        Unverified live: no Snowflake account in the test setup.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        return f"{self.quote(schema)}.{self.quote(name)}"
+
     def columns(self, table: str) -> list[Column]:
         """Introspect columns, reading numeric_scale to split NUMBER.
 

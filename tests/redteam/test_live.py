@@ -178,18 +178,9 @@ def test_pg_search_path_reads_a_different_table_than_it_introspects(
 @pytest.mark.parametrize(
     "dialect_path, schema",
     [
-        # Fixed: PostgresDialect.qualify always names the schema.
+        # Fixed: both dialects' qualify always names the schema.
         ("parity.dialects.postgres_dialect:PostgresDialect", "public"),
-        pytest.param(
-            "parity.dialects.snowflake_dialect:SnowflakeDialect",
-            "PUBLIC",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="RT-D2: qualify() leaves an unqualified table unqualified, "
-                "so the schema read is the session's, not the one columns() "
-                "introspected",
-            ),
-        ),
+        ("parity.dialects.snowflake_dialect:SnowflakeDialect", "PUBLIC"),
     ],
 )
 def test_unqualified_tables_are_read_from_the_schema_they_were_introspected_in(
