@@ -7,7 +7,9 @@ PostgreSQL and DuckDB disagree - and every workaround says which.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import unquote
 
 from parity.dialects.base import (
     FLOAT_EXACT_INT_FROM,
@@ -16,9 +18,164 @@ from parity.dialects.base import (
     HASH_HEX_CHARS,
     Dialect,
     float_range_where,
+    map_type,
     sql_literal,
 )
-from parity.types import Column, LogicalType
+from parity.types import Column, KeySpec, LogicalType
+
+#: Session settings pinned at connect, each to the server's stock default.
+#: A role, database, `PGOPTIONS` or URL `options=-c ...` default can change any
+#: of them, and each changes either the canonical text or whether the diff
+#: survives at all - so none may be left to whoever configured the login. All
+#: are user-settable and set with plain session-level `SET` (never `ALTER`),
+#: while autocommit is still on, so they stick to the session rather than to a
+#: transaction that never commits (CLAUDE.md section 4.8).
+SESSION_PINS: tuple[tuple[str, str], ...] = (
+    # `timestamptz` renders through the *session* timezone, so two sides whose
+    # sessions differ render the same instant as different text and every row
+    # with a timestamptz reports as changed - a false positive that looks
+    # exactly like catastrophic data loss. A timestamptz is an instant;
+    # comparing instants in UTC is both correct and deterministic. Naive
+    # `timestamp` columns carry no zone and are unaffected.
+    ("TimeZone", "'UTC'"),
+    # FLOAT canonical text casts a double to text and relies on that being the
+    # shortest round-trip decimal. PostgreSQL 12+ prints exactly that whenever
+    # extra_float_digits > 0 (the default is 1), but a session or role default
+    # of 0 or less falls back to 15 significant digits and a value like
+    # 1e15+0.5 would render as 1e15.
+    ("extra_float_digits", "1"),
+    # Off - a role, database or PGOPTIONS default, and the norm before 9.1 -
+    # PostgreSQL processes backslash escapes in plain literals, so a literal
+    # `'\N'` reads `'N'` and a NULL compared equal to the one-letter string N
+    # on the other side (RT-D1). No literal anywhere may mean two things.
+    ("standard_conforming_strings", "on"),
+    # Unmapped types (interval, money, bytea, arrays of timestamptz, ...)
+    # render through `::text`, whose output follows these four. One table read
+    # by two sessions with different styles rendered two ways (RT-D5).
+    ("IntervalStyle", "'postgres'"),
+    ("DateStyle", "'ISO, MDY'"),
+    ("bytea_output", "'hex'"),
+    ("lc_monetary", "'C'"),
+    # psycopg decodes text in the client encoding. SQL_ASCII (a role default
+    # or PGCLIENTENCODING) makes it hand back bytes, and the walk died in a
+    # bare TypeError naming neither side nor table (RT-D8). UTF8 is what every
+    # other engine's text is compared in.
+    ("client_encoding", "'UTF8'"),
+    # The REPEATABLE READ snapshot is held for the whole diff and sits idle in
+    # transaction whenever the *other* side is the slow one - every level,
+    # against a cloud warehouse. A role default such as a one-minute
+    # idle_in_transaction_session_timeout (common: it protects vacuum) killed
+    # the session mid-walk (RT-D13). 0 disables it for this session only.
+    ("idle_in_transaction_session_timeout", "0"),
+    # Every built-in the canonical text calls - to_char, md5, concat_ws,
+    # round, the casts, the `||` operator - is resolved by name through the
+    # search_path. pg_catalog is searched first only when the path does not
+    # name it, and even then a user function with a *more exact* signature
+    # wins: pg_catalog has no `to_char(date, text)` (DATE goes through an
+    # implicit cast to timestamptz), so any such function anywhere on the path
+    # replaced it and changed the canonical text - a false match between two
+    # PostgreSQL tables (RT-D14). Pinned to pg_catalog alone, nothing a user
+    # created can be called; schema-qualifying each call instead could not
+    # reach operators or the shared row-text SQL. Every table is
+    # schema-qualified (`qualify`), so no relation lookup depends on it.
+    ("search_path", "pg_catalog"),
+)
+
+#: PostgreSQL 17 added `transaction_timeout`, which kills the held snapshot
+#: transaction just as idle_in_transaction_session_timeout does (RT-D13).
+#: Older servers reject the name, so it is pinned only where it exists.
+TRANSACTION_TIMEOUT_FROM = 170000
+
+#: The text an infinite date, timestamp or timestamptz renders as. `to_char`
+#: returns SQL NULL for both infinities, which the coalesce turned into the
+#: NULL sentinel: +infinity, -infinity and NULL all compared equal - and
+#: `infinity` is the idiomatic "valid until forever" end of an SCD row (RT-A5,
+#: B11, C9, E3). Lower case because that is exactly what DuckDB's `strftime`
+#: prints for its own infinite DATE / TIMESTAMP / TIMESTAMPTZ, so the two agree
+#: without the DuckDB rendering, or any DuckDB checksum, moving. FLOAT's
+#: `Infinity` is capitalised, but the two never meet: a DATE column is never
+#: compared with a FLOAT one. No other supported engine can store either.
+DATE_INFINITY = "infinity"
+DATE_NEG_INFINITY = "-infinity"
+
+#: Matches the scheme of a PostgreSQL URL in any case. The dialect is chosen
+#: case-insensitively (`get_dialect`), but libpq accepts only lower case and
+#: otherwise reads the URL as a key/value string - and echoes it, password and
+#: all, in its "missing =" error (RT-F2).
+_SCHEME = re.compile(r"^(postgres|postgresql)://", re.IGNORECASE)
+
+
+def connection_secrets(connection_string: str) -> list[str]:
+    """Every string in `connection_string` that might be a password.
+
+    Best effort and deliberately generous: it runs on strings libpq has just
+    *refused*, so it cannot assume they are well formed, and redacting a
+    little too much from an error is harmless where printing a password into
+    a CI log is not. Covers the URI's `user:password@`, a `password=` query
+    parameter and a key/value `password=` (quoted or not), each raw and
+    percent-decoded. A piece of one (libpq may quote only the part before a
+    space) is caught by `redact`'s quoted-token rule, not listed here: a
+    one-letter piece replaced everywhere would mangle the rest of the error.
+    """
+    found: list[str] = []
+    rest = connection_string.split("://", 1)[1] if "://" in connection_string else ""
+    if "@" in rest:
+        # The *last* `@` ends the userinfo: an unencoded password may itself
+        # hold `@`, `/` or a space, all of which libpq then refuses.
+        userinfo = rest[: rest.rfind("@")]
+        if ":" in userinfo:
+            found.append(userinfo.split(":", 1)[1])
+    # A URI query value runs to the next `&` (spaces included: libpq refuses
+    # them, and quotes the whole value); a key/value one to the next space,
+    # unless it is single-quoted.
+    unquoted = r"[^&]*" if rest else r"\S*"
+    pattern = r"password\s*=\s*('(?:[^'\\]|\\.)*'?|" + unquoted + ")"
+    for m in re.finditer(pattern, connection_string):
+        found.append(m.group(1).strip("'"))
+    out: list[str] = []
+    for value in found:
+        for v in (value, unquote(value)):
+            v = v.strip()
+            if v and v not in out:
+                out.append(v)
+    # Longest first, so the raw form is replaced before a shorter decoded one.
+    return sorted(out, key=len, reverse=True)
+
+
+def redact(message: str, secrets: list[str]) -> str:
+    """`message` with every secret, and every quoted token holding one, removed.
+
+    libpq quotes the token it failed on - sometimes the whole URL, sometimes
+    one piece of the password - so a quoted token that contains a secret, or
+    is itself a run of three or more characters out of one, goes as well.
+    """
+    for secret in secrets:
+        message = message.replace(secret, "***")
+
+    def token(m: re.Match[str]) -> str:
+        """Replace one quoted token if it holds, or is part of, a secret."""
+        inner = m.group(1)
+        if "***" in inner or (len(inner) >= 3 and any(inner in s for s in secrets)):
+            return '"***"'
+        return m.group(0)
+
+    return re.sub(r'"([^"]*)"', token, message)
+
+
+#: information_schema's own rule for `data_type`, re-applied to pg_attribute
+#: for relations information_schema does not list (materialized views): a
+#: domain reports its base type, an array `ARRAY`, a non-catalog type
+#: `USER-DEFINED`, anything else its unmodified `format_type`. Spelling it the
+#: same way is what lets `map_type` and the tz-aware check read both alike.
+_DATA_TYPE_SQL = (
+    "case when t.typtype = 'd' then "
+    "case when bt.typelem <> 0 and bt.typlen = -1 then 'ARRAY' "
+    "when nbt.nspname = 'pg_catalog' then pg_catalog.format_type(t.typbasetype, null) "
+    "else 'USER-DEFINED' end "
+    "else case when t.typelem <> 0 and t.typlen = -1 then 'ARRAY' "
+    "when nt.nspname = 'pg_catalog' then pg_catalog.format_type(a.atttypid, null) "
+    "else 'USER-DEFINED' end end"
+)
 
 
 class PostgresDialect(Dialect):
@@ -28,36 +185,38 @@ class PostgresDialect(Dialect):
     def connect(self, connection_string: str) -> None:
         """Open a read-only, UTC-pinned, single-snapshot session.
 
-        Five settings, in this order, and the order matters: the timezone and
-        `extra_float_digits` are set while autocommit is still on so they stick
-        to the session rather than to a transaction that never commits.
+        The session pins (`SESSION_PINS`) are set while autocommit is still on
+        so they stick to the session rather than to a transaction that never
+        commits; only then do read-only and REPEATABLE READ go on.
         """
         import psycopg
 
-        # psycopg understands postgres:// and postgresql:// URLs directly.
-        self._conn = psycopg.connect(connection_string, autocommit=True)
-        # Pin the session to UTC before anything else. `timestamptz` renders
-        # through the *session* timezone, so two sides whose sessions differ
-        # render the same instant as different text and every row with a
-        # timestamptz reports as changed - a false positive that looks exactly
-        # like catastrophic data loss. A timestamptz is an instant; comparing
-        # instants in UTC is both correct and deterministic. Naive `timestamp`
-        # columns carry no zone and are unaffected.
-        #
-        # Done while autocommit is still on, so it applies to the session
-        # rather than to a transaction that later rolls back.
-        self._conn.execute("set time zone 'UTC'")
-        # FLOAT canonical text casts a double to text and relies on that being
-        # the shortest round-trip decimal. PostgreSQL 12+ prints exactly that
-        # whenever extra_float_digits > 0 (the default is 1), but a session or
-        # role default of 0 or less falls back to 15 significant digits and a
-        # value like 1e15+0.5 would render as 1e15. Pin it, like the timezone.
-        self._conn.execute("set extra_float_digits = 1")
+        try:
+            # psycopg understands postgres:// and postgresql:// URLs directly,
+            # but only in lower case - see `_SCHEME`.
+            self._conn = psycopg.connect(
+                _SCHEME.sub(lambda m: m.group(1).lower() + "://", connection_string),
+                autocommit=True,
+            )
+        except psycopg.Error as exc:
+            # libpq quotes the token it could not parse, which for a mistyped
+            # URL is the password or the whole URL (RT-F2). This tool runs in
+            # CI, where errors land in logs other people read.
+            text = str(exc).strip()
+            clean = redact(text, connection_secrets(connection_string))
+            # The chained driver exception carries the same text, so drop it
+            # whenever redaction had to remove something.
+            cause = exc if clean == text else None
+            raise self._err(f"could not connect: {clean}") from cause
+        for setting, value in SESSION_PINS:
+            self._conn.execute(f"set {setting} = {value}")
         # PostgreSQL 11 and older print 17 significant digits instead of the
         # shortest repr, so FLOAT columns cannot be rendered canonically there;
         # `normalize` refuses them rather than report rounding-only diffs.
         row = self._conn.execute("show server_version_num").fetchone()
         self._server_version_num = int(row[0]) if row else 0
+        if self._server_version_num >= TRANSACTION_TIMEOUT_FROM:
+            self._conn.execute("set transaction_timeout = 0")
         self._conn.autocommit = False
         # Read-only by construction (CLAUDE.md section 6). Enforced by the
         # server, so no bug in query building can write to a user's database.
@@ -102,6 +261,7 @@ class PostgresDialect(Dialect):
         with self._conn.cursor() as cur:
             try:
                 cur.execute(sql)
+                return cur.fetchall()
             except psycopg.Error as exc:
                 text = str(exc)
                 at = text.find(FLOAT_OUT_OF_RANGE_MESSAGE)
@@ -109,7 +269,81 @@ class PostgresDialect(Dialect):
                     raise
                 line = text[at:].splitlines()[0]
                 raise self._err(line[:-1] if line.endswith('"') else line) from exc
-            return cur.fetchall()
+            except UnicodeDecodeError as exc:
+                # client_encoding is pinned to UTF8, but a SQL_ASCII *database*
+                # stores bytes unchecked and the server passes them through
+                # unconverted; text that is not UTF-8 cannot be compared as
+                # text with any other engine.
+                raise self._err(
+                    f"the server returned text that is not valid UTF-8 ({exc}); "
+                    f"is the database encoding SQL_ASCII?"
+                ) from exc
+
+    # ------------------------------------------------------------ metadata
+
+    def qualify(self, table: str) -> str:
+        """Quote a table name, always schema-qualified.
+
+        An unqualified name is documented to mean `public.<name>`, and that is
+        where `columns()` introspects it. Left unqualified in the data queries,
+        PostgreSQL resolved it through the session's search_path - `"$user",
+        public` by default, so a login with a sandbox schema named after
+        itself, or a role default putting another schema first, read one
+        table's columns and *another* table's rows, and could call
+        `public.orders` identical when it was not (RT-C2, RT-D2). The
+        search_path is now pinned to pg_catalog besides (`SESSION_PINS`), so
+        an unqualified name would not resolve at all.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        return f"{self.quote(schema)}.{self.quote(name)}"
+
+    def columns(self, table: str) -> list[Column]:
+        """Introspect a table, view, or materialized view.
+
+        `information_schema.columns` - the shared path - does not list
+        materialized views at all (they are PostgreSQL-specific, outside the
+        SQL standard), so a materialized view used to fall through to "exists
+        but this role cannot read it", blaming a GRANT that was there (RT-C3).
+        They are ordinary readable relations, so they are introspected from
+        pg_attribute instead. Only on that fallback path: a table's
+        introspection runs exactly the SQL it always did.
+        """
+        try:
+            return super().columns(table)
+        except ValueError as exc:
+            try:
+                schema, name = self.split_table(table, self.default_schema)
+            except ValueError:
+                raise exc from None
+            found = self._matview_columns(table, schema, name)
+            if found is None:
+                raise
+            return found
+
+    def _matview_columns(self, table: str, schema: str, name: str) -> list[Column] | None:
+        """The columns of materialized view `schema.name`, or None if it is not one."""
+        rows = self.query(
+            f"select a.attname, {_DATA_TYPE_SQL}, "
+            "pg_catalog.has_table_privilege(c.oid, 'SELECT') "
+            "from pg_catalog.pg_class c "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "join pg_catalog.pg_attribute a on a.attrelid = c.oid "
+            "join pg_catalog.pg_type t on t.oid = a.atttypid "
+            "join pg_catalog.pg_namespace nt on nt.oid = t.typnamespace "
+            "left join pg_catalog.pg_type bt on t.typtype = 'd' and bt.oid = t.typbasetype "
+            "left join pg_catalog.pg_namespace nbt on nbt.oid = bt.typnamespace "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)} "
+            "and c.relkind = 'm' and a.attnum > 0 and not a.attisdropped "
+            "order by a.attnum"
+        )
+        if not rows:
+            return None
+        if not rows[0][2]:
+            raise self._err(
+                f"materialized view {table} exists but this role cannot read it. "
+                f"Ask for SELECT on {schema}.{name}."
+            )
+        return [Column(r[0], map_type(r[1]), r[1]) for r in rows]
 
     def _exists_but_unreadable(self, schema: str, name: str) -> bool:
         """Is the table really there, with this role simply unable to see it?
@@ -137,6 +371,21 @@ class PostgresDialect(Dialect):
         command line and reach SQL through here.
         """
         return '"' + identifier.replace('"', '""') + '"'
+
+    def count_distinct_key(self, key: KeySpec, identity: str) -> str:
+        """Count distinct key identities by their bytes, not their collation.
+
+        A hashed key's identity is text, and `::text` keeps the column's
+        collation. Under a nondeterministic ICU collation - PostgreSQL's
+        standard answer to case-insensitive emails and user names - `count
+        (distinct)` merged 'abc' and 'ABC' and refused two distinct rows as a
+        duplicate key (RT-B10, RT-D11), though md5 and `fetch_range` keep them
+        apart. `"C"` compares bytes, which is what identity means here. An
+        integer key has no collation, so it keeps the shared SQL.
+        """
+        if not key.hashed:
+            return super().count_distinct_key(key, identity)
+        return self.count(f'distinct ({identity}) collate pg_catalog."C"')
 
     # ----------------------------------------------------------- rendering
 
@@ -213,12 +462,46 @@ class PostgresDialect(Dialect):
             # which is exactly why the encoding tests plant differences.
             expr = f"case when {c} then 'true' when not {c} then 'false' end"
         elif t is LogicalType.DATE:
-            expr = f"to_char({c}, 'YYYY-MM-DD')"
+            expr = self._datetime_text(c, "-MM-DD")
         elif t is LogicalType.TIMESTAMP:
-            expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.US')"
+            expr = self._datetime_text(c, "-MM-DD HH24:MI:SS.US")
         else:
             expr = f"({c})::text"
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    @staticmethod
+    def _datetime_text(c: str, after_year: str) -> str:
+        """Render a date, timestamp or timestamptz, infinities and BC included.
+
+        `to_char(c, 'YYYY' || after_year)` is the AD case, unchanged, so no
+        ordinary checksum moves. Two cases it got wrong:
+
+        - **infinity / -infinity**: `to_char` returns SQL NULL, so both
+          equalled each other and a real NULL. They render `DATE_INFINITY` /
+          `DATE_NEG_INFINITY`, as DuckDB does.
+        - **BC**: `YYYY` drops the era, so 44 BC rendered exactly like AD 44
+          (RT-A6, C10, E4). The canonical form is DuckDB's astronomical year
+          numbering, where 1 BC is year 0 and 44 BC is year -43: `0000` for
+          year 0, and for earlier years a minus sign and the *unpadded*
+          magnitude (`-43-03-15`, `-4712-01-01`) - exactly what DuckDB's
+          `strftime('%Y')` prints, verified against DuckDB 1.5.5 from 4713 BC
+          to 1 BC. `to_char`'s BC `YYYY` is the BC year, so the astronomical
+          magnitude is that minus one.
+
+        `c < '0001-01-01'` (true for -infinity too, hence the order) is one
+        cheap comparison per value; the literal takes the column's type, and
+        for a timestamptz it reads as UTC because the session is pinned there.
+        """
+        year = f"to_char({c}, 'YYYY')"
+        return (
+            f"case when {c} = 'infinity' then '{DATE_INFINITY}' "
+            f"when {c} = '-infinity' then '{DATE_NEG_INFINITY}' "
+            f"when {c} < '0001-01-01' then "
+            f"case when {year} = '0001' then '0000' "
+            f"else '-' || (cast({year} as integer) - 1)::text end "
+            f"|| to_char({c}, '{after_year}') "
+            f"else to_char({c}, 'YYYY{after_year}') end"
+        )
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.

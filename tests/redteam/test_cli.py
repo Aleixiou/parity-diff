@@ -681,11 +681,6 @@ def _connect_error(conn: str) -> str:
         f"postgres://parity@127.0.0.1:5432/parity?password={SECRET} x",
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F2: libpq parse errors echo the password (or the whole URL) "
-    "and parity prints the driver message verbatim",
-)
 def test_postgres_parse_errors_do_not_print_the_password(conn):
     """Offline: each of these fails inside libpq before any network I/O."""
     pytest.importorskip("psycopg")
@@ -976,6 +971,7 @@ def test_postgres_receives_only_reads(pg_url, duck_orders, monkeypatch):
     import psycopg
 
     from parity.dialects.base import get_dialect
+    from parity.dialects.postgres_dialect import SESSION_PINS
 
     admin = psycopg.connect(pg_url, autocommit=True)
     try:
@@ -1008,11 +1004,12 @@ def test_postgres_receives_only_reads(pg_url, duck_orders, monkeypatch):
         assert log, "nothing was recorded"
         print("postgres statements:", sorted({x.split()[0] for x in log}), len(log))
         assert _non_reads(log) == []
-        assert _sets(log) == [
-            "set extra_float_digits = 1",
-            "set time zone 'UTC'",
-            "show server_version_num",
-        ]
+        # The session pins (SESSION_PINS: RT-D1/D5/D8/D13/D14) and the
+        # version probe; transaction_timeout only exists from PostgreSQL 17.
+        pins = {f"set {k} = {v}" for k, v in SESSION_PINS}
+        pins |= {"show server_version_num", "set transaction_timeout = 0"}
+        assert set(_sets(log)) <= pins
+        assert {f"set {k} = {v}" for k, v in SESSION_PINS} <= set(_sets(log))
         # And the server itself would refuse a write in the diff's session.
         d = get_dialect(pg_url, side="A")
         try:

@@ -261,11 +261,6 @@ def pg_table(pg_url):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E3: PostgreSQL 'infinity' / '-infinity' dates and timestamps "
-    "render as NULL (to_char returns NULL), so they equal NULL on the other side",
-)
 def test_rt_e3_postgres_infinity_is_not_null(pg_url, pg_table, tmp_path):
     """RT-E3: PostgreSQL infinity dates must not equal NULL."""
     ddl = "id int, d date, ts timestamp"
@@ -275,11 +270,6 @@ def test_rt_e3_postgres_infinity_is_not_null(pg_url, pg_table, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E3b: 'infinity' on PostgreSQL and on DuckDB reads different "
-    "('\\N' against 'infinity')",
-)
 def test_rt_e3b_infinity_on_both_sides_is_identical(pg_url, pg_table, tmp_path):
     """RT-E3b: infinity on PostgreSQL and on DuckDB must compare equal."""
     t = pg_table("rt_fz_inf2", "id int, d date", "(1, 'infinity')")
@@ -288,11 +278,6 @@ def test_rt_e3b_infinity_on_both_sides_is_identical(pg_url, pg_table, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E4: PostgreSQL renders a BC date without its era (to_char "
-    "'YYYY'), so 0044-03-15 BC compares equal to 0044-03-15 AD",
-)
 def test_rt_e4_a_bc_date_is_not_the_ad_date(pg_url, pg_table, tmp_path):
     """RT-E4: a BC date must not equal the AD date with the same digits."""
     t = pg_table("rt_fz_bc", "id int, d date", "(1, '0044-03-15 BC')")
@@ -301,11 +286,6 @@ def test_rt_e4_a_bc_date_is_not_the_ad_date(pg_url, pg_table, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E4b: one BC date reads '0044-03-15' on PostgreSQL and "
-    "'-43-03-15' on DuckDB (astronomical year, unpadded)",
-)
 def test_rt_e4b_a_bc_date_on_both_sides_is_identical(pg_url, pg_table, tmp_path):
     """RT-E4b: one BC date on PostgreSQL and on DuckDB must compare equal."""
     t = pg_table("rt_fz_bc2", "id int, d date", "(1, '0044-03-15 BC')")

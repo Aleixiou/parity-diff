@@ -707,7 +707,10 @@ def test_schema_qualified_names_quote_each_part():
 
     d = PostgresDialect()
     assert d.qualify("public.orders") == '"public"."orders"'
-    assert d.qualify("orders") == '"orders"'
+    # An unqualified name is always read from the schema it is introspected
+    # in, never resolved through the session's search_path (RT-C2, RT-D2).
+    assert d.qualify("orders") == '"public"."orders"'
+    assert d.qualify('my"t') == '"public"."my""t"'
 
 
 def test_get_dialect_rejects_unknown_scheme():

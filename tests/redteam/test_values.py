@@ -278,11 +278,6 @@ def test_rt_a3_composite_key_null_component(engines):
 
 
 @pytest.mark.parametrize("typ", ["date", "timestamp", "timestamptz"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A5: PostgreSQL to_char() returns NULL for +/-infinity, so "
-    "'infinity', '-infinity' and NULL all render '\\N'",
-)
 def test_rt_a5_pg_infinity_equals_minus_infinity(engines, typ):
     r = run_pair(
         engines,
@@ -293,10 +288,6 @@ def test_rt_a5_pg_infinity_equals_minus_infinity(engines, typ):
     assert found(r) == [(1, "different")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A5: PostgreSQL 'infinity' timestamp matches a NULL on DuckDB",
-)
 def test_rt_a5_pg_infinity_matches_null_on_duckdb(engines):
     r = run_pair(
         engines,
@@ -312,11 +303,6 @@ def test_rt_a5_pg_infinity_matches_null_on_duckdb(engines):
     assert found(r) == [(1, "different")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A5: the same 'infinity' reads '\\N' on PostgreSQL and 'infinity' "
-    "on DuckDB - a false difference",
-)
 def test_rt_a5_infinity_on_both_sides_is_a_false_difference(engines):
     ins = ["insert into {t} values (1, 'infinity'), (2, '2024-01-01')"]
     r = run_pair(
@@ -334,10 +320,6 @@ def test_rt_a5_infinity_on_both_sides_is_a_false_difference(engines):
 
 
 @pytest.mark.parametrize("typ", ["date", "timestamp", "timestamptz"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A6: PostgreSQL 'YYYY' drops the era, so 44 BC renders exactly like AD 44",
-)
 def test_rt_a6_pg_bc_equals_ad(engines, typ):
     v = "0044-03-15" if typ == "date" else "0044-03-15 12:00:00"
     if typ == "timestamptz":
@@ -351,10 +333,6 @@ def test_rt_a6_pg_bc_equals_ad(engines, typ):
     assert found(r) == [(1, "different")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A6: PostgreSQL 44 BC matches DuckDB AD 44 (false match)",
-)
 def test_rt_a6_pg_bc_matches_duckdb_ad(engines):
     r = run_pair(
         engines,
@@ -370,11 +348,6 @@ def test_rt_a6_pg_bc_matches_duckdb_ad(engines):
     assert found(r) == [(1, "different")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A6: the same BC date renders '0044-03-15' on PostgreSQL and "
-    "'-43-03-15' on DuckDB - a false difference",
-)
 def test_rt_a6_bc_on_both_sides_is_a_false_difference(engines):
     r = run_pair(
         engines,
