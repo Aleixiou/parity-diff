@@ -257,13 +257,15 @@ class MySQLDialect(Dialect):
         be told to give. Autocommit goes off once the session is pinned, so
         that snapshot spans the diff.
         """
-        import mysql.connector
-
         try:
             url = parse_mysql_url(connection_string)
         except ValueError as exc:
             # Name the side; the message never carries the userinfo.
             raise self._err(str(exc)) from None
+        # Imported only after the URL parses, so a malformed connection string
+        # is reported as such even where the driver is not installed.
+        import mysql.connector
+
         self._database = url.database
         if self.default_schema == "" and self._database:
             self.default_schema = self._database

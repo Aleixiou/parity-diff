@@ -1175,6 +1175,12 @@ def test_pg_snapshot_survives_a_slow_other_side(pg_url, pgw, tmp_path, gucs):
     takes 2.5 s after level 1 (simulated); the diff must still finish."""
     import time
 
+    if "transaction_timeout" in gucs:
+        # The setting only exists from PostgreSQL 17; an older server refuses
+        # the connection outright, and the dialect pins it only on 17+.
+        (version,) = pgw.execute("show server_version_num").fetchone()
+        if int(version) < 170000:
+            pytest.skip("transaction_timeout needs PostgreSQL 17 or newer")
     t = f"{SCHEMA}.idle_{next(iter(gucs))[:12]}_{RUN}"
     pgw.execute(f"create table {t} (id int primary key, v text)")
     pgw.execute(f"insert into {t} select i, 'v' || i from generate_series(1, {ROWS}) i")

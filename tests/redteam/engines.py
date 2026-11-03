@@ -94,8 +94,12 @@ class PostgresEngine(Engine):
     name = "postgres"
 
     def __init__(self) -> None:
-        """Connect an autocommit fixture writer, or skip when no server answers."""
-        import psycopg
+        """Connect an autocommit fixture writer, or skip when no server answers.
+
+        Skips, not fails, without the driver too: CI's DuckDB-only job runs
+        the whole suite with no PostgreSQL driver installed, on purpose.
+        """
+        psycopg = pytest.importorskip("psycopg")
 
         try:
             self.con = psycopg.connect(PG_URL, autocommit=True, connect_timeout=5)
@@ -237,7 +241,7 @@ class MSSQLEngine(Engine):
         Skips when no SQL Server is configured or reachable."""
         if not MSSQL_URL:
             pytest.skip("PARITY_TEST_MSSQL not set")
-        import mssql_python
+        mssql_python = pytest.importorskip("mssql_python")
 
         from parity.dialects.mssql_dialect import parse_mssql_url
 
