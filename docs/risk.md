@@ -36,6 +36,8 @@ For one run that reports **identical**, on columns the rules cover:
 | A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
 | A filtered "identical" read as one about the whole table | **0**: the headline, a `filtered:` line, JSON and a caveat state the filter; a filtered run **proves nothing about rows outside it** | By design (enforced) |
 | A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()` without one snapshot) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
+| A `parity run` summary reading stronger than one of its pairs | **0**: the run is identical only if every pair is; every pair's qualifiers appear in every output format; an error or Ctrl-C is exit 2 | By design (tested) |
+| A `--resume`d pair whose tables or settings changed carried over as identical | **0** for the config entry, the tool version and the connection strings as expanded (hashed); **not bounded** for data written since the earlier run — the report names it and its timestamp | By design / Not quantifiable |
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
@@ -88,6 +90,24 @@ line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
 | The predicate selects different rows in different queries (`random()`, `clock_timestamp()`; `now()`/`current_date` where an engine gives each query its own snapshot) | a change between the row count and the first level, or between two levels of one range, is **never identical** (unexplained); a row entering the filter beyond the key range measured first is **not compared**; beyond that **not bounded** — every filtered run's caveat says to prefer fixed literals | Not quantifiable |
 | A deterministic predicate inside one snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables; `now()` is stable within PostgreSQL's transaction) | **no new risk**: every query sees the same rows, so the walk is the unfiltered walk over a smaller table | By design (tested) |
 | The two sides' predicates select different slices | **not the tool's to know**: rows in one slice only read as only in A / only in B, and a one-sided filter draws a warning | By design |
+
+### 2c. Many pairs in one run (`parity run`)
+
+What it does: runs one ordinary comparison per `[[pair]]` of a config file,
+one after another, each on two fresh connections closed before the next.
+**A multi-pair verdict is each pair's verdict**: every figure in this file
+applies per pair, and the run's own verdict ("every pair identical") is
+never stronger than its weakest pair. Quote a run by its pairs: each pair's
+risk line, scale, filters and caveats, as the reports print them.
+
+| Risk | Odds | Kind |
+|---|---|---|
+| A pair's qualifier (filtered, truncated, unexplained, schema differences, sample-check failure or error, uncovered columns, caveats) missing from the summary | **0** — every format renders from the pair's own JSON result through one list of qualifiers; `tests/test_batch.py` plants each qualifier and checks it in the human, JSON, Markdown and JUnit output | By design (tested) |
+| One pair's session or snapshot affecting another | **0** — fresh connections per pair, closed before the next | By design (tested) |
+| A pair that errored, or was not run (Ctrl-C, `--fail-fast`), counted as identical | **0** — the run is identical only if every selected pair is; an error or an interrupt is exit 2 | By design (tested) |
+| A misspelt field silently ignored (e.g. a `where` that never applies) | **0** — unknown fields are refused before any connection | By design (tested) |
+| `--resume` carrying over a verdict that no longer holds | only pairs that finished identical are carried over, and only under an unchanged hash of the pair's settings, the tool version and both expanded connection strings; data written to the tables **since** that run is **not bounded** — each carried-over pair is labelled "from an earlier run" with its timestamp in every output | By design / Not quantifiable |
+| A password from `${NAME}` in the output | **0** for the tool's own messages, reports and the state file (redacted; connections are stored as a salted PBKDF2 fingerprint); data values are never altered | By design (tested) |
 
 ## 3. Checking keys
 
@@ -203,6 +223,7 @@ walk defect or a table changed mid-run.
   run.
 - **Tables changing during a run** without one snapshot (section 1).
 - **Rows outside a `--where` filter**: never compared (section 2b).
+- **Data changed since a `--resume`d pair's earlier run** (section 2c).
 - **Crafted data** against the checksum or the sample (sections 5, 8).
 - **Uncovered column types**, named in each report (section 4).
 - **The engines themselves**: a database or driver bug that returns wrong

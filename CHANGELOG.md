@@ -41,6 +41,31 @@ with the caveat that 0.x means the CLI surface may still move.
   and that a match does not make the type change harmless.
 - CONTRIBUTING no longer says a dialect is about eighty lines (the smallest
   is about 570).
+- **`parity run CONFIG`: a whole migration in one command** (`parity.batch`).
+  A TOML (Python 3.11+, or `tomli` via the new `[toml]` extra on 3.10) or
+  JSON file names connections once - `${NAME}` reads an environment
+  variable, so passwords stay out of the file - plus `[defaults]` and a list
+  of `[[pair]]` entries, each with its own `key`, `columns`, `exclude`,
+  `map`, `where`/`a_where`/`b_where` and overrides. The whole file is
+  validated before any connection (unknown fields refused with a near-miss
+  suggestion, duplicates, missing fields, types, unsafe filters, unset
+  variables - all at once, each naming file, pair and field). Pairs run one
+  after another on fresh connections; a pair's error is recorded and the run
+  goes on; `--fail-fast`, `--only NAME[,NAME]`; Ctrl-C still writes the
+  summary, marked incomplete. Outputs: a human summary, `--json` (every
+  pair's full `parity diff --json` plus totals), `--markdown FILE` (a
+  sign-off report with version, date and config SHA-256) and `--junit FILE`.
+  Every qualifier of a pair (filtered, truncated, unexplained, schema
+  differences, sample-check failure or error, uncovered columns, caveats)
+  appears in every format; the run is identical only if every pair is. Exit
+  0 all identical, 1 a pair differs, 2 a pair errored, interrupted, or an
+  invalid config. `--resume STATE.json` records each pair as it finishes and
+  skips, on a re-run, pairs that finished identical with an unchanged config
+  entry (settings, tool version, salted PBKDF2 fingerprint of each expanded
+  connection), listed as "from an earlier run" with their timestamp. The
+  expanded value of a variable never appears in any output, report or the
+  state file: tool messages are redacted (data values never are). `parity
+  diff` is unchanged.
 - **User documentation restructured** for someone who has never seen the
   tool. The README is now install, a five-minute first try on two DuckDB
   files (no server needed), use on real databases, reading the output, CI,

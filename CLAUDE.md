@@ -865,6 +865,23 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   by B's name. A swap (`x=y,y=x`) is legal and pinned by tests both ways
   (swapped data matches except the plant; unswapped data differs on every
   row). Differences carry A's name; `DiffResult.column_map` gives B's.
+- **A multi-pair verdict is each pair's verdict, never stronger than its
+  weakest pair** (`parity run`, `parity/batch.py`, 2026-11-04). Each pair is
+  one plain `diff` on two fresh dialects closed before the next, so no
+  snapshot or session is shared. The summary renders from each pair's
+  `to_dict` JSON (so a `--resume`d pair prints exactly like a fresh one),
+  and `batch.qualifiers` lists every line the single-pair report prints
+  before its rows - filtered, truncated, schema, unexplained, sample failure
+  / error / not run, uncovered columns, notes, every warning - in all four
+  formats; `tests/test_batch.py` checks each qualifier in each format. The
+  whole config is validated before any connection; unknown fields are
+  refused, never ignored (a misspelt `where` would compare the whole table).
+  `${NAME}` values are registered with a `Redactor` and replaced in every
+  tool message, report and the state file - never in data values. `--resume`
+  skips only pairs that finished **identical** under the same hash of
+  settings, version and a salted PBKDF2 fingerprint of each expanded
+  connection, so re-pointing a variable re-runs the pair. Exit 2 beats 1:
+  any pair error or Ctrl-C is 2. The CLI only adds the subcommand.
 
 ## 5. Architecture
 

@@ -235,6 +235,118 @@ while a same-named column still matches it by name — is refused, as is a
 mapped name absent on its side (with near misses listed) and a column both
 mapped and excluded. From Python: `diff(..., column_map={"a_col": "b_col"})`.
 
+## Checking a whole migration: `parity run`
+
+A migration is rarely one table. List the pairs once in a config file and
+check all of them with one command and one summary:
+
+```toml
+# migration.toml
+[connections]
+legacy    = "${LEGACY_URL}"                       # read from the environment
+warehouse = "postgres://checker:${WH_PW}@wh-host/analytics"
+local     = "duckdb:///./new.duckdb"
+
+[defaults]                 # optional; the same defaults as `parity diff`
+float_scale   = 6
+verify_sample = 10000
+max_diffs     = 10000      # 0 = no limit
+# bisection_factor = 32, threshold = 10000
+
+[[pair]]
+name    = "orders"
+a       = "legacy"
+b       = "warehouse"
+a_table = "public.orders"
+b_table = "public.orders"
+key     = "order_id"
+
+[[pair]]
+name    = "customers"
+a       = "legacy"
+b       = "warehouse"
+table   = "public.customers"          # same name on both sides
+key     = ["region", "customer_no"]   # or "region,customer_no"
+map     = { customer_name = "cust_nm" }   # side A name = side B name
+exclude = ["etl_loaded_at"]
+
+[[pair]]
+name        = "events-october"
+a           = "legacy"
+b           = "local"
+a_table     = "public.events"
+b_table     = "main.events"
+key         = "event_id"
+where       = "created_at >= '2026-10-01'"  # or a_where / b_where per side
+float_scale = 2                             # any default can be overridden
+```
+
+```
+parity run migration.toml
+parity run migration.toml --only orders,customers
+parity run migration.toml --fail-fast
+parity run migration.toml --markdown signoff.md --junit parity.xml
+parity run migration.toml --resume state.json      # skip what already passed
+parity run migration.toml --json > run.json
+```
+
+```
+✓ orders                     1,204,332 rows · no differences · 31.2s · scale 6
+✗ customers                     88,410 rows · 2 differences · 3.1s · scale 6
+      renamed columns (A = B): customer_name = B cust_nm
+✓ events-october                10,882 rows · no differences (filtered rows only) · 0.9s · scale 2
+    ! filtered rows only: A where created_at >= '2026-10-01'; B where created_at >= '2026-10-01'
+    ! side A (postgres) is filtered by (...): ...
+
+✗ 2 of 3 pairs identical, 1 differ, 0 errors
+  ! 1 identical pair(s) carry qualifiers (filters, caveats, uncovered columns, no sample check): read their lines above
+  risk, weakest identical pair (orders): with 99.9% confidence fewer than 0.069% of rows ...
+  the differing rows are listed by --json and --markdown FILE
+  35.4s · exit 1
+```
+
+- **Each pair is one `parity diff`** with the same rules, opened on two
+  fresh connections and closed before the next pair, so no pair shares a
+  snapshot or a session with another. Pairs run one after another.
+- **The whole file is validated before anything connects**: an unknown field
+  (with a near-miss suggestion), a duplicate name, a missing field, a wrong
+  type, an unsafe row filter or an unset environment variable is refused,
+  every problem at once, each naming the file, the pair and the field. A
+  pair without `name` is called by its `a_table`.
+- **`${NAME}`** in a connection string, as the whole value or inside it,
+  reads an environment variable, so passwords stay out of the file. Nothing
+  else is special (a `$` in a literal password stays a `$`). The expanded
+  value is never printed: every error, warning, report and the resume file
+  show `${NAME}` in its place.
+- **A pair that errors is recorded and the run goes on** to the next one;
+  `--fail-fast` stops at the first pair that is not identical or errors.
+  **Ctrl-C** stops cleanly: the summary of the pairs that finished is still
+  printed and every report is still written, marked incomplete.
+- **Exit code**: `0` only if every selected pair is identical; `2` if any
+  pair errored, the run was interrupted, or the config is invalid; otherwise
+  `1` (a pair differs, or `--fail-fast` stopped after one).
+- **The summary is never stronger than its weakest pair.** Every qualifier
+  the single-pair report would print — filtered, truncated, unexplained,
+  schema differences, a sample-check failure or error, uncovered columns,
+  caveats — is printed under that pair in every format, and the run's own
+  verdict is just "every pair identical", nothing more.
+- **`--resume STATE.json`** records each finished pair as it completes. On a
+  re-run with the same file, a pair that finished **identical** with an
+  unchanged config entry (its settings, the tool version, and a salted hash
+  of both connection strings as expanded) is not run again; it is listed as
+  `from an earlier run (<timestamp>)` in every output. Every other pair runs.
+- **`--markdown FILE`** writes a sign-off report (tool version, date, the
+  config file's SHA-256, then per pair: verdict, tables, key, filters,
+  renames, float scale, risk line, caveats, uncovered columns and up to 20
+  differences); **`--junit FILE`** writes one test case per pair (a failure
+  for differences, an error for an error); **`--json`** prints the whole run
+  with each pair's full `parity diff --json` object. See
+  [docs/output.md](docs/output.md#parity-run-the-summary).
+- TOML needs Python 3.11+, or `pip install "parity-diff[toml]"` on 3.10;
+  a `.json` file with the same structure works everywhere. Relative DuckDB
+  paths are relative to the directory you run `parity` from, as with
+  `parity diff`.
+
 ## Reading the output
 
 The report leads with one verdict line, then the cost, then everything that
