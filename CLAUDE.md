@@ -851,6 +851,13 @@ dialect is roughly 80 lines.
   is a landmine for the next contributor.
 - Errors must name the side and the table. `"table not found"` is useless when
   you are comparing two databases.
+- **`docs/risk.md` states the error odds of every step and is updated in the
+  same commit as every change to the tool** - re-check the sections the
+  change touches, copy new coverage numbers, then re-stamp it with
+  `python tests/test_risk_doc.py --stamp`. `tests/test_risk_doc.py` fails
+  whenever `src/parity/` changed since the last stamp, or a figure there
+  disagrees with the code or `docs/coverage.md`. Never re-stamp without
+  reviewing: the file is what a client is told about trusting a verdict.
 
 ## 7. Local development environment (Windows)
 

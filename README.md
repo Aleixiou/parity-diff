@@ -276,6 +276,9 @@ transaction open.
 
 ## Risk figures — what a run can state about itself
 
+[`docs/risk.md`](docs/risk.md) states the error odds of every step of a
+comparison, in summary and in detail, and is kept current with the code.
+
 Every report ends its sample-check line with two numbers. They are computed,
 not estimated, under the assumptions stated with each:
 

@@ -1,0 +1,181 @@
+# Error odds — what can go wrong, and how likely
+
+This file states, for every step of a comparison, how a wrong answer could
+arise and how likely it is. It is kept current with the code: it is updated
+after **every** change to the tool, and `tests/test_risk_doc.py` fails the
+suite whenever the source code, a constant below or the coverage map no
+longer match it (see *Keeping this file current* at the end).
+
+Every figure is labelled with what kind of number it is:
+
+- **Proven bound** — follows from mathematics under the stated assumption.
+- **Measured** — counted from tests that ran; true for what was tested.
+- **By design** — a documented rule, not an error; both methods follow it.
+- **Not quantifiable** — no honest number exists; what limits it is stated.
+
+The worst error is a **false match**: "identical" for tables that are not.
+A **false alarm** (a reported difference that is not real) and a **refusal**
+(the tool stops with an error) are inconvenient but never hide a difference.
+
+Source fingerprint: `src-sha256: 4dbc19a1d83e2b7c`
+
+## Summary
+
+For one run that reports **identical**, on columns the rules cover:
+
+| What would have to go wrong | Odds | Kind |
+|---|---|---|
+| A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
+| A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.01^(1/n)** of the rows, at 99% confidence, for n rows sampled — **0.46%** at the default n = 1,000; **0** when every row was compared | Proven bound |
+| An engine renders a value differently from the rules | **0 of 3,213** checks at float scale 6 outside the 26 required refusals (3,187 exact), on 484 distinct values × 6 engines | Measured |
+| Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
+| A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
+| A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
+| A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
+| A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
+| Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
+| Columns of types outside the rules (listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
+| A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
+
+How to state a run's risk to a client: quote the run's own `risk` line (or
+JSON `risk`), the scale and caveats it printed, and the uncovered columns
+it listed. Do not quote a probability that the software has no bugs.
+
+---
+
+## 1. Connecting and pinning the session
+
+What it does: opens each side read-only, pins time zone (UTC), float output,
+escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
+
+| Risk | Odds | Kind |
+|---|---|---|
+| Session settings change how values render | **0** for every setting the dialect pins; unpinned settings are being tested (red-team round G, in progress) | Measured / in progress |
+| Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
+| Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
+
+## 2. Matching schemas and columns
+
+| Risk | Odds | Kind |
+|---|---|---|
+| A column present on one side only is silently skipped | **0** — it is a schema difference, exit 1 | By design (tested) |
+| Two columns differing only in case are confused | **0** — such a table is refused | By design (tested) |
+| A type mismatch between sides goes unnoticed | **0** — a warning is printed; values compare by canonical text | By design (tested) |
+
+## 3. Checking keys
+
+| Risk | Odds | Kind |
+|---|---|---|
+| Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation) | By design (tested) |
+| Two distinct keys render alike and merge | **0** for INTEGER, DECIMAL (exact text), TIMESTAMP (all stored digits), STRING (escaped); FLOAT keys are refused | By design (tested) |
+
+## 4. Rendering each value as canonical text (per engine)
+
+What it does: each engine renders every value by the rules of CLAUDE.md 4.2
+and 4.3. This is where every past false match lived.
+
+| Risk | Odds | Kind |
+|---|---|---|
+| Rendering disagrees with the rules, covered types | **0 of 3,213** checks at scale 6 (3,187 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
+| Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
+| Types outside the rules (JSON, binary, arrays, …) | **not covered**: compared by text, named in every report; rules for them are in progress | Not quantifiable |
+| Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
+
+Findings this check produced and fixed: 6 (COV-1 to COV-6), one of them a
+false match (Snowflake TIME). Earlier red-team campaign: about 30 problems,
+11 of them false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
+
+## 5. Hashing rows and summing per key range
+
+What it does: each row's text becomes a 60-bit MD5 prefix; each side sums
+them per key range in a wide type and counts rows.
+
+| Risk | Odds | Kind |
+|---|---|---|
+| A range holding a real difference sums to the same value | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per differing range: the sums differ by at least one 60-bit hash that is uniform and independent of the rest | Proven bound (data not crafted to collide) |
+| Sum overflow | **0** — summed in NUMERIC / DECIMAL(38) / HUGEINT / NUMBER(38) | By design |
+| Crafted collision (8 rows chosen to cancel) | **not bounded** — a few seconds of computation, no secret needed | Not quantifiable |
+
+## 6. Walking the key space (bisection)
+
+| Risk | Odds | Kind |
+|---|---|---|
+| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine), property-tested against `bucket_bounds` | By design (tested) |
+| An empty range on one side is skipped | **0** — empty sums are 0 on both sides | By design (tested) |
+
+## 7. Downloading differing ranges and comparing rows
+
+| Risk | Odds | Kind |
+|---|---|---|
+| A driver changes values on download (dropped NULs, rounding) | **0** false matches — a range whose checksums differ but whose rows compare equal is "unexplained", never identical | By design (tested) |
+| Rows lost on download | **0** — row counts are checked against the checksum counts | By design (tested) |
+| `--max-diffs` stops the walk | **0** — the result is marked partial, never identical | By design (tested) |
+
+## 8. The independent sample check
+
+What it does: after the walk, about `--verify-sample` rows (default 1,000;
+all rows of a smaller table), chosen by a hash of the key with a fresh random
+residue each run, are fetched as raw driver values on both sides and compared
+in Python by the rules (`parity/reference.py`), with none of the engine SQL.
+Any disagreement means not identical.
+
+Chance that a rendering error affecting a share p of rows is **missed** by
+n sampled rows: (1 − p)ⁿ.
+
+| Share of rows affected | n = 1,000 | n = 100,000 |
+|---|---|---|
+| 1% | 4.3 × 10⁻⁵ | below 10⁻⁴³⁶ |
+| 0.1% | 0.368 | 3.5 × 10⁻⁴⁴ |
+| 0.01% | 0.905 | 4.5 × 10⁻⁵ |
+| 0.001% | 0.990 | 0.368 |
+
+Equivalently, after n rows with no disagreement, fewer than 1 − 0.01^(1/n)
+of rows can carry a hidden error, at 99% confidence:
+
+| n | share | of 10M rows, at most |
+|---|---|---|
+| 1,000 | 0.4595% | 45,946 |
+| 10,000 | 0.0460% | 4,605 |
+| 100,000 | 0.0046% | 461 |
+| 1,000,000 | 0.00046% | 47 |
+| whole table | 0 | 0 |
+
+Assumptions: the key hash spreads keys evenly over residues (MD5), the
+residue is random (`random.SystemRandom`), and the data is not crafted
+against the sample. The bound covers the run's `covered_columns`; columns
+listed as uncovered carry none. Driver quirks that would make the check
+disagree falsely are worked around per engine and verified live (MySQL
+FLOAT, SQL Server NULs and 7-digit times, PostgreSQL and DuckDB infinite
+and BC dates). Measured: on the full live suite (1,437 tests) the check
+raised no false disagreement; every disagreement it raised was a planted
+walk defect or a table changed mid-run.
+
+## 9. What no figure covers
+
+- **Bugs not yet found.** Evidence instead of a number: the coverage map
+  (section 4), the full live test suite, two red-team campaigns (the second,
+  on server settings and versions, in progress), and the sample check on
+  every run.
+- **Tables changing during a run** without one snapshot (section 1).
+- **Crafted data** against the checksum or the sample (sections 5, 8).
+- **Uncovered column types**, named in each report (section 4).
+- **The engines themselves**: a database or driver bug that returns wrong
+  data to both methods alike.
+
+---
+
+## Keeping this file current
+
+Update this file after **every** change to the tool, in the same commit:
+
+1. Re-check each section the change touches; change the figures and the
+   kind of number where they moved.
+2. If the change touches rendering, regenerate `docs/coverage.md`
+   (`tests/conformance/report.py`) and copy its summary numbers into
+   sections *Summary* and 4.
+3. Refresh the fingerprint: `python tests/test_risk_doc.py --stamp`.
+
+`tests/test_risk_doc.py` fails when the fingerprint does not match
+`src/parity/`, when a constant quoted here (2⁻⁶⁰, 99%, the default sample
+size) differs from the code, or when the coverage numbers here differ from
+`docs/coverage.md`.
