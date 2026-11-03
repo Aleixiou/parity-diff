@@ -158,6 +158,31 @@ def _mssql_available() -> tuple[bool, str]:
     return True, ""
 
 
+#: Oracle, if one is configured: a URL, or `1` for the local Oracle Free
+#: container `oracle://parity:parity@127.0.0.1:1521/FREEPDB1` (see
+#: tests/test_oracle.py). Opt-in: CI has no Oracle. The login must be able to
+#: create tables in its own schema; the fixtures build their own.
+ORACLE_DEFAULT_URL = "oracle://parity:parity@127.0.0.1:1521/FREEPDB1"
+ORACLE_URL = os.environ.get("PARITY_TEST_ORACLE", "")
+if ORACLE_URL == "1":
+    ORACLE_URL = ORACLE_DEFAULT_URL
+
+
+def _oracle_available() -> tuple[bool, str]:
+    """Can we reach Oracle? Returns (yes/no, why not)."""
+    if not ORACLE_URL:
+        return False, "PARITY_TEST_ORACLE is not set"
+    try:
+        import oracledb  # noqa: F401 - importing it is the probe
+    except ImportError:  # pragma: no cover - depends on install extras
+        return False, "oracledb is not installed"
+    try:
+        get_dialect(ORACLE_URL, side="A").close()
+    except Exception as exc:  # pragma: no cover - depends on the server
+        return False, f"no Oracle at the configured URL: {type(exc).__name__}"
+    return True, ""
+
+
 def _duckdb_available() -> tuple[bool, str]:
     """Is the duckdb driver installed? Returns (yes/no, why not)."""
     try:
@@ -210,6 +235,15 @@ def mssql_url() -> str:
     if not ok:
         pytest.skip(why)
     return MSSQL_URL
+
+
+@pytest.fixture(scope="session")
+def oracle_url() -> str:
+    """The Oracle endpoint, or skip if none is configured/reachable."""
+    ok, why = _oracle_available()
+    if not ok:
+        pytest.skip(why)
+    return ORACLE_URL
 
 
 @pytest.fixture(scope="session")

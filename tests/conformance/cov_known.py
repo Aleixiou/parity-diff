@@ -102,6 +102,11 @@ REFUSED: dict[tuple[str, str, str], str] = {
     ("bigquery", "NUMERIC", "d:-99999999999999999999999999999.999999999"): (
         "as above, negative"
     ),
+    ("oracle", "timestamp(9) with local time zone", "tz:9999-12-31 23:59:59.999999+00:00"): (
+        "Oracle stores the instant but cannot print it: TO_CHAR raises ORA-01877 "
+        "and EXTRACT reads year 10000, so the year guard refuses it naming the "
+        "column - loud, never `#####`"
+    ),
 }
 
 #: (family, value key) -> COV id, for cross-engine splits on ruled types.

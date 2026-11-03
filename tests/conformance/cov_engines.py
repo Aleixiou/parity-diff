@@ -9,7 +9,8 @@ spelling is exactly the kind of thing under test.
 
 Every object created is ours alone: PostgreSQL schema `parity_cov`, MySQL
 tables `cov_*` in the test database, SQL Server database `cov_db`, BigQuery
-and Snowflake tables `cov_*` / `COV_*`, DuckDB files in a temp directory -
+and Snowflake tables `cov_*` / `COV_*`, Oracle tables `ora_cov_*` in the
+login's schema, DuckDB files in a temp directory -
 the prefix and schema overridable (`PARITY_COV_PREFIX`,
 `PARITY_COV_PG_SCHEMA`) so two sweeps on one server never meet. The
 builders drop everything they made in `drop_all`.
@@ -1196,6 +1197,214 @@ class SnowflakeCov(CovEngine):
         finally:
             cur.close()
             self.w.close()
+
+
+@dataclass(frozen=True)
+class OraBind:
+    """A bound value with the SQL expression that receives it (`to_date(:n,
+    ...)`) and the driver bind type, for the values python-oracledb would
+    otherwise bind lossily (a float as NUMBER, a datetime as DATE)."""
+
+    expr: str
+    value: Any
+    size: Any = None
+
+
+def _ora_stamp(x: dt.datetime) -> str:
+    """`YYYY-MM-DD HH24:MI:SS.FF6`, zero-padded at any year."""
+    return (
+        f"{x.year:04d}-{x.month:02d}-{x.day:02d} "
+        f"{x.hour:02d}:{x.minute:02d}:{x.second:02d}.{x.microsecond:06d}"
+    )
+
+
+def ora_interval_ds(v: Val) -> bool:
+    """Intervals an INTERVAL DAY TO SECOND holds as given: no months, one
+    sign, a clock below one day (Oracle folds 24:00:00 into a day)."""
+    if v.value is None:
+        return True
+    if not isinstance(v.value, tuple):
+        return False
+    m, d, us = v.value
+    return m == 0 and abs(us) < 86_400_000_000 and d * us >= 0 and abs(d) < 10**9
+
+
+def ora_interval_ym(v: Val) -> bool:
+    """Intervals an INTERVAL YEAR TO MONTH holds: months only."""
+    if v.value is None:
+        return True
+    if not isinstance(v.value, tuple):
+        return False
+    m, d, us = v.value
+    # NUMTOYMINTERVAL(-2147483648, 'MONTH') stores +2147483648 (verified):
+    # the binder cannot write that one value, so it is left out.
+    return d == 0 and us == 0 and -(2**31) < m < 12 * 10**9
+
+
+def ora_bc_ok(v: Val) -> bool:
+    """BC dates as text; Oracle has no infinities."""
+    return v.value is None or (isinstance(v.value, str) and "BC" in v.value)
+
+
+class OracleCov(CovEngine):
+    """Oracle: `ora_cov_*` tables in the login's schema, bound by python-oracledb."""
+
+    name = "oracle"
+
+    def __init__(self, url: str) -> None:
+        """Connect a plain writer (the dialect's session is READ ONLY)."""
+        import oracledb
+
+        from parity.dialects.oracle_dialect import parse_oracle_url
+
+        self.url = url
+        self.con = oracledb.connect(**parse_oracle_url(url))
+        self.tables: list[str] = []
+
+    def natives(self) -> list[Native]:
+        """Every Oracle type `map_type_oracle` covers, plus UNKNOWN ones."""
+        return [
+            Native("number(10)", "int", int_range(-(10**10) + 1, 10**10 - 1)),
+            Native("number(19)", "int", int_range(-(10**19) + 1, 10**19 - 1)),
+            Native("integer", "int", int_range(-(10**38) + 1, 10**38 - 1)),
+            Native("number(38,9)", "dec", dec_fits(38, 9)),
+            Native("number", "dec", dec_fits(38, 30)),
+            Native("number(38,30)", "dec_wide", dec_fits(38, 30)),
+            Native("binary_float", "float4"),
+            Native("binary_double", "float"),
+            Native("binary_double", "float_refuse"),
+            Native("boolean", "bool"),
+            Native("varchar2(4000)", "str", max_utf8(4000)),
+            Native("nvarchar2(2000)", "str", max_utf16(2000)),
+            Native("clob", "str"),
+            Native("nclob", "str"),
+            Native("char(20)", "char", max_utf8(20)),
+            Native("nchar(20)", "char", max_utf16(20)),
+            Native("varchar2(36)", "uuid"),
+            Native("date", "date"),
+            Native("date", "date_ext", ora_bc_ok),
+            Native("date", "ts", lambda v: v.value is None or v.value.microsecond == 0),
+            Native("timestamp(6)", "ts"),
+            Native("timestamp(6)", "ts_ext", ora_bc_ok),
+            Native("timestamp(9)", "ts"),
+            Native("timestamp(9)", "ts_sub"),
+            Native("timestamp(6) with time zone", "tstz"),
+            Native("timestamp(9) with local time zone", "tstz"),
+            Native("interval day(9) to second(6)", "interval", ora_interval_ds),
+            Native("interval year(9) to month", "interval", ora_interval_ym),
+            Native("raw(2000)", "bytes", max_bytes(2000)),
+            Native("blob", "bytes"),
+            # UNKNOWN on Oracle.
+            Native("json", "json"),
+        ]
+
+    def table_name(self, slug: str) -> str:
+        """Prefixed `ora_` so other campaigns on this server never meet it."""
+        return f"ora_{PREFIX}_{slug}"[:120]
+
+    def bind(self, native: Native, v: Val) -> Any:
+        """Through SQL conversions where the driver would bind lossily."""
+        import oracledb
+
+        x = v.value
+        ddl = native.ddl
+        if x is None:
+            return None
+        if ddl == "binary_double":
+            return OraBind(":v", x, oracledb.DB_TYPE_BINARY_DOUBLE)
+        if ddl == "binary_float":
+            return OraBind(":v", x, oracledb.DB_TYPE_BINARY_FLOAT)
+        if ddl in ("clob", "nclob"):
+            return OraBind(":v", x, oracledb.DB_TYPE_CLOB if ddl == "clob" else oracledb.DB_TYPE_NCLOB)
+        if ddl == "blob":
+            return OraBind(":v", x, oracledb.DB_TYPE_BLOB)
+        if native.group == "date_ext":
+            return OraBind("to_date(:v, 'YYYY-MM-DD BC')", x)
+        if native.group == "ts_ext":
+            return OraBind("to_timestamp(:v, 'YYYY-MM-DD HH24:MI:SS BC')", x)
+        if native.group == "date":
+            return OraBind("to_date(:v, 'YYYY-MM-DD')", f"{x.year:04d}-{x.month:02d}-{x.day:02d}")
+        if native.group == "ts_sub":
+            return OraBind("to_timestamp(:v, 'YYYY-MM-DD HH24:MI:SS.FF9')", x)
+        if native.group == "ts":
+            return OraBind("to_timestamp(:v, 'YYYY-MM-DD HH24:MI:SS.FF6')", _ora_stamp(x))
+        if native.group == "tstz":
+            off = x.utcoffset() or dt.timedelta(0)
+            secs = int(off.total_seconds())
+            sign = "-" if secs < 0 else "+"
+            hh, mm = divmod(abs(secs) // 60, 60)
+            return OraBind(
+                "to_timestamp_tz(:v, 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')",
+                f"{_ora_stamp(x.replace(tzinfo=None))} {sign}{hh:02d}:{mm:02d}",
+            )
+        if native.group == "interval":
+            m, d, us = x
+            if "year" in ddl:
+                return OraBind("numtoyminterval(:v, 'MONTH')", m)
+            # As exact seconds: a timedelta binds a negative duration as
+            # -1 day plus a positive clock, an interval Oracle never builds.
+            secs = Decimal(d * 86_400_000_000 + us).scaleb(-6)
+            return OraBind("numtodsinterval(:v, 'SECOND')", secs)
+        if native.group == "json":
+            return OraBind("json(:v)", x)
+        return x
+
+    def build(self, table, columns, rows):
+        """Recreate `table` with quoted lower-case names and bind each row."""
+        cur = self.con.cursor()
+        try:
+            cur.execute(f'drop table "{table}" purge')
+        except Exception:
+            pass
+        cols = ", ".join(
+            f'"{n}" {"number(19)" if n == "id" else ddl}' for n, ddl in columns
+        )
+        cur.execute(f'create table "{table}" ({cols})')
+        cur.close()
+        self.tables.append(table)
+
+        def one(r: Sequence[Any]) -> None:
+            """Insert one row through its value's own conversion."""
+            exprs, params, sizes = [], {}, {}
+            for j, x in enumerate(r):
+                name = f"p{j}"
+                if isinstance(x, OraBind):
+                    exprs.append(x.expr.replace(":v", f":{name}"))
+                    params[name] = x.value
+                    if x.size is not None:
+                        sizes[name] = x.size
+                else:
+                    exprs.append(f":{name}")
+                    params[name] = x
+            c = self.con.cursor()
+            try:
+                if sizes:
+                    c.setinputsizes(**sizes)
+                c.execute(f'insert into "{table}" values ({", ".join(exprs)})', params)
+                self.con.commit()
+            finally:
+                c.close()
+
+        return _per_row(one, rows)
+
+    def ref(self, table):
+        """In the login's own schema."""
+        return table
+
+    def open(self, scale):
+        """A read-only parity dialect."""
+        return get_dialect(self.url, side="A", float_scale=scale)
+
+    def drop_all(self):
+        """Drop every table, then close the writer."""
+        cur = self.con.cursor()
+        for t in self.tables:
+            try:
+                cur.execute(f'drop table "{t}" purge')
+            except Exception:
+                pass
+        cur.close()
+        self.con.close()
 
 
 #: Still UNKNOWN on DuckDB: a nested list and a struct.

@@ -319,7 +319,8 @@ def _cell(
         cell.detail = terr[(i, j)]
         return cell
     raw_text = texts.get(i, (None,) * (j + 1))[j]
-    cell.text = d.fetched(raw_text) if raw_text is not None else None
+    # Through `fetched` even when NULL: Oracle's empty text arrives as None.
+    cell.text = d.fetched(raw_text)
     if cell.text is None:
         cell.status, cell.detail = "error", "the canonical text was SQL NULL"
         return cell

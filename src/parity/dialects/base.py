@@ -1676,10 +1676,14 @@ def get_dialect(
         from parity.dialects.mssql_dialect import SQLServerDialect
 
         dialect = SQLServerDialect(float_scale=float_scale, side=side)
+    elif scheme in ("oracle",):
+        from parity.dialects.oracle_dialect import OracleDialect
+
+        dialect = OracleDialect(float_scale=float_scale, side=side)
     else:
         raise ValueError(
             f"[side {side}] no dialect for scheme {scheme!r}. "
-            f"Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql."
+            f"Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql, oracle."
         )
     try:
         dialect.connect(connection_string)
