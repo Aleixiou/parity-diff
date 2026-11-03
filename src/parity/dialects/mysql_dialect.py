@@ -547,7 +547,9 @@ class MySQLDialect(Dialect):
         elif raw == "bit":
             expr = self._bit_text(column, c)
         else:
-            expr = f"cast({c} as char)"
+            # STRING, and every unmapped type (json, time, ...) through its
+            # text cast: arbitrary text, so escaped.
+            expr = self.escape_text(f"cast({c} as char)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
 
     def _binary_text(self, column: Column, c: str, *, prefix: bool) -> str:
@@ -617,6 +619,27 @@ class MySQLDialect(Dialect):
             return primary
         parts = ["'parity: wide row'", *(f"md5({self.normalize(c)})" for c in columns)]
         return f"coalesce({primary}, {self.hash_expr(self._concat(parts))})"
+
+    def backslash_sql(self) -> str:
+        r"""`char(92 using utf8mb4)`: a backslash whatever sql_mode says about
+        `\` in literals (NO_BACKSLASH_ESCAPES), and text, not a binary string."""
+        return "char(92 using utf8mb4)"
+
+    def concat_sql(self, left: str, right: str) -> str:
+        """`concat()`: in MySQL `||` is logical OR unless PIPES_AS_CONCAT."""
+        return f"concat({left}, {right})"
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """DECIMAL's char cast is exact and plain, at the declared scale; drop
+        the trailing fractional zeros that scale adds. Zero is tested first:
+        MySQL can hold a negative zero, which would render `-0`."""
+        t = f"cast({c} as char)"
+        return (
+            f"case when {c} = 0 then '0' "
+            f"when locate('.', {t}) > 0 "
+            f"then trim(trailing '.' from trim(trailing '0' from {t})) "
+            f"else {t} end"
+        )
 
     def _decimal_text(self, column: Column, c: str) -> str:
         """Render a DECIMAL column at the float scale, exactly or not at all.

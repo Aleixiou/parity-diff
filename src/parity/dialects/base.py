@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import Any, TypeVar
 
 from parity.types import Column, KeySpec, KeyStats, LogicalType
@@ -33,6 +34,68 @@ SEPARATOR_SQL = (
     "chr(31)"  # default; a dialect overrides `separator_sql` if its spelling differs
 )
 NULL_SENTINEL = "\\N"
+
+# ------------------------------------------------------- text escaping
+#
+# Row text is unambiguous only if no field can contain the separator and no
+# non-NULL field can render as the NULL sentinel. Numbers, dates, timestamps
+# and booleans render from a fixed alphabet that holds neither, but text does
+# not: the string `\N` (the NULL marker of MySQL and PostgreSQL text dumps)
+# rendered exactly like NULL, and a chr(31) inside a value moved a field
+# boundary, so ('a\x1fb', 'c') and ('a', 'b\x1fc') were one row - false matches
+# on ordinary data, in compared columns and in key identity alike (RT-A1..A4,
+# B1, B3, E1, E2, F9). So every rendering whose text is arbitrary - STRING, and
+# the fallback cast of an unmapped type such as JSON, an array or an interval -
+# goes through `Dialect.escape_text`: each backslash is doubled first, then
+# each chr(31) becomes a backslash followed by `s`. Afterwards every backslash
+# in an escaped field is followed by `\` or `s`, so no field equals `\N`; no
+# field contains chr(31), so the separators split a row one way only; and the
+# escape is injective, so distinct values stay distinct. Text holding neither
+# character renders byte-identically to before, so its checksums do not move.
+#
+# The backslash is always spelled as a function of its code point (`chr(92)`
+# and the engines' equivalents), never as a string literal: MySQL's
+# NO_BACKSLASH_ESCAPES and PostgreSQL's standard_conforming_strings decide what
+# a literal backslash means, and with the latter off `'\N'` became `'N'`, so a
+# NULL matched the one-letter string N (RT-D1).
+
+#: What chr(31) is escaped to, after the backslash that introduces it.
+SEPARATOR_ESCAPE = "s"
+
+
+def escape_canonical_text(value: str) -> str:
+    """The escape every dialect's `escape_text` applies, in Python: the spec."""
+    return value.replace("\\", "\\\\").replace("\x1f", "\\" + SEPARATOR_ESCAPE)
+
+
+def decode_canonical_field(field: str) -> str | None:
+    """Turn one field of canonical text back into the value it renders.
+
+    None for the NULL sentinel; otherwise the text with the escapes of
+    `escape_canonical_text` undone. For *display* only: rows are always
+    matched by their canonical text, never by this. A field that is not
+    escaped text (a number, a date) holds no backslash and comes back as it
+    is; a backslash not starting an escape is kept literally.
+    """
+    if field == NULL_SENTINEL:
+        return None
+    if "\\" not in field:
+        return field
+    out: list[str] = []
+    i = 0
+    while i < len(field):
+        pair = field[i : i + 2]
+        if pair == "\\\\":
+            out.append("\\")
+            i += 2
+        elif pair == "\\" + SEPARATOR_ESCAPE:
+            out.append("\x1f")
+            i += 2
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
 
 # Number of MD5 hex characters folded into the row hash. 15 nibbles = 60 bits.
 HASH_HEX_CHARS = 15
@@ -155,6 +218,27 @@ def canonical_float_text(x: float, scale: int = DEFAULT_FLOAT_SCALE) -> str:
     if q == 0:
         return float_zero_text(scale)
     return format(q, "f")
+
+
+def float_key_refusal(column: Column) -> str:
+    """Why a FLOAT column cannot be a key - see `Dialect.normalize_key`."""
+    return (
+        f"FLOAT column {column.name!r} cannot be used as a key. A key is "
+        "matched by exact text, and doubles are only compared rounded to the "
+        "float scale, which would merge distinct keys into one row; no "
+        "rendering of a double is both exact and identical on every engine. "
+        "Key by another column, or by a DECIMAL/integer cast of this one in a view"
+    )
+
+
+def canonical_decimal_key_text(value: Decimal) -> str:
+    """A DECIMAL key's canonical text, in Python: the spec `decimal_key_text`
+    implements on every engine. The exact value in plain notation, without
+    trailing fractional zeros or a trailing point, and never `-0`."""
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
 
 
 def sql_literal(value: str) -> str:
@@ -481,22 +565,51 @@ class Dialect(ABC):
         """
         return str(position)
 
-    def null_sentinel_sql(self) -> str:
-        r"""SQL producing the NULL sentinel as a string literal.
+    def backslash_sql(self) -> str:
+        r"""SQL for one backslash, built from its code point: `chr(92)`.
 
-        PostgreSQL and DuckDB take `\N` verbatim - neither processes
-        backslash escapes in a plain string literal. MySQL does, and its
-        setting is toggled by `sql_mode`, so a literal there is doubly unsafe;
-        it overrides this to build the two bytes from `CHAR(92)` instead.
+        Never a literal: whether `'\'` means a backslash depends on MySQL's
+        sql_mode and PostgreSQL's standard_conforming_strings (RT-D1).
         """
-        return f"'{NULL_SENTINEL}'"
+        return "chr(92)"
+
+    def concat_sql(self, left: str, right: str) -> str:
+        """Concatenate two text expressions. `||` here; MySQL and SQL Server
+        override it (`||` is logical OR in MySQL, `+` in T-SQL)."""
+        return f"({left} || {right})"
+
+    def null_sentinel_sql(self) -> str:
+        r"""SQL producing the NULL sentinel `\N`, from `chr(92)`.
+
+        It used to be the literal `'\N'`, which PostgreSQL reads as `'N'` when
+        standard_conforming_strings is off - a role, database or PGOPTIONS
+        default - so a NULL matched the string N (RT-D1). Same two bytes on
+        every engine, so no checksum moves.
+        """
+        return self.concat_sql(self.backslash_sql(), "'N'")
+
+    def escape_text(self, expr: str) -> str:
+        r"""Escape arbitrary text so row text stays unambiguous.
+
+        Backslash doubled first, then chr(31) as `\s` - see the comment at
+        `SEPARATOR_ESCAPE`, and `escape_canonical_text` for the spec. Applied
+        to the STRING branch and the unmapped-type fallback of every dialect.
+        A NULL stays NULL, so the sentinel still comes from the coalesce.
+        """
+        bs = self.backslash_sql()
+        escaped_sep = self.concat_sql(bs, "'" + SEPARATOR_ESCAPE + "'")
+        return (
+            f"replace(replace({expr}, {bs}, {self.concat_sql(bs, bs)}), "
+            f"{self.separator_sql()}, {escaped_sep})"
+        )
 
     def row_text(self, columns: Sequence[Column]) -> str:
         """Join every column's canonical text into one string per row.
 
-        Fields are separated by ASCII Unit Separator, which effectively never
-        occurs in warehouse string data - so ("ab", "c") cannot collide with
-        ("a", "bc").
+        Fields are separated by ASCII Unit Separator, and no field can contain
+        one - text is escaped (`escape_text`) and every other type renders from
+        an alphabet without it - so ("ab", "c") cannot collide with ("a", "bc"),
+        nor ("a\\x1fb", "c") with ("a", "b\\x1fc").
         """
         if not columns:
             # Two tables can legitimately share only their key - after
@@ -573,18 +686,71 @@ class Dialect(ABC):
         """
         if not key.hashed:
             return self.quote(key.columns[0].name)
-        return self.hash_expr(self.row_text(key.columns))
+        return self.hash_expr(self._concat(self._key_parts(key)))
 
     def key_identity(self, key: KeySpec) -> str:
         """The key as the user would recognise it, and as rows are matched by.
 
         Never the hash. Identity has to be exact, or two unrelated rows that
         happened to collide would be compared against each other - a false
-        difference at best and a masked one at worst.
+        difference at best and a masked one at worst. Exact means the key text,
+        not the value text: see `normalize_key`.
         """
         if not key.hashed:
             return self.quote(key.columns[0].name)
-        return self.row_text(key.columns)
+        return self._concat(self._key_parts(key))
+
+    def _key_parts(self, key: KeySpec) -> list[str]:
+        """Each key column's exact canonical text, in key order."""
+        return [self.normalize_key(c) for c in key.columns]
+
+    def normalize_key(self, column: Column) -> str:
+        """SQL rendering a *key* column as exact canonical text, null-safe.
+
+        `normalize` is right for values and wrong for keys. It rounds DECIMAL
+        and FLOAT to the float scale and timestamps to microseconds, which for
+        a value is a documented, printed precision limit - but a key's text is
+        its identity, so the same rounding merged distinct rows: key 1.00000001
+        on one side "was" 1.00000002 on the other and the pair read identical,
+        and a unique decimal(18,8) key was refused as not unique (RT-A18, B5,
+        B6). A key is therefore rendered exactly or refused:
+
+        - DECIMAL: the exact value with trailing fractional zeros (and a bare
+          point) removed - `decimal_key_text`. Independent of the declared
+          scale, so numeric(10,2) 1.50 and decimal(18,8) 1.50000000 are both
+          `1.5`, and an integral decimal is `42`, the text an integer key has.
+        - FLOAT: refused (`check_key`). A double's exact decimal expansion has
+          up to 767 digits and its shortest repr differs between engines above
+          2^53; no rendering is both exact and the same everywhere.
+        - Sub-microsecond timestamps: a dialect whose engine holds them
+          overrides this (DuckDB TIMESTAMP_NS, SQL Server datetime2(7)).
+        - Everything else already renders exactly and goes through `normalize`.
+        """
+        if column.logical_type is LogicalType.FLOAT:
+            raise self._err(float_key_refusal(column))
+        if column.logical_type is LogicalType.DECIMAL:
+            text = self.decimal_key_text(self.quote(column.name), column)
+            return f"coalesce({text}, {self.null_sentinel_sql()})"
+        return self.normalize(column)
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """A DECIMAL key's exact value as minimal plain text, NULL for NULL.
+
+        No trailing fractional zeros and no trailing point: `1.5`, `-0.25`,
+        `42`, `0`. Every dialect implements it from its own exact
+        decimal-to-text conversion; the default refuses, so a new dialect
+        cannot silently round a key.
+        """
+        raise self._err(
+            f"DECIMAL column {column.name!r} cannot be used as a key on "
+            f"{self.name}: no exact key rendering is defined for it"
+        )
+
+    def check_key(self, table: str, key: KeySpec) -> None:
+        """Refuse a key that cannot be matched exactly, naming side and table."""
+        for c in key.columns:
+            if c.logical_type is LogicalType.FLOAT:
+                raise self._err(f"in {table}: {float_key_refusal(c)}")
 
     # ------------------------------------------------------------- queries
 
@@ -600,17 +766,30 @@ class Dialect(ABC):
         to visit the key, and without it a non-unique key goes undetected,
         collapsing rows in `fetch_range` so their differences disappear.
         """
+        self.check_key(table, key)
         bucket = self.key_bucket(key)
         identity = self.key_identity(key)
         # `count(identity)` counts non-NULL keys only, while `count(*)` counts
         # every row. Carrying both is what lets a NULL key be diagnosed as a
         # NULL key rather than misreported as a duplicate - `count(distinct)`
-        # also ignores NULLs. For a hashed key the identity is coalesced text
-        # and so never NULL, which means a NULL component shows up as a
-        # duplicate instead; that is the honest limit of doing this in one pass.
+        # also ignores NULLs.
+        #
+        # A hashed key's identity is coalesced text and so never NULL: a NULL
+        # component became the key `\N`, was never refused, and was matched to
+        # the other side's NULL - or, before text was escaped, to a real `\N`
+        # (RT-B1, B2). So for a hashed key the rows counted as keyed are those
+        # whose every key column is non-NULL, and the engine refuses the rest
+        # exactly as it refuses a NULL integer key.
+        if key.hashed:
+            all_set = " and ".join(
+                f"{self.quote(c.name)} is not null" for c in key.columns
+            )
+            non_null_sql = self.count(f"case when {all_set} then 1 end")
+        else:
+            non_null_sql = self.count(identity)
         sql = (
             f"select min({bucket}), max({bucket}), {self.count()}, "
-            f"{self.count(identity)}, {self.count_distinct_key(key, identity)} "
+            f"{non_null_sql}, {self.count_distinct_key(key, identity)} "
             f"from {self.qualify(table)}"
         )
         lo, hi, rows, non_null, distinct = self.query(sql)[0]
@@ -693,8 +872,11 @@ class Dialect(ABC):
         # rows, so an incidental mismatch costs a query, never a wrong verdict.
         # It also subsumes the no-comparable-columns mode, where the key becomes
         # the only thing hashed. `columns` never contains the key, so the key is
-        # hashed exactly once.
-        content = self.row_hash([*key.columns, *columns])
+        # hashed exactly once - as its exact key text (`normalize_key`), or two
+        # keys that round alike would hash alike here too.
+        content = self.hash_expr(
+            self._concat([*self._key_parts(key), *(self.normalize(c) for c in columns)])
+        )
         return (
             f"select {bucket} as seg, {self.count()}, "
             f"{self.sum_wide(content)} "

@@ -586,11 +586,6 @@ def test_unencodable_data_does_not_crash_the_human_report(base, tmp_path):
     assert b"key 5" in raw.getvalue()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F9: a text value spelled \\N is byte-identical to the NULL "
-    "sentinel, so NULL versus the string '\\N' reports identical",
-)
 def test_null_versus_the_literal_sentinel_string_is_a_difference(base, tmp_path):
     """FALSE MATCH: row 13's note is NULL on A and the two characters `\\N` on B."""
     b = build(

@@ -49,6 +49,12 @@ def test_integer_division_and_widening():
     assert d.sum_wide("h") == "coalesce(sum(cast((h) as number(38,0))), 0)"
 
 
+_ESCAPED = (
+    'replace(replace(cast("c" as varchar), chr(92), (chr(92) || chr(92))), '
+    "chr(31), (chr(92) || 's'))"
+)
+
+
 def test_normalize_renders_each_logical_type():
     """Every branch of the canonical-text encoding, null-safe."""
     d = _d()
@@ -60,8 +66,9 @@ def test_normalize_renders_each_logical_type():
         LogicalType.BOOLEAN: "case when \"c\" then 'true' when not \"c\" then 'false' end",
         LogicalType.DATE: "to_char(\"c\", 'YYYY-MM-DD')",
         LogicalType.TIMESTAMP: "to_char(\"c\", 'YYYY-MM-DD HH24:MI:SS.FF6')",
-        LogicalType.STRING: 'cast("c" as varchar)',
-        LogicalType.UNKNOWN: 'cast("c" as varchar)',
+        # Arbitrary text is escaped: backslash doubled, chr(31) as \s.
+        LogicalType.STRING: _ESCAPED,
+        LogicalType.UNKNOWN: _ESCAPED,
     }
     for t, inner in cases.items():
         assert d.normalize(_col("c", t)) == f"coalesce({inner}, {sentinel})", t

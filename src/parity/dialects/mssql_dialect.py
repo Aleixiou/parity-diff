@@ -640,6 +640,7 @@ class SQLServerDialect(Dialect):
             expr = f"rtrim(cast({c} as {text}))"
             if raw == "nchar":
                 expr = self._utf16_safe(expr)
+            expr = self.escape_text(expr)
         elif raw == "uniqueidentifier":
             # SQL Server prints GUIDs upper-case; PostgreSQL and DuckDB lower.
             expr = f"lower(convert({text}, {c}))"
@@ -647,16 +648,18 @@ class SQLServerDialect(Dialect):
             expr = f"cast({c} as {text})"
             if raw in ("nvarchar", "ntext", "sysname"):
                 expr = self._utf16_safe(expr)
+            expr = self.escape_text(expr)
         elif raw in ("binary", "varbinary", "image", "timestamp", "rowversion"):
             # Bytes as 0x-hex (style 1); a cast to nvarchar would read them as
             # UTF-16. `timestamp` is rowversion, not a point in time.
             expr = f"convert({text}, convert(varbinary(max), {c}), 1)"
         elif raw in ("geography", "geometry", "hierarchyid"):
-            expr = f"{c}.ToString()"
+            expr = self.escape_text(f"cast({c}.ToString() as {text})")
         elif raw == "sql_variant":
             expr = self._variant_text(c)
         else:
-            expr = f"cast({c} as {text})"
+            # Any other type through its text: arbitrary, so escaped.
+            expr = self.escape_text(f"cast({c} as {text})")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
 
     def _variant_text(self, c: str) -> str:
@@ -697,7 +700,74 @@ class SQLServerDialect(Dialect):
         # Integers, bit, decimal/numeric and char/varchar convert exactly by
         # default: digits, and the decimal's own scale.
         value = f"case {base} {whens} else convert({text}, {c}) end"
-        return f"{base} + N':' + {value}"
+        # The value can be arbitrary text (a varchar/nvarchar base type), so
+        # it is escaped like any string: no `\N` or chr(31) can leak through.
+        return f"{base} + N':' + {self.escape_text(value)}"
+
+    def backslash_sql(self) -> str:
+        """`nchar(92)`: nvarchar like the rest of the row text."""
+        return "nchar(92)"
+
+    def concat_sql(self, left: str, right: str) -> str:
+        """T-SQL concatenates with `+`."""
+        return f"({left} + {right})"
+
+    def escape_text(self, expr: str) -> str:
+        """Escape under a binary collation, whatever the column's own.
+
+        T-SQL's `replace()` compares under the input's collation, and the
+        Windows collations treat control characters such as chr(31) as
+        ignorable, so a linguistic `replace` cannot be trusted to find them.
+        Latin1_General_BIN2 compares UTF-16 code units, which is exactly
+        what is wanted for one backslash and one chr(31), in any database
+        collation; it changes no character, and the hash's own UTF-8
+        conversion overrides it.
+        """
+        return super().escape_text(f"(({expr}) collate Latin1_General_BIN2)")
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """decimal's text is exact and plain at the declared scale; drop the
+        trailing fractional zeros. T-SQL 2019 has no `rtrim(s, chars)`, so
+        the zeros are cut with `reverse`/`patindex`. money and smallmoney
+        convert to text at two places by default, so they go through their
+        exact decimal(19,4) / decimal(10,4) first."""
+        raw = column.raw_type.lower().split("(")[0].strip()
+        if raw == "money":
+            c = f"cast({c} as decimal(19,4))"
+        elif raw == "smallmoney":
+            c = f"cast({c} as decimal(10,4))"
+        t = f"convert(nvarchar(max), {c})"
+        nz = f"left({t}, len({t}) - patindex(N'%[^0]%', reverse({t})) + 1)"
+        return (
+            f"case when {c} = 0 then N'0' "
+            f"when charindex(N'.', {t}) = 0 then {t} "
+            f"when right({nz}, 1) = N'.' then left({nz}, len({nz}) - 1) "
+            f"else {nz} end"
+        )
+
+    def normalize_key(self, column: Column) -> str:
+        """Exact key text; a datetime2/datetimeoffset key keeps its 100 ns tick.
+
+        As a value the seventh fractional digit is truncated (`caveats` says
+        so), and as a key that merged distinct keys. A key whose seventh digit
+        is not zero renders as nanoseconds instead - the seven digits and
+        `00`, the nine digits DuckDB prints for the same TIMESTAMP_NS - and
+        any other key renders exactly as before, so it still matches a
+        microsecond key elsewhere. Six digits against nine: no collisions.
+        """
+        raw = column.raw_type.lower().split("(")[0].strip()
+        if column.logical_type is LogicalType.TIMESTAMP and raw in (
+            "datetime2",
+            "datetimeoffset",
+        ):
+            c = self.quote(column.name)
+            v = f"switchoffset({c}, '+00:00')" if raw == "datetimeoffset" else c
+            s27 = f"convert(nvarchar(max), cast({v} as datetime2(7)), 121)"
+            return (
+                f"case when {c} is null or right({s27}, 1) = N'0' "
+                f"then {self.normalize(column)} else {s27} + N'00' end"
+            )
+        return super().normalize_key(column)
 
     def _timestamp_text(self, c: str, raw: str) -> str:
         """`yyyy-mm-dd hh:mi:ss.ffffff`, as the other engines print timestamps.

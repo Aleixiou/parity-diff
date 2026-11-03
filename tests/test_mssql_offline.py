@@ -423,6 +423,15 @@ def test_arithmetic_never_uses_a_rounding_division():
     assert d.sum_wide("h") == "coalesce(sum(cast((h) as decimal(38,0))), 0)"
 
 
+def _escaped(expr: str) -> str:
+    """`expr` through SQL Server's text escape, under a binary collation."""
+    inner = f"(({expr}) collate Latin1_General_BIN2)"
+    return (
+        f"replace(replace({inner}, nchar(92), (nchar(92) + nchar(92))), "
+        "nchar(31), (nchar(92) + 's'))"
+    )
+
+
 @pytest.mark.parametrize(
     ("column", "expr"),
     [
@@ -450,12 +459,14 @@ def test_arithmetic_never_uses_a_rounding_division():
                 "as datetime2(7)), 121), 26)"
             ),
         ),
-        (_col("c", "char"), "rtrim(cast([c] as nvarchar(max)))"),
+        # Text is escaped (backslash doubled, chr(31) as \s) under a binary
+        # collation, so no value renders as the sentinel or holds the separator.
+        (_col("c", "char"), _escaped("rtrim(cast([c] as nvarchar(max)))")),
         # N-types guard against unpaired surrogates (RT-E9); see the test below.
-        (_col("c", "nchar"), _utf16_safe("rtrim(cast([c] as nvarchar(max)))")),
+        (_col("c", "nchar"), _escaped(_utf16_safe("rtrim(cast([c] as nvarchar(max)))"))),
         (_col("c", "uniqueidentifier"), "lower(convert(nvarchar(max), [c]))"),
-        (_col("c", "nvarchar"), _utf16_safe("cast([c] as nvarchar(max))")),
-        (_col("c", "varchar"), "cast([c] as nvarchar(max))"),
+        (_col("c", "nvarchar"), _escaped(_utf16_safe("cast([c] as nvarchar(max))"))),
+        (_col("c", "varchar"), _escaped("cast([c] as nvarchar(max))")),
         (
             _col("c", "timestamp"),
             "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
@@ -464,8 +475,8 @@ def test_arithmetic_never_uses_a_rounding_division():
             _col("c", "varbinary"),
             "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
         ),
-        (_col("c", "geography"), "[c].ToString()"),
-        (_col("c", "time", 7), "cast([c] as nvarchar(max))"),
+        (_col("c", "geography"), _escaped("cast([c].ToString() as nvarchar(max))")),
+        (_col("c", "time", 7), _escaped("cast([c] as nvarchar(max))")),
     ],
 )
 def test_every_type_renders_as_nvarchar_max_inside_the_coalesce(column, expr):
@@ -591,7 +602,10 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     assert sql.endswith("group by 1") and " as seg, count(*), " in sql
     d.key_stats("s.t", TEXT_KEY)
     identity = d.key_identity(TEXT_KEY)
-    assert f"count(*), count({identity}), count(distinct {identity}) from" in seen[-1]
+    # A hashed key counts rows whose every key column is set (RT-B2): its
+    # identity is coalesced text, which is never NULL.
+    keyed = f"count(case when {d.quote('code')} is not null then 1 end)"
+    assert f"count(*), {keyed}, count(distinct {identity}) from" in seen[-1]
     notes = d.caveats([Column("t", LogicalType.TIMESTAMP, "datetime2(7)")])
     if isinstance(d, SnowflakeDialect):
         # Snowflake reports its own READ COMMITTED gap on every run (RT-D7),
