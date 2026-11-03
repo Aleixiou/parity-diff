@@ -695,3 +695,161 @@ def test_cli_end_to_end_json_exit_code_and_no_credentials(bigquery_url, bq, tmp_
     blob = proc.stdout + proc.stderr
     for secret in ("access_token", "refresh_token", "private_key", "Bearer "):
         assert secret not in blob
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HB9: each FLOAT64 column's rendering is ~2,200 characters, so a "
+    "table of 500 FLOAT64 columns exceeds BigQuery's 1,024K-character query "
+    "limit and cannot be compared at all",
+)
+def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path):
+    run, name, ds, _ = bq
+    n = 500
+    t = name("widef")
+    cols = ", ".join(f"cast(i * {k} as float64) / 7 as f{k}" for k in range(n))
+    run(f"create or replace table {ds}.`{t}` as select i as id, {cols} from unnest(generate_array(1, 3)) i")
+    dcols = ", ".join(f"(i * {k})::double / 7 as f{k}" for k in range(n))
+    path = _duck(
+        tmp_path,
+        f"create table t as select i::bigint as id, {dcols} from range(1, 4) r(i)",
+        "update t set f499 = 0 where id = 2",
+    )
+    result = _bq_duck(bigquery_url, path, t, "t", threshold=10_000)
+    assert _found(result) == [(2, "different", ["f499"])]
+
+
+def test_the_rendering_length_that_breaks_the_query_limit():
+    """The arithmetic behind RT-HB9, offline: the FLOAT64 expression alone is
+    over 2,000 characters, so ~460 columns reach 1,024K."""
+    d = BigQueryDialect()
+    assert len(d.normalize(_column("f499", "FLOAT64"))) > 2000
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "alter table {t} drop column v",
+        "alter table {t} rename column v to w",
+        "create or replace table {t} as select i as id, 'new' as v from unnest(generate_array(1, 12)) i",
+        "update {t} set v = 'changed' where id = 3",
+    ],
+)
+def test_schema_changes_and_replacement_mid_walk_stay_invisible(bigquery_url, bq, ddl):
+    """Time travel covers the table's schema and identity too: after a column
+    is dropped or renamed, or the whole table replaced, mid-walk, the pinned
+    dialect still reads the version it started on (checksums unchanged); a
+    fresh dialect sees the change (the control)."""
+    run, name, ds, _ = bq
+    t = name(f"sch{abs(hash(ddl)) % 10_000}")
+    run(f"create or replace table {ds}.`{t}` as select i as id, cast(i as string) as v from unnest(generate_array(1, 10)) i")
+    a = open_bigquery(bigquery_url)
+    try:
+        cols = a.columns(t)
+        key = a.key_spec(t, "id")
+        rest = [c for c in cols if c.name != "id"]
+        before = a.segment_checksums(t, key, rest, 1, 11, 1)
+        run(ddl.format(t=f"{ds}.`{t}`"))
+        assert a.segment_checksums(t, key, rest, 1, 11, 1) == before
+        assert a.key_stats(t, key).rows == 10
+    finally:
+        a.close()
+    fresh = open_bigquery(bigquery_url)
+    try:
+        cols = fresh.columns(t)
+        key = fresh.key_spec(t, "id")
+        rest = [c for c in cols if c.name != "id"]
+        assert [c.name for c in rest] != ["v"] or fresh.segment_checksums(
+            t, key, rest, 1, 13, 1
+        ) != before
+    finally:
+        fresh.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HB10: a table written as the BigQuery console copies it, "
+    "`project.dataset.table` in backticks, is refused as 'Invalid project ID' "
+    "or 'table not found' with no word about the backticks",
+)
+@pytest.mark.parametrize("form", ["`{t}`", "`{p}.{d}.{t}`", "`{p}`.`{d}`.`{t}`"])
+def test_a_backtick_quoted_table_name_is_read_or_explained(bigquery_url, bq, form):
+    t = _where_table(bq)
+    project, dataset, _ = parse_bigquery_url(bigquery_url)
+    a = open_bigquery(bigquery_url, "A")
+    try:
+        try:
+            cols = a.columns(form.format(p=project, d=dataset, t=t))
+        except ValueError as exc:
+            assert "backtick" in str(exc)
+        else:
+            assert [c.name for c in cols] == ["id", "v"]
+    finally:
+        a.close()
+
+
+def test_a_wildcard_table_name_is_refused_naming_the_side(bigquery_url, bq):
+    """`rth_bq_where_*` is BigQuery wildcard syntax; parity reads one table
+    and must say it found none (naming the side), not query a union."""
+    _where_table(bq)
+    a = open_bigquery(bigquery_url, "A")
+    try:
+        with pytest.raises(ValueError) as exc:
+            a.columns("rth_bq_where_*")
+        assert "side A" in str(exc.value) and "not found" in str(exc.value)
+    finally:
+        a.close()
+
+
+def test_unicode_and_control_text_against_duckdb(bigquery_url, bq, tmp_path):
+    """NUL, chr(31), backslash-N, every plane (BMP, astral emoji, U+10FFFF),
+    RTL, combining marks against precomposed, whitespace-only: equal text
+    matches DuckDB, and NFC against NFD is a difference (bytes differ)."""
+    run, name, ds, _ = bq
+    vals = [
+        "a\x00b", "a\x1fb", "\\N", "\U0001F600", "\U0010FFFF", "שלום",
+        "é", " \t ", "",
+    ]
+    t = name("uni")
+    lits = ", ".join(
+        f"struct({i} as id, code_points_to_string([{', '.join(str(ord(ch)) for ch in v)}]) as s)"
+        if v else f"struct({i} as id, '' as s)"
+        for i, v in enumerate(vals, 1)
+    )
+    run(f"create or replace table {ds}.`{t}` as select * from unnest([{lits}])")
+    path = str(tmp_path / "u.duckdb")
+    con = duckdb_write(path)
+    try:
+        con.execute("create table t (id bigint, s varchar)")
+        b_vals = list(vals)
+        b_vals[6] = "é"  # NFC on side B, NFD on side A: a real difference
+        con.executemany("insert into t values (?, ?)", list(enumerate(b_vals, 1)))
+    finally:
+        con.close()
+    result = _bq_duck(bigquery_url, path, t, "t")
+    assert _found(result) == [(7, "different", ["s"])]
+
+
+def test_200k_rows_with_first_last_and_middle_plants(bigquery_url, bq, tmp_path):
+    """Scale within the cost budget: 200,000 rows, differences on the first
+    key, the last key and one in the middle, nothing else."""
+    run, name, ds, _ = bq
+    t = name("scale")
+    run(
+        f"create or replace table {ds}.`{t}` as select i as id, "
+        "concat('v', cast(i as string)) as v, cast(i as numeric) / 8 as n "
+        "from unnest(generate_array(1, 200000)) i"
+    )
+    path = _duck(
+        tmp_path,
+        "create table t as select i::bigint as id, 'v' || i::varchar as v, (i::decimal(18,3) / 8)::decimal(18,3) as n from range(1, 200001) r(i)",
+        "update t set v = 'x' where id in (1, 200000)",
+        "update t set n = n + 0.001 where id = 123457",
+    )
+    result = _bq_duck(bigquery_url, path, t, "t", threshold=1000, bisection_factor=16)
+    assert _found(result) == [
+        (1, "different", ["v"]),
+        (123457, "different", ["n"]),
+        (200000, "different", ["v"]),
+    ]
+    assert result.stats.rows_downloaded < 10_000
