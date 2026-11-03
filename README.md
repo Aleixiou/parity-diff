@@ -307,9 +307,12 @@ stated plainly rather than buried.
   caps `--float-scale` at 30 for DECIMAL columns), on DuckDB 38 − s, on
   BigQuery the column type's own range. PostgreSQL has no limit. The error
   names the side, the column and the value.
-- **Snowflake FLOAT columns are not verified** against that canonical form —
-  no account was available when it was defined — and every run comparing one
-  prints a warning saying so. Snowflake DECIMAL columns are unaffected.
+- **Snowflake's driver sends usage telemetry to Snowflake.** The tool turns
+  off the connector's telemetry switch and its cloud-metadata probes
+  (`SNOWFLAKE_DISABLE_PLATFORM_DETECTION`), but connector 5.x still flushes a
+  small telemetry batch about the driver's own calls to your Snowflake account
+  when the session closes. No row data is in it, and it goes only to the
+  account you are already connected to.
 - **Keys must be unique.** A non-unique key is detected up front and rejected.
   Silently collapsing duplicate rows would hide real differences.
 - **`Infinity` and `NaN`** in float columns are compared as those literal

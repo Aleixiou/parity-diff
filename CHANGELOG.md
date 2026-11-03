@@ -3,6 +3,29 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
+## Unreleased
+
+- **Snowflake FLOAT now follows the canonical float form** every other engine
+  shares (the shortest round-trip decimal, rounded half away from zero). It
+  used to round the double's exact binary value, which disagreed with the
+  other engines on 215 of the 1,565 adversarial sample doubles at the default
+  scale (8 at scale 2) — false differences, and in principle two different
+  doubles rendering alike. Verified live against Snowflake on 6,565 doubles at
+  scales 0, 2, 6, 9 and 20; Infinity and NaN render as the shared tokens, and
+  values past 2^116 are refused naming the column. The "Snowflake FLOAT not
+  verified" warning is gone. **Checksums of Snowflake FLOAT columns change.**
+- **Every Snowflake change in 0.4.0 is now verified live** (AWS eu-central-2,
+  2026-11-03): UTC rendering of `TIMESTAMP_TZ` and `TIMESTAMP_LTZ`, timezone
+  awareness, the nanosecond caveat, nanosecond timestamp keys, exact DECIMAL
+  keys, `VARIANT` keeping its type, schema-qualified tables, the exact bucket
+  division (plain `/` was confirmed to round 9999999.99… up to 10000000) and
+  escaped text, including under a case-insensitive collation.
+- **Snowflake: no cloud-metadata probes.** Connector 5.x probes the AWS, Azure
+  and GCP metadata services at every login to report its platform; the tool
+  now sets `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` (an explicit setting wins).
+  The connector still flushes a telemetry batch to the connected account at
+  logout; see the README's limitations.
+
 ## 0.4.0 — 2026-11-03
 
 > **Upgrade from any earlier version, and re-run comparisons that touched any

@@ -30,12 +30,15 @@ The Snowflake-specific decisions, each confirmed by that run:
   result. This is a genuine limitation, documented rather than hidden, and
   `caveats` prints it on every run.
 
-Changed after that run, from Snowflake's documentation alone and **not yet
-verified live** (no account was available; each needs one query to confirm):
+Changed after that run from the documentation, then verified live on
+2026-11-03 (connector 5.1.0, AWS eu-central-2; `tests/test_snowflake.py`):
 
-- **Client telemetry is switched off** at login (the
-  `CLIENT_TELEMETRY_ENABLED` session parameter, plus the connector's own
-  switches): CLAUDE.md section 6.
+- **FLOAT follows the canonical float form** (`_float_text`): the old
+  `cast(c as number(38, s))` rounded the exact binary value and disagreed
+  with every other engine on 215 of 1,565 sample doubles.
+- **No telemetry, no cloud-metadata probes.** The connector's telemetry
+  switch is off and platform detection is disabled; connector 5.x still
+  flushes a session-telemetry batch at logout, which the README states.
 - **TIMESTAMP_TZ / TIMESTAMP_LTZ are instants** (`Column.tz_aware`), and a
   TIMESTAMP_TZ is moved to UTC before it is printed: `TO_CHAR` prints it in
   its *stored* offset, which the session TIMEZONE pin does not touch, so two
@@ -46,7 +49,7 @@ verified live** (no account was available; each needs one query to confirm):
   a string's quotes: a plain varchar cast prints the number 1 and the string
   "1" alike.
 - **`int_div` divides an exact multiple**, as SQL Server's does: NUMBER
-  division rounds its quotient to 6 places, so `floor(n / d)` could put a key
+  division rounds its quotient to 6 places, so `floor(n / d)` puts a key
   one bucket high.
 """
 
@@ -56,7 +59,16 @@ from collections.abc import Sequence
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
-from parity.dialects.base import Dialect, sql_literal
+from parity.dialects.base import (
+    FLOAT_EXACT_INT_FROM,
+    FLOAT_MAX_MAGNITUDE_SQL,
+    FLOAT_OUT_OF_RANGE_MESSAGE,
+    Dialect,
+    float_range_where,
+    float_tiny_sql,
+    float_zero_text,
+    sql_literal,
+)
 from parity.types import Column, LogicalType
 
 
@@ -78,6 +90,14 @@ class SnowflakeDialect(Dialect):
         one snapshot across the walk. UTC is still pinned so timestamps render
         deterministically.
         """
+        import os
+
+        # CLAUDE.md section 6: no calls anywhere but the warehouse. Connector
+        # 5.x probes the AWS, Azure and GCP metadata services at every login
+        # (169.254.169.254, metadata.google.internal) to report the platform
+        # it runs on; this switch stops it - verified live on 5.1.0, the
+        # probes vanish from the driver's log. An explicit setting wins.
+        os.environ.setdefault("SNOWFLAKE_DISABLE_PLATFORM_DETECTION", "true")
         import snowflake.connector
 
         url = urlparse(connection_string)
@@ -99,7 +119,10 @@ class SnowflakeDialect(Dialect):
             # driver usage (imported packages, connection shape) to Snowflake
             # unless told not to, and does so *during* connect - so the session
             # parameter has to ride in the login request; setting it afterwards
-            # would be too late. Not verified live.
+            # would be too late. The server does not list this parameter
+            # (it is a client one); the connector's own state is False -
+            # verified live. Connector 5.x still flushes a session-telemetry
+            # batch at logout that no switch in 5.1.0 stops (README).
             session_parameters={"CLIENT_TELEMETRY_ENABLED": False},
             log_imported_packages_in_telemetry=False,
             account=url.hostname,
@@ -147,7 +170,8 @@ class SnowflakeDialect(Dialect):
         another could be compared, and a real difference read identical
         (RT-D2, the Snowflake form of PostgreSQL's search_path gap). Naming
         the schema makes the rows come from the table that was introspected.
-        Unverified live: no Snowflake account in the test setup.
+        Verified live 2026-11-03: a planted change in PUBLIC.SAME is found
+        while the URL's schema holds an identical ENC.SAME.
         """
         schema, name = self.split_table(table, self.default_schema)
         return f"{self.quote(schema)}.{self.quote(name)}"
@@ -210,16 +234,6 @@ class SnowflakeDialect(Dialect):
 
     # ----------------------------------------------------------- rendering
 
-    def float_caveat(self) -> str | None:
-        """FLOAT here predates the shared canonical float form, unverified."""
-        return (
-            "Snowflake's FLOAT rendering (cast to NUMBER(38, scale)) has not "
-            "been verified against the canonical float form the other engines "
-            "share; doubles with more than ~15 significant digits or within a "
-            "hair of a rounding boundary may report as different, or a change "
-            "at the last compared decimal place may be missed"
-        )
-
     def null_sentinel_sql(self) -> str:
         r"""Build the sentinel from CHR(92), not a `\N` literal.
 
@@ -232,20 +246,17 @@ class SnowflakeDialect(Dialect):
     def normalize(self, column: Column) -> str:
         """Render one column as canonical text, null-safe.
 
-        DECIMAL/FLOAT cast to NUMBER(38, scale) then to text - so `1.5`
-        becomes `'1.500000'`. FLOAT is *not* verified against the canonical
-        float form the other engines now share (`canonical_float_text`: the
-        shortest round-trip decimal, rounded half away from zero): it was
-        defined before that form was, and no Snowflake account was available
-        to check it, so `float_caveat` warns on every FLOAT column. Non-finite
-        floats are a further unverified gap: Snowflake's Inf/NaN detection
-        differs from the other engines.
+        DECIMAL casts to NUMBER(38, scale) then to text - so `1.5` becomes
+        `'1.500000'`. FLOAT follows the canonical float form every engine
+        shares (`_float_text`), verified live.
         """
         c = self.quote(column.name)
         t = column.logical_type
         if t is LogicalType.INTEGER:
             expr = f"cast({c} as varchar)"
-        elif t in (LogicalType.DECIMAL, LogicalType.FLOAT):
+        elif t is LogicalType.FLOAT:
+            expr = self._float_text(c, self.float_scale_for(column), column)
+        elif t is LogicalType.DECIMAL:
             expr = f"cast(cast({c} as number(38,{self.float_scale})) as varchar)"
         elif t is LogicalType.BOOLEAN:
             expr = f"case when {c} then 'true' when not {c} then 'false' end"
@@ -259,7 +270,7 @@ class SnowflakeDialect(Dialect):
                 # session TIMEZONE pin does not move (it governs LTZ only), so
                 # 12:00 +00:00 and 12:00 +05:00 - instants five hours apart -
                 # would print alike. Move it to UTC first; the two-argument
-                # form converts an instant. From the docs, not verified live.
+                # form converts an instant. Verified live against DuckDB.
                 c = f"convert_timezone('UTC', {c})"
             expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
         elif _base(column.raw_type) in ("VARIANT", "OBJECT", "ARRAY"):
@@ -268,17 +279,80 @@ class SnowflakeDialect(Dialect):
             # false match on the very type semi-structured data lands in.
             # TO_JSON keeps the quotes, and TYPEOF keeps what JSON cannot say
             # (a TIMESTAMP and the VARCHAR spelling it print the same JSON).
-            # From the docs, not verified live.
+            # Verified live: 1 and "1", a DATE and its text, differ.
             expr = f"typeof({c}) || ':' || to_json({c})"
         else:
             # STRING, and every unmapped type through its varchar cast:
-            # arbitrary text, so escaped. Not verified live (no account).
+            # arbitrary text, so escaped. Verified live against DuckDB, also
+            # under an `en-ci` collation, which REPLACE ignores here.
             expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
 
+    def _float_text(self, c: str, s: int, column: Column) -> str:
+        """The canonical text of a double (`canonical_float_text`, base.py).
+
+        Below 2^53 that is the shortest round-trip decimal, rounded half away
+        from zero to the scale. Snowflake prints no shortest repr: a varchar
+        cast is 15 significant digits and `TO_VARCHAR(x, 'TME')` 16, matching
+        it on 444 and 1,039 of the 1,565 sample doubles; the old
+        `cast(x as number(38, s))` rounds the exact binary value and disagreed
+        on 215. But, verified live on every sample value, `cast(x as
+        number(38, q))` *is* the exact binary value rounded half up, and
+        `ROUND` takes a per-row scale and a `'HALF_TO_EVEN'` mode. So the
+        shortest repr is the first of the 15-, 16- and 17-significant-digit
+        roundings that converts back to the same double - the BigQuery and
+        SQL Server construction - with ties to even, as Ryu and dtoa break
+        them, done by `ROUND` itself.
+
+        Two bands, because NUMBER holds 38 digits: below 1 the exact value to
+        37 places; from 1 to 2^53, to 21 (16 integer digits). The decimal
+        exponent e is read off the exact value's text, never a float log10.
+        Values under 10^-(s+1) are zero at this scale and short-circuit, which
+        keeps a 17-digit rounding inside 37 places up to the maximum scale 20.
+        From 2^53 every double is an integer and `number(38, 0)` holds it
+        exactly; past 2^116 it is refused by a failing cast whose message
+        carries the value and the column. Infinity and NaN (Snowflake FLOAT
+        holds both, and `NaN = NaN` is true) become the shared tokens.
+        """
+        x = c
+        where = float_range_where(column).replace("'", "''")
+
+        def shortest(q: int, exponent: str) -> str:
+            """The shortest repr from the exact value to q places; `exponent`
+            computes the decimal exponent e from `{d}`."""
+            d = f"cast({x} as number(38,{q}))"
+            e = exponent.format(d=d)
+            c15, c16, c17 = (
+                f"round({d}, {n - 1} - {e}, 'HALF_TO_EVEN')" for n in (15, 16, 17)
+            )
+            return (
+                f"(case when cast({c15} as float) = {x} then {c15} "
+                f"when cast({c16} as float) = {x} then {c16} else {c17} end)"
+            )
+
+        # Below 1: '0.000123...' - e is 2 minus the position of the first
+        # non-zero digit. From 1: the length of the integer part, minus one.
+        small = shortest(37, "(2 - regexp_instr(cast(abs({d}) as varchar), '[1-9]'))")
+        large = shortest(21, "(length(cast(floor(abs({d})) as varchar)) - 1)")
+        frac = "." + "0" * s if s else ""
+        return (
+            f"case when {x} = 'inf'::float then 'Infinity' "
+            f"when {x} = '-inf'::float then '-Infinity' "
+            f"when {x} = 'nan'::float then 'NaN' "
+            f"when abs({x}) < {float_tiny_sql(s)} then '{float_zero_text(s)}' "
+            f"when abs({x}) < 1 "
+            f"then cast(cast(round({small}, {s}) as number(38,{s})) as varchar) "
+            f"when abs({x}) < {FLOAT_EXACT_INT_FROM} "
+            f"then cast(cast(round({large}, {s}) as number(38,{s})) as varchar) "
+            f"when abs({x}) < '{FLOAT_MAX_MAGNITUDE_SQL}'::float "
+            f"then cast(cast({x} as number(38,0)) as varchar) || '{frac}' "
+            f"when {x} is not null then cast(cast('{FLOAT_OUT_OF_RANGE_MESSAGE}' "
+            f"|| cast({x} as varchar) || '{where}' as number) as varchar) end"
+        )
+
     def decimal_key_text(self, c: str, column: Column) -> str:
         """NUMBER's varchar cast is exact at the declared scale; drop the
-        trailing fractional zeros it adds. Not verified live (no account)."""
+        trailing fractional zeros it adds. Verified live against DuckDB."""
         t = f"cast({c} as varchar)"
         return (
             f"case when {c} = 0 then '0' "
@@ -292,7 +366,7 @@ class SnowflakeDialect(Dialect):
         Snowflake timestamps hold nanoseconds and render at FF6, which as a
         key merges distinct keys. One with a sub-microsecond part renders FF9
         instead (the nine digits DuckDB prints for a TIMESTAMP_NS); any other
-        renders exactly as before. Not verified live (no account).
+        renders exactly as before. Verified live against DuckDB TIMESTAMP_NS.
         """
         if column.logical_type is LogicalType.TIMESTAMP:
             c = self.quote(column.name)
@@ -321,7 +395,7 @@ class SnowflakeDialect(Dialect):
         on this side only - the flaw SQL Server's `int_div` had. `n - mod(n,
         d)` is an exact multiple of `d`, so its quotient is an integer and
         nothing can round; the operands are non-negative, so this is floor.
-        From the docs, not verified live.
+        Verified live: plain `/` gave 10000000 for 9999999.99999999...
         """
         n, d = f"({numerator})", f"({denominator})"
         return f"cast(({n} - mod({n}, {d})) / {d} as number(38,0))"

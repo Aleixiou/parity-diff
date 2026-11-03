@@ -263,6 +263,7 @@ for byte:
 | MySQL | `cast(cast(c as decimal(38,6)) as char)` (unchanged: its DECIMAL cast goes through dtoa's shortest repr) |
 | BigQuery | the first of `round(cast(c as bignumeric), n-1-e, 'ROUND_HALF_EVEN')` for n = 15, 16, 17 significant digits that casts back to `c`, then `round(.., 6)` |
 | SQL Server | the same construction from `cast(c as decimal(38,37))` below 1 and `cast(c as decimal(38,21))` up to 2^53, with ties to even built by hand (`ROUND` is half away from zero) at 16 and 17 digits; `--float-scale` capped at 18 |
+| Snowflake | the same two bands from `cast(c as number(38,q))`, candidates `round(.., n-1-e, 'HALF_TO_EVEN')` |
 
 Every one of these was found by measurement, not by reading the docs:
 
@@ -303,9 +304,14 @@ Every one of these was found by measurement, not by reading the docs:
   string-to-float parse is not correctly rounded**: `'-5.795195809241054e+16'`
   arrives one ulp off and subnormals arrive as 0, so test doubles must travel
   as bound parameters, never literals.
-- **Snowflake is not verified** against this form (no live account): its FLOAT
-  is still `cast(c as number(38,6))`, and `float_caveat()` makes every run that
-  compares a Snowflake FLOAT column print a warning.
+- **Snowflake prints no shortest repr either** (verified live 2026-11-03): a
+  varchar cast is 15 significant digits, `TO_VARCHAR(x, 'TME')` 16, and the old
+  `cast(c as number(38,6))` rounded the exact binary value (215 of the 1,565
+  sample doubles disagreed). `cast(float as number(38, q))` *is* the exact value
+  rounded half up, and `ROUND` takes a per-row scale and a `'HALF_TO_EVEN'`
+  mode, so the BigQuery construction carries over with no hand-built tie test.
+  NUMBER holds 38 digits, hence SQL Server's two bands (37 places below 1, 21
+  up to 2^53). Agrees with the spec on 6,565 doubles at scales 0, 2, 6, 9, 20.
 
 Before this form, PostgreSQL and DuckDB disagreed on 347 of the 1,565 sample
 doubles, PostgreSQL and MySQL on 296, DuckDB and MySQL on 289; now every pair
@@ -712,9 +718,15 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   the SELECT guard accepts one plain SELECT only.
 - **DuckDB:** extension autoinstall/autoload are off (no network, §6);
   HUGEINT key spans past 2^127 bucket exactly in UHUGEINT.
-- **Snowflake changes are unverified live** (no account): UTC rendering of
-  `TIMESTAMP_TZ`, `tz_aware`, `VARIANT` type tag, schema-qualified tables, the
-  exact `int_div`, telemetry off. Each needs one live query to confirm.
+- **Snowflake changes are verified live** (2026-11-03, `tests/test_snowflake.py`):
+  UTC rendering of `TIMESTAMP_TZ`/`LTZ`, `tz_aware`, the FF6 caveat, FF9 keys,
+  exact DECIMAL keys, `VARIANT` type tag, schema-qualified tables, the exact
+  `int_div` (plain `/` rounds the quotient to 6 places - confirmed), escaping
+  under an `en-ci` collation. **Telemetry:** `CLIENT_TELEMETRY_ENABLED` is a
+  client parameter (the server does not list it); connector 5.x probes cloud
+  metadata at login unless `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` is set (the
+  dialect sets it), and still flushes a session-telemetry batch to the
+  connected account at logout, which no switch in 5.1.0 was found to stop.
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,

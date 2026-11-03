@@ -11,6 +11,8 @@ carry `# pragma: no cover`); `columns()` is exercised here through a stubbed
 
 from __future__ import annotations
 
+import pytest
+
 from parity.dialects.snowflake_dialect import SnowflakeDialect, map_type_snowflake
 from parity.types import Column, LogicalType
 
@@ -62,7 +64,6 @@ def test_normalize_renders_each_logical_type():
     cases = {
         LogicalType.INTEGER: 'cast("c" as varchar)',
         LogicalType.DECIMAL: 'cast(cast("c" as number(38,6)) as varchar)',
-        LogicalType.FLOAT: 'cast(cast("c" as number(38,6)) as varchar)',
         LogicalType.BOOLEAN: "case when \"c\" then 'true' when not \"c\" then 'false' end",
         LogicalType.DATE: "to_char(\"c\", 'YYYY-MM-DD')",
         LogicalType.TIMESTAMP: "to_char(\"c\", 'YYYY-MM-DD HH24:MI:SS.FF6')",
@@ -72,6 +73,23 @@ def test_normalize_renders_each_logical_type():
     }
     for t, inner in cases.items():
         assert d.normalize(_col("c", t)) == f"coalesce({inner}, {sentinel})", t
+
+
+def test_float_builds_the_shortest_repr_not_a_plain_cast():
+    """FLOAT is the canonical float form (verified live in test_float_canonical
+    and test_snowflake): the 15/16/17-digit candidates rounded half to even,
+    tokens for Infinity and NaN, and a refusal past 2^116 naming the column.
+    A plain `cast(c as number(38, 6))` rounded the exact binary value and
+    disagreed with every other engine on 215 of the 1,565 sample doubles."""
+    sql = _d().normalize(_col("ratio", LogicalType.FLOAT))
+    assert sql.startswith("coalesce(case when \"ratio\" = 'inf'::float then 'Infinity' ")
+    # Per band: the 15- and 16-digit candidates are tested and then returned,
+    # the 17-digit one only returned - five roundings, two bands.
+    assert sql.count("'HALF_TO_EVEN'") == 10
+    assert "when \"ratio\" = 'nan'::float then 'NaN'" in sql
+    assert "in column ''ratio''" in sql
+    with pytest.raises(ValueError, match="cannot be compared at float_scale 21"):
+        SnowflakeDialect(float_scale=21).normalize(_col("ratio", LogicalType.FLOAT))
 
 
 def test_map_type_splits_number_by_scale_and_maps_the_rest():
