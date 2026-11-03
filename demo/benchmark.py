@@ -97,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"{s.rows_downloaded:>9,} rows downloaded ({pct:.4f}%)  "
                 f"{wall:6.2f}s"
             )
+            # The independent sample check is counted apart from the walk, so
+            # the walk's figures stay comparable with earlier measurements.
+            print(
+                f"           sample check: {s.sample_queries} queries  "
+                f"{s.rows_sampled:,} rows sampled (both sides)"
+            )
 
         result, wall = results[-1]
         if result.diffs:

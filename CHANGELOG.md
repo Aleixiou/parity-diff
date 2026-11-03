@@ -5,6 +5,25 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **User documentation restructured** for someone who has never seen the
+  tool. The README is now install, a five-minute first try on two DuckDB
+  files (no server needed), use on real databases, reading the output, CI,
+  the Python API, the risk figures and the eight limitations most likely to
+  change a verdict. New pages: `docs/output.md` (every line and verdict the
+  report can print, exit codes, every JSON field), `docs/troubleshooting.md`
+  (the real error messages and their fixes), `docs/engines.md` (per engine:
+  connection string, authentication actually supported, minimum read-only
+  grants, snapshot behaviour, versions, what a run costs on BigQuery and
+  Snowflake, keeping passwords out of logs) and `docs/limitations.md` (the
+  full limitations list, moved from the README, nothing removed). Fixed on
+  the way: the usage line showed `--verify-sample 1000` (the default is
+  10,000); the example output lacked the sample-check and risk lines; the
+  Python options omitted `verify_sample`; the session-settings list missed
+  round G's pins; a duplicated paragraph; "a dialect is ~80 lines" (the
+  smallest is 574). The 10M-row benchmark was re-measured with the sample
+  check (exact counts unchanged: 4 queries / 0 rows and 28 queries / 7,628
+  rows), and `demo/benchmark.py` now prints the sample check's queries and
+  rows.
 - **Bit strings, intervals, times with a time zone, lists, network addresses
   and SQL Server variants have exact rules** (new logical types BITS,
   INTERVAL, TIMETZ, LIST, INET, VARIANT; `tests/test_types_rules2.py`):
