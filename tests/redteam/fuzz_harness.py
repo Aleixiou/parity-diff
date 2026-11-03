@@ -121,6 +121,10 @@ class Case:
 def ddl_type(engine: str, c: Col, is_key: bool) -> str:
     """The column type each engine stores a logical kind in."""
     k = c.kind
+    if engine == "snowflake":
+        return _snowflake_ddl(c)
+    if k in EXTRA_DDL:
+        return EXTRA_DDL[k][engine](is_key)
     if k == "int":
         return {"bigquery": "INT64"}.get(engine, "integer")
     if k == "bigint":
@@ -172,6 +176,58 @@ def ddl_type(engine: str, c: Col, is_key: bool) -> str:
     raise AssertionError(k)
 
 
+#: Kinds added for round H (`fuzz_cross.py`): TIME, BINARY, UUID and JSON,
+#: as each engine stores them. JSON only where the engines' normal forms can
+#: coincide (PostgreSQL jsonb, MySQL json, DuckDB json).
+EXTRA_DDL: dict[str, dict[str, Callable[[bool], str]]] = {
+    "time": {
+        "postgres": lambda key: "time",
+        "duckdb": lambda key: "time",
+        "mysql": lambda key: "time(6)",
+        "mssql": lambda key: "time(6)",
+        "bigquery": lambda key: "TIME",
+    },
+    "binary": {
+        "postgres": lambda key: "bytea",
+        "duckdb": lambda key: "blob",
+        "mysql": lambda key: "varbinary(64)" if key else "longblob",
+        "mssql": lambda key: "varbinary(64)" if key else "varbinary(max)",
+        "bigquery": lambda key: "BYTES",
+    },
+    "uuid": {
+        "postgres": lambda key: "uuid",
+        "duckdb": lambda key: "uuid",
+        "mysql": lambda key: "char(36)",
+        "mssql": lambda key: "uniqueidentifier",
+        "bigquery": lambda key: "STRING",
+    },
+    "json": {
+        "postgres": lambda key: "jsonb",
+        "duckdb": lambda key: "json",
+        "mysql": lambda key: "json",
+    },
+}
+
+
+def _snowflake_ddl(c: Col) -> str:
+    """Snowflake's storage for each logical kind."""
+    return {
+        "int": "integer",
+        "bigint": "bigint",
+        "dec": f"number({c.p},{c.s})",
+        "double": "double",
+        "real": "float",
+        "bool": "boolean",
+        "text": "varchar",
+        "date": "date",
+        "ts": "timestamp_ntz(6)",
+        "tstz": "timestamp_tz(6)",
+        "time": "time(6)",
+        "binary": "binary",
+        "uuid": "varchar(36)",
+    }[c.kind]
+
+
 # ------------------------------------------------------------ generation
 
 
@@ -218,6 +274,8 @@ EDGE_TEXT = [
 def gen_value(rng: random.Random, c: Col, engines: set[str], fs: int, known: set[str]):
     """One value for column `c`, biased towards edges every engine can store."""
     k = c.kind
+    if k in ("time", "binary", "uuid", "json"):
+        return gen_extra(rng, k, engines)
     if k == "int":
         return rng.choice(
             [0, 1, -1, 2**31 - 1, -(2**31), 7, rng.randint(-(2**31), 2**31 - 1)]
@@ -291,6 +349,79 @@ def gen_value(rng: random.Random, c: Col, engines: set[str], fs: int, known: set
         )
         off = dt.timezone(dt.timedelta(minutes=rng.choice([0, 0, 330, -300, 840, -720])))
         return base.astimezone(off)
+    raise AssertionError(k)
+
+
+EDGE_BYTES = [
+    b"",
+    b"\x00",
+    b"\x00\x00",
+    b"a",
+    b"a\x00",
+    b"\x00a",
+    b"\xff" * 8,
+    b"\\N",
+    b"\x1f",
+    b"\x80\x81",
+    b"\xed\xa0\x80",  # a UTF-8-encoded surrogate: invalid UTF-8
+    b"abc",
+    b"ABC",
+    b"x" * 64,
+]
+
+
+def gen_json(rng: random.Random, depth: int = 0) -> Any:
+    """A JSON value every normal form (jsonb, MySQL, DuckDB verbatim) keeps
+    alike: integers, plain strings, objects whose keys are distinct and already
+    in length-then-bytes order, so no engine reorders them."""
+    r = rng.random()
+    if depth > 2 or r < 0.4:
+        return rng.choice(
+            [0, 1, -1, 7, 123456789, True, False, None, "", "a", "é", "日本", "a b",
+             'q"t', "b\\s"]
+        )
+    if r < 0.7:
+        return [gen_json(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    keys = rng.sample(["a", "b", "aa", "ab", "id", "x1", "key", "name"], rng.randint(0, 4))
+    keys.sort(key=lambda k: (len(k.encode()), k.encode()))
+    return {k: gen_json(rng, depth + 1) for k in keys}
+
+
+def json_text(v: Any) -> str:
+    """The layout every engine's canonical JSON uses: `{"a": 1, "b": [1, 2]}`."""
+    import json
+
+    return json.dumps(v, ensure_ascii=False, separators=(", ", ": "))
+
+
+def gen_extra(rng: random.Random, k: str, engines: set[str]) -> Any:
+    """A value of one of the round-H kinds."""
+    if k == "time":
+        return rng.choice(
+            [
+                dt.time(0, 0),
+                dt.time(23, 59, 59, 999999),
+                dt.time(12, 0, 0, 1),
+                dt.time(0, 0, 0, 999999),
+                dt.time(rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59),
+                        rng.choice([0, rng.randint(0, 999999)])),
+            ]
+        )
+    if k == "binary":
+        if rng.random() < 0.5:
+            return rng.choice(EDGE_BYTES)
+        return bytes(rng.randrange(256) for _ in range(rng.randint(0, 20)))
+    if k == "uuid":
+        return rng.choice(
+            [
+                uuid.UUID(int=0),
+                uuid.UUID(int=2**128 - 1),
+                uuid.UUID(int=rng.getrandbits(128)),
+                uuid.UUID(int=rng.getrandbits(128)),
+            ]
+        )
+    if k == "json":
+        return json_text(gen_json(rng))
     raise AssertionError(k)
 
 
@@ -425,6 +556,27 @@ def gen_key(rng: random.Random, key: list[Col], n: int, engines: set[str]) -> li
                     )
             elif c.kind == "date":
                 vals.append(dt.date(2000, 1, 1) + dt.timedelta(days=rng.randint(0, 9000)))
+            elif c.kind == "dec":
+                q = Decimal(1).scaleb(-c.s, context=_WIDE)
+                top = 10 ** min(c.p, 15) - 1
+                small = min(50, top)
+                n_ = rng.choice(
+                    [0, 1, top, rng.randint(-top, top), rng.randint(-small, small)]
+                )
+                vals.append((Decimal(n_) * q).quantize(q, context=_WIDE))
+            elif c.kind == "ts":
+                base = dt.datetime(2000, 1, 1) + dt.timedelta(
+                    seconds=rng.randint(0, 10**9)
+                )
+                vals.append(base.replace(microsecond=rng.choice([0, 1, 999999,
+                                                                 rng.randint(0, 999999)])))
+            elif c.kind == "uuid":
+                vals.append(uuid.UUID(int=rng.getrandbits(128)))
+            elif c.kind == "time":
+                vals.append(dt.time(rng.randint(0, 23), rng.randint(0, 59),
+                                    rng.randint(0, 59), rng.randint(0, 999999)))
+            elif c.kind == "binary":
+                vals.append(bytes(rng.randrange(256) for _ in range(rng.randint(1, 6))))
             else:
                 raise AssertionError(c.kind)
         t = tuple(vals)
@@ -609,6 +761,23 @@ def _mutate_cell(rng: random.Random, op: str, c: Col, v: Any, fs: int, engines: 
         if nv == v:
             nv = unicodedata.normalize("NFC", v)
         return nv if nv != v else "é"
+    if op == "time_micro" and k == "time" and v is not None:
+        full = dt.datetime.combine(dt.date(2000, 1, 2), v)
+        nv = (full + dt.timedelta(microseconds=rng.choice([1, -1]))).time()
+        return nv if nv != v else _SKIP
+    if op == "bytes_tweak" and k == "binary" and v is not None:
+        return rng.choice(
+            [v + b"\x00", b"\x00" + v, v[:-1], v.upper() if v.upper() != v else v + b"a",
+             bytes([v[0] ^ 1]) + v[1:] if v else b"\x00"]
+        )
+    if op == "uuid_tweak" and k == "uuid" and v is not None:
+        return uuid.UUID(int=v.int ^ (1 << rng.randrange(128)))
+    if op == "json_tweak" and k == "json" and v is not None:
+        import json
+
+        doc = json.loads(v)
+        nv = json_text(rng.choice([[doc], {"a": doc}, 0 if doc != 0 else 1, str(doc)]))
+        return nv if nv != v else _SKIP
     if op == "ts_micro" and k in ("ts", "tstz") and v is not None:
         try:
             return v + dt.timedelta(microseconds=rng.choice([1, -1]))
@@ -732,6 +901,22 @@ def key_text(v: Any, kind: str) -> str:
         return str(v)
     if kind == "date":
         return f"{v.year:04d}-{v.month:02d}-{v.day:02d}"
+    if kind == "dec":
+        t = format(Decimal(v), "f")
+        if "." in t:
+            t = t.rstrip("0").rstrip(".")
+        return "0" if t in ("-0", "") else t
+    if kind == "ts":
+        return v.strftime("%Y-%m-%d %H:%M:%S.") + f"{v.microsecond:06d}"
+    if kind == "time":
+        v = logical(v, "time", 6)
+        return v.strftime("%H:%M:%S.") + f"{v.microsecond:06d}"
+    if kind == "uuid":
+        return str(v).lower()
+    if kind == "binary":
+        return "\\\\x" + bytes(v).hex()  # BINARY_PREFIX: an escaped backslash
+    if kind == "text":
+        return v.replace("\\", "\\\\").replace("\x1f", "\\s")
     return v
 
 
@@ -755,6 +940,25 @@ def logical(v: Any, kind: str, fs: int) -> Any:
         return v.replace(tzinfo=None)
     if kind in ("int", "bigint"):
         return int(v)
+    if kind == "time":
+        if isinstance(v, dt.timedelta):  # MySQL's driver reads TIME as a duration
+            us = v // dt.timedelta(microseconds=1)
+            return dt.time(us // 3_600_000_000, us // 60_000_000 % 60,
+                           us // 1_000_000 % 60, us % 1_000_000)
+        if isinstance(v, str):
+            return dt.time.fromisoformat(v)
+        return v
+    if kind == "binary":
+        return bytes(v)
+    if kind == "uuid":
+        return str(v).lower()
+    if kind == "json":
+        import json
+
+        doc = json.loads(v) if isinstance(v, (str, bytes)) else v
+        return json.dumps(doc, sort_keys=True, ensure_ascii=False)
+    if kind == "dec" and not isinstance(v, Decimal):
+        return v
     return v
 
 
@@ -784,9 +988,9 @@ def oracle(case: Case, fetched_a: list[tuple], fetched_b: list[tuple]) -> Expect
         """Rows indexed by logical key; a duplicate is a generator bug."""
         out = {}
         for r in rows:
-            k = tuple(
-                logical(r[i], case.key[i].kind, case.float_scale) for i in range(nkey)
-            )
+            # Exact key text, never rounded (a DECIMAL key is not at the
+            # float scale - `normalize_key`).
+            k = tuple(key_text(r[i], case.key[i].kind) for i in range(nkey))
             assert k not in out, f"duplicate key generated: {k}"
             out[k] = r
         return out
@@ -847,9 +1051,17 @@ class Engine:
         """The table name as passed to `diff` (schema-qualified where needed)."""
         return table
 
-    def create(self, table: str, cols: list[Col], nkey: int, upper: bool) -> list[str]:
+    def create(
+        self,
+        table: str,
+        cols: list[Col],
+        nkey: int,
+        upper: bool,
+        names: list[str] | None = None,
+    ) -> list[str]:
         """Drop and create the table; returns the stored column names."""
-        names = [c.name.upper() if upper else c.name for c in cols]
+        if names is None:
+            names = [c.name.upper() if upper else c.name for c in cols]
         spec = ", ".join(
             f"{self.ident(n)} {ddl_type(self.name, c, i < nkey)}"
             for i, (n, c) in enumerate(zip(names, cols, strict=True))
@@ -882,12 +1094,16 @@ class Engine:
         ]
         self.many(sql, data)
 
-    def fetch(self, table: str, names: list[str], cols: list[Col]) -> list[tuple]:
-        """Every row back through the raw driver, for the oracle."""
+    def fetch(
+        self, table: str, names: list[str], cols: list[Col], where: str | None = None
+    ) -> list[tuple]:
+        """Every row back through the raw driver, for the oracle; with
+        `where`, only the rows that predicate selects (the engine's own SQL)."""
         sel = ", ".join(self.fetch_expr(n, c) for n, c in zip(names, cols, strict=True))
-        return [
-            tuple(r) for r in self.rows(f"select {sel} from {self.ident_table(table)}")
-        ]
+        sql = f"select {sel} from {self.ident_table(table)}"
+        if where:
+            sql += f" where ({where})"
+        return [tuple(r) for r in self.rows(sql)]
 
     def fetch_expr(self, name: str, c: Col) -> str:
         """How the oracle selects one column so its value survives the driver."""
@@ -936,6 +1152,13 @@ class PG(Engine):
             return v  # psycopg sends 'Infinity'/'NaN' for float8
         return v
 
+    def fetch_expr(self, name: str, c: Col) -> str:
+        """JSON as its text: psycopg would parse it, and a JSON string `"a"`
+        would then be indistinguishable from the text it holds."""
+        if c.kind == "json":
+            return f"{self.ident(name)}::text"
+        return self.ident(name)
+
     def close(self) -> None:
         """Close the writer's connection."""
         self.conn.close()
@@ -965,10 +1188,17 @@ class Duck(Engine):
         """Run one statement, discarding any result."""
         self.conn.execute(sql)
 
-    def create(self, table: str, cols: list[Col], nkey: int, upper: bool) -> list[str]:
+    def create(
+        self,
+        table: str,
+        cols: list[Col],
+        nkey: int,
+        upper: bool,
+        names: list[str] | None = None,
+    ) -> list[str]:
         """Drop and create the table; returns the stored column names."""
         self._open(table)
-        return super().create(table, cols, nkey, upper)
+        return super().create(table, cols, nkey, upper, names)
 
     def many(self, sql: str, data: list[tuple]) -> None:
         """Run one statement for many parameter rows."""
@@ -996,9 +1226,11 @@ class Duck(Engine):
             return f"epoch_us({self.ident(name)})"
         return self.ident(name)
 
-    def fetch(self, table: str, names: list[str], cols: list[Col]) -> list[tuple]:
+    def fetch(
+        self, table: str, names: list[str], cols: list[Col], where: str | None = None
+    ) -> list[tuple]:
         """Every row back through the raw driver, for the oracle."""
-        out = super().fetch(table, names, cols)
+        out = super().fetch(table, names, cols, where)
         tz = [i for i, c in enumerate(cols) if c.kind == "tstz"]
         if not tz:
             return out
@@ -1084,6 +1316,8 @@ class MySQL(Engine):
         """Turn a Python value into what this driver binds losslessly."""
         if c.kind == "tstz" and v is not None:
             return v.astimezone(UTC).replace(tzinfo=None)
+        if c.kind == "uuid" and v is not None:
+            return str(v)
         if c.kind in ("real", "double") and v is not None:
             # As shortest-repr text, which MySQL parses correctly rounded and
             # FLOAT (single precision) rounds back to the float32 exactly.
@@ -1167,6 +1401,8 @@ class MSSQL(Engine):
             return format(v, "f")
         if c.kind == "real":
             return float(v)
+        if c.kind in ("time", "uuid", "json"):
+            return str(v)
         return v
 
     def load(
@@ -1179,7 +1415,7 @@ class MSSQL(Engine):
         # timestamp lands in the column type exactly.
         ph = ", ".join(
             f"cast(? as {ddl_type('mssql', c, False)})"
-            if c.kind in ("dec", "ts", "tstz", "date")
+            if c.kind in ("dec", "ts", "tstz", "date", "time", "uuid")
             else "?"
             for c in cols
         )
@@ -1210,12 +1446,16 @@ class MSSQL(Engine):
             return f"convert(varchar(80), {self.ident(name)})"
         if c.kind == "real":
             return f"cast({self.ident(name)} as float)"
+        if c.kind == "time":
+            return f"cast({self.ident(name)} as varchar(20))"
         return self.ident(name)
 
-    def fetch(self, table: str, names: list[str], cols: list[Col]) -> list[tuple]:
+    def fetch(
+        self, table: str, names: list[str], cols: list[Col], where: str | None = None
+    ) -> list[tuple]:
         """Every row back through the raw driver, for the oracle."""
         out = []
-        for r in super().fetch(table, names, cols):
+        for r in super().fetch(table, names, cols, where):
             r = list(r)
             for i, c in enumerate(cols):
                 if r[i] is None:
@@ -1226,6 +1466,8 @@ class MSSQL(Engine):
                     r[i] = dt.datetime.fromisoformat(r[i])
                 elif c.kind == "dec":
                     r[i] = Decimal(r[i])
+                elif c.kind == "time" and isinstance(r[i], str):
+                    r[i] = dt.time.fromisoformat(r[i])
             out.append(tuple(r))
         return out
 
@@ -1284,6 +1526,14 @@ class BigQuery(Engine):
                 return v.isoformat()
             if c.kind == "tstz":
                 return v.astimezone(UTC).isoformat()
+            if c.kind == "time":
+                return v.isoformat()
+            if c.kind == "binary":
+                import base64
+
+                return base64.b64encode(v).decode()
+            if c.kind == "uuid":
+                return str(v)
             return v
 
         data = [
