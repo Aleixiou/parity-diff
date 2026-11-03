@@ -751,6 +751,24 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   only when both sides' `holds_sub_micro` is true; then a value with digits
   past microseconds renders nine digits on every engine, otherwise they are
   truncated and the dialect's caveat says so.
+- **TIME, BINARY, JSON** (`canonical_time_text`, `canonical_binary_text`,
+  `canonical_json_text` in base.py): TIME `HH:MM:SS.ffffff`; BINARY `\\x` +
+  lower hex; JSON the engine's own normal form (jsonb on PostgreSQL, MySQL's
+  binary JSON, BigQuery/Snowflake by code point, DuckDB verbatim text) in one
+  layout - `{"a": 1, "b": [1, 2]}` - and one string escaping, with every
+  backslash in that SQL built by `spell_sql` (RT-D1). Cross-engine JSON is
+  exact only where normal forms coincide; `json_semantics` names both forms
+  in a warning otherwise. A NULL JSON must render the sentinel, never `null`
+  (BigQuery's TO_JSON_STRING(NULL) is `null`).
+- **Session pins are the contract for server settings** (round G): every
+  setting that changes rendering or row visibility is pinned at connect -
+  MySQL `sql_select_limit`, Snowflake `rows_per_resultset`, PostgreSQL
+  `quote_all_identifiers`, SQL Server `numeric_roundabort` - and the engine
+  checks that each side's first-level bucket counts add up to its row count,
+  so any cap not yet pinned reads unexplained, never identical. PostgreSQL
+  hashes `convert_to(text, 'UTF8')`; FLOAT is refused on SQL Server below
+  compatibility level 130 and on PostgreSQL below 12; PostgreSQL < 9.6 and
+  DuckDB < 1.3 are refused outright; RLS is a caveat.
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,

@@ -311,12 +311,18 @@ class SQLServerDialect(Dialect):
             )
         self.default_schema = schema or "dbo"
         self.snapshot = snapshot_state == 1
+        self.compatibility_level = self._compatibility_level()
         cur = self._conn.cursor()
         try:
             cur.execute(
                 "set transaction isolation level "
                 + ("snapshot" if self.snapshot else "read committed")
             )
+            # ON - a session default, or server-wide through 'user options'
+            # 8192 - makes every rounding DECIMAL cast raise error 8115, so
+            # the diff could not run (RT-D6, RT-G8). Rounding is what the
+            # canonical text is built on; OFF is SQL Server's own default.
+            cur.execute("set numeric_roundabort off")
         finally:
             cur.close()
         # Nothing is ever committed: `close` rolls back, so even a bug that
@@ -333,6 +339,13 @@ class SQLServerDialect(Dialect):
             f"where name = '{UTF8_COLLATION}')"
         )[0]
         return int(row[0] or 0), str(row[1] or ""), int(row[2] or 0), bool(row[3])
+
+    def _compatibility_level(self) -> int:
+        """The current database's compatibility level (160 if unreadable)."""
+        rows = self.query(
+            "select compatibility_level from sys.databases where database_id = db_id()"
+        )
+        return int(rows[0][0]) if rows and rows[0][0] is not None else 160
 
     def close(self) -> None:
         """End the snapshot by rolling back - never committing - and close."""
@@ -623,6 +636,19 @@ class SQLServerDialect(Dialect):
     def float_scale_for(self, column: Column) -> int:
         """The shared limit, tightened to `MSSQL_FLOAT_MAX_SCALE`."""
         s = super().float_scale_for(column)
+        level = getattr(self, "compatibility_level", 160)
+        if level < 130:
+            # Below 130, float -> decimal goes through 17 significant digits,
+            # not the exact binary value the canonical FLOAT form is built on:
+            # -262.4724295 rendered -262.472429, the text of a different double
+            # - a false match - and 2^63 off by one digit (RT-G5). Every other
+            # type renders identically at levels 100-160 (verified).
+            raise self._err(
+                f"FLOAT column {column.name!r} cannot be compared in a database at "
+                f"compatibility level {level}: below 130 SQL Server converts floats "
+                "to decimal inexactly. Raise the level to 130 or more, or leave the "
+                "column out with --exclude"
+            )
         if s > MSSQL_FLOAT_MAX_SCALE:
             raise self._err(
                 f"FLOAT column {column.name!r} cannot be compared at float_scale "

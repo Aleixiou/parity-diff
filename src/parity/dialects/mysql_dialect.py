@@ -295,6 +295,26 @@ class MySQLDialect(Dialect):
         # servers in different zones cannot report the same instant as different.
         cur.execute("set session time_zone = '+00:00'")
         cur.execute(f"set session sql_mode = '{SQL_MODE}'")
+        # A GLOBAL, per-user or init_connect `sql_select_limit` caps the rows of
+        # every SELECT without a LIMIT - the column introspection and the
+        # checksum buckets alike - so columns past it were never compared and
+        # buckets past it read as empty on both sides: identical (RT-G1).
+        # Not `= default`: for a session variable that means the GLOBAL value,
+        # which is the cap itself. The type's maximum is MySQL's own default.
+        cur.execute("set session sql_select_limit = 18446744073709551615")
+        # MySQL 9.7 moved MD5() into the optional component_classic_hashing;
+        # without it the first checksum died naming nothing useful (RT-G13).
+        try:
+            cur.execute("select md5('')")
+            cur.fetchall()
+        except Exception as exc:
+            self._conn.close()
+            raise self._err(
+                "this MySQL server has no MD5() function, which every row hash "
+                "needs. MySQL 9.7 moved it into an optional component: a DBA "
+                "can add it with INSTALL COMPONENT "
+                "'file://component_classic_hashing'"
+            ) from exc
         # Belt and braces on top of the InnoDB default - and READ ONLY, so the
         # server itself refuses a write in this session, as it does on
         # PostgreSQL, DuckDB and BigQuery (RT-F11; CLAUDE.md section 6). A
@@ -632,6 +652,27 @@ class MySQLDialect(Dialect):
             f"convert(0x{where.hex()} using utf8mb4))) as char)"
         )
         return f"case when {c} is null then null else coalesce({text}, {refuse}) end"
+
+    def escape_text(self, expr: str) -> str:
+        """Escape text, refusing a value whose escaped text MySQL cannot hold.
+
+        Escaping lengthens text, and past max_allowed_packet MySQL's REPLACE
+        returns NULL with only warning 1301. The coalesce then made it the NULL
+        sentinel, so a long text holding one backslash equalled a NULL on the
+        other side - a false match against every engine (RT-G3). As for binary
+        (`_binary_text`), a NULL from a non-NULL value raises through
+        UUID_TO_BIN instead, and `query` names the side and the size. Text
+        that fits renders exactly as before: no checksum moves.
+        """
+        escaped = super().escape_text(expr)
+        note = b" characters of text, past max_allowed_packet once escaped"
+        refuse = (
+            f"cast(uuid_to_bin(concat('{TOO_LONG_MARKER}', char_length({expr}), "
+            f"convert(0x{note.hex()} using utf8mb4))) as char)"
+        )
+        return (
+            f"case when ({expr}) is null then null else coalesce({escaped}, {refuse}) end"
+        )
 
     def _bit_text(self, column: Column, c: str) -> str:
         """Render BIT(n) as its n binary digits, PostgreSQL's `bit(n)` text.

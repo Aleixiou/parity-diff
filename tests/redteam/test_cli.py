@@ -1092,7 +1092,9 @@ def test_mysql_receives_only_reads(mysql_url, mysql_orders, duck_orders, monkeyp
     print("mysql statements:", sorted({x.split()[0] for x in log}), len(log))
     assert log and _non_reads(log) == []
     assert _sets(log) == [
-        f"set session sql_mode = '{SQL_MODE}'",
+        "set session sql_mode = '" + SQL_MODE + "'",
+        # RT-G1: a server or init_connect row cap must not reach the session.
+        "set session sql_select_limit = 18446744073709551615",
         "set session time_zone = '+00:00'",
         "set session transaction isolation level repeatable read, read only",
     ]
@@ -1544,7 +1546,9 @@ def test_mssql_receives_only_selects_as_a_datareader(mssql_url, duck_orders):
         others = [s for s in sent if not _READ.match(s)]
         assert others == [], others
         assert sorted({s.strip() for s in sent if s.lower().startswith("set")}) == [
-            "set transaction isolation level snapshot"
+            # RT-D6 / RT-G8: rounding casts must not raise under a server default.
+            "set numeric_roundabort off",
+            "set transaction isolation level snapshot",
         ]
     finally:
         run(

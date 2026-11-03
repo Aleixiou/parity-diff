@@ -5,6 +5,48 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Server settings and versions** (red-team round G, `tests/redteam/test_settings.py`,
+  `test_versions.py`, against PostgreSQL 9.5-18, MySQL 8.0/8.4/9.7, SQL Server
+  2019/2022 at compatibility levels 100-160, DuckDB 1.0-2.0, live BigQuery and
+  Snowflake). Eight false matches, all fixed:
+  - MySQL `sql_select_limit` and Snowflake `ROWS_PER_RESULTSET` (a GLOBAL,
+    user or `init_connect` value) capped every result, so columns and checksum
+    buckets past the cap were never compared: now reset per session, and any
+    run whose checksums cover fewer rows than a side holds is not identical.
+  - MySQL text that passes `max_allowed_packet` once escaped became the NULL
+    sentinel: now refused with an error naming side and size.
+  - PostgreSQL databases in LATIN1 or WIN1252 hashed text in the server
+    encoding: now hashed as UTF-8 (no checksum moves in UTF-8 databases).
+  - SQL Server below compatibility level 130 converts floats inexactly: FLOAT
+    columns there are refused, naming the level.
+  - PostgreSQL row-level security silently hid rows: now a caveat on every run.
+  - DuckDB before 1.3 (unquoted list text, pre-epoch nanoseconds, truncated
+    DECIMAL): refused at connect; the `[duckdb]` extra needs `duckdb>=1.3`.
+  Also fixed: PostgreSQL `quote_all_identifiers` (pinned off), SQL Server
+  NUMERIC_ROUNDABORT from 'user options' or a session default (pinned off;
+  closes RT-D6), PostgreSQL 9.5 refused naming the minimum (9.6), MySQL 9.7
+  without MD5() refused naming `component_classic_hashing`. Verified to hold:
+  PostgreSQL 12-17 byte-identical to 18, MySQL 8.4/9.7 to 8.0, SQL Server 2019
+  to 2022 and levels 130-160, DuckDB 1.3-2.0 to 1.5, every user-settable
+  PostgreSQL setting, MySQL sql_mode/charset/time_zone variants, SQL Server
+  collations, Snowflake output-format parameters, BigQuery `und:ci`.
+- **TIME, BINARY and JSON have exact rules** (new logical types): TIME as
+  `HH:MM:SS.ffffff` (24:00:00 kept; MySQL's duration TIME only matches MySQL;
+  sub-µs digits as for timestamps), BINARY as `\\x` + lower hex of the bytes,
+  JSON as the engine's normalised document in one canonical layout and string
+  escaping - exact same-engine, exact across engines where the normal forms
+  coincide, with a warning naming both forms where they do not. PostgreSQL
+  `money` compares as DECIMAL (it rendered locale text), enums as STRING.
+  Found on the way: BigQuery `TO_JSON_STRING(NULL)` is the text `null`, so a
+  SQL NULL equalled JSON null - a false match, fixed. **Checksums move** for
+  TIME, BINARY and JSON columns on most engines (PostgreSQL json, time,
+  money; MySQL time(0-5); DuckDB TIME/BLOB/JSON; SQL Server time and binary
+  types; BigQuery TIME/BYTES/JSON; Snowflake TIME/BINARY/VARIANT/OBJECT/ARRAY);
+  unchanged for PostgreSQL bytea/jsonb, enums, and MySQL binary/json/time(6).
+  Coverage: 3,717 of 3,743 ruled cells exact (the rest required refusals);
+  UNKNOWN-mapped types down from 34 to 14 (arrays, interval, inet, bit
+  strings, timetz, sql_variant, UHUGEINT remain).
+
 - **Every run states its own residual risk** (README "Risk figures"): the
   checksum-collision bound (2^-60 per differing range) and, from the sample
   check, the most rows that could hide a difference at 99% confidence - the

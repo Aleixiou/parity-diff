@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 4dbc19a1d83e2b7c`
+Source fingerprint: `src-sha256: 1a8b6e56fd0b8385`
 
 ## Summary
 
@@ -27,14 +27,16 @@ For one run that reports **identical**, on columns the rules cover:
 |---|---|---|
 | A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
 | A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.01^(1/n)** of the rows, at 99% confidence, for n rows sampled — **0.46%** at the default n = 1,000; **0** when every row was compared | Proven bound |
-| An engine renders a value differently from the rules | **0 of 3,213** checks at float scale 6 outside the 26 required refusals (3,187 exact), on 484 distinct values × 6 engines | Measured |
+| An engine renders a value differently from the rules | **0 of 3,743** checks at float scale 6 outside the 26 required refusals (3,717 exact), every type with a rule × 6 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
+| A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
+| Row-level security hides rows from the reading role (PostgreSQL) | **not bounded**: those rows are not compared; every run names the table in a caveat | Not quantifiable |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
-| Columns of types outside the rules (listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
+| Columns of types outside the rules (arrays, interval, inet, bit strings, timetz, sql_variant; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
 
 How to state a run's risk to a client: quote the run's own `risk` line (or
@@ -50,7 +52,9 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Session settings change how values render | **0** for every setting the dialect pins; unpinned settings are being tested (red-team round G, in progress) | Measured / in progress |
+| Session settings change how values render | **0** for every pinned setting; round G set every user-settable PostgreSQL setting at each value, MySQL sql_mode, charset, time_zone and init_connect variants, SQL Server collations, ANSI options and 'user options', Snowflake output formats and BigQuery `und:ci`: the 6 that changed anything are now pinned or refused | Measured |
+| Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
+| Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
 
@@ -76,14 +80,17 @@ and 4.3. This is where every past false match lived.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Rendering disagrees with the rules, covered types | **0 of 3,213** checks at scale 6 (3,187 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
+| Rendering disagrees with the rules, covered types | **0 of 3,743** checks at scale 6 (3,717 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
-| Types outside the rules (JSON, binary, arrays, …) | **not covered**: compared by text, named in every report; rules for them are in progress | Not quantifiable |
+| Types outside the rules: arrays/lists, INTERVAL, INET/CIDR, bit strings, PostgreSQL timetz, SQL Server sql_variant, DuckDB UHUGEINT (14 native types in the sweep) | **not covered**: compared by text, named in every report | Not quantifiable |
+| JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
 
 Findings this check produced and fixed: 6 (COV-1 to COV-6), one of them a
-false match (Snowflake TIME). Earlier red-team campaign: about 30 problems,
-11 of them false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
+false match (Snowflake TIME); the type rules found one more (BigQuery SQL
+NULL equal to JSON `null`). Red-team round G (settings, versions): 14
+problems, 8 of them false matches, all fixed. Earlier campaign: about 30
+problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range
 
@@ -153,9 +160,9 @@ walk defect or a table changed mid-run.
 ## 9. What no figure covers
 
 - **Bugs not yet found.** Evidence instead of a number: the coverage map
-  (section 4), the full live test suite, two red-team campaigns (the second,
-  on server settings and versions, in progress), and the sample check on
-  every run.
+  (section 4), the full live test suite, two red-team campaigns (the
+  second on server settings and versions), and the sample check on every
+  run.
 - **Tables changing during a run** without one snapshot (section 1).
 - **Crafted data** against the checksum or the sample (sections 5, 8).
 - **Uncovered column types**, named in each report (section 4).

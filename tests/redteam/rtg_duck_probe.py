@@ -137,10 +137,23 @@ def cov(tmp: str) -> dict:
     }
 
 
+def refuse(tmp: str) -> dict:
+    """Open a DuckDB dialect; the error text if parity refuses this version."""
+    import duckdb
+
+    from parity.dialects.base import get_dialect
+
+    try:
+        get_dialect("duckdb:///:memory:", side="A").close()
+    except ValueError as exc:
+        return {"version": duckdb.__version__, "error": str(exc)}
+    return {"version": duckdb.__version__, "error": None}
+
+
 def main() -> None:
     """Dispatch on the mode and print the JSON result."""
     mode, tmp = sys.argv[1], sys.argv[2]
-    result = {"cov": cov, "scenarios": scenarios}[mode](tmp)
+    result = {"cov": cov, "scenarios": scenarios, "refuse": refuse}[mode](tmp)
     sys.stdout.write("RTG-JSON " + json.dumps(result) + "\n")
 
 

@@ -509,6 +509,9 @@ def test_snowflake_to_duckdb(snowflake_url, duck):
             [i, None if t is None else ("TEXT", t.isoformat()), b, j]
             for i, t, b, j in _rows("A")
         ]
+        # Connector 4.x (the supported line) ignores `_force_qmark_paramstyle`
+        # in executemany and formats with `%`: switch the connection itself.
+        w._conn._paramstyle = "qmark"
         cur.executemany(
             f'insert into "{table}" values (?, ?, ?, ?)',
             rows,

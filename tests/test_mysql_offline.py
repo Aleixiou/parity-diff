@@ -171,6 +171,8 @@ def test_the_session_is_pinned_read_only_before_autocommit_goes_off(monkeypatch)
     assert log == [
         "set session time_zone = '+00:00'",
         f"set session sql_mode = '{SQL_MODE}'",
+        "set session sql_select_limit = 18446744073709551615",  # RT-G1
+        "select md5('')",  # RT-G13: MySQL 9.7 may lack MD5()
         "set session transaction isolation level repeatable read, read only",
     ]
     assert d._conn.autocommit is False
@@ -244,11 +246,22 @@ def test_ordinary_text_renders_as_before():
     """The fallback branch is the plain char cast, escaped like every text
     (backslash doubled, chr(31) as `\\s`), so text holding neither renders
     exactly as before and no ordinary checksum moves."""
+    # Since RT-G3 the escape is guarded: a non-NULL value whose escaped text
+    # MySQL returns as NULL (past max_allowed_packet) raises instead of
+    # becoming the sentinel. Text that fits takes the coalesce's first
+    # branch - the old expression - so its rendering is unchanged.
     bs = "char(92 using utf8mb4)"
-    assert _render("json") == (
-        f"coalesce(replace(replace(cast(`v` as char), {bs}, concat({bs}, {bs})), "
-        f"char(31 using utf8mb4), concat({bs}, 's')), convert(0x5c4e using utf8mb4))"
+    x = "cast(`v` as char)"
+    escaped = (
+        f"replace(replace({x}, {bs}, concat({bs}, {bs})), "
+        f"char(31 using utf8mb4), concat({bs}, 's'))"
     )
+    got = _render("json")
+    assert got.startswith(
+        f"coalesce(case when ({x}) is null then null else coalesce({escaped}, "
+    ), got
+    assert "uuid_to_bin(" in got
+    assert got.endswith("end, convert(0x5c4e using utf8mb4))"), got
 
 
 def test_timestamp_is_an_instant_and_datetime_is_not():

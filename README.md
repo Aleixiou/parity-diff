@@ -367,6 +367,12 @@ stated plainly rather than buried.
   live test checks that a session contacts only the account's own login,
   query and logout endpoints. The login itself names the driver, Python and
   OS versions, as every Snowflake client's does.
+- **What the reading login cannot see is not compared.** PostgreSQL
+  row-level security that filters the reading role is named in the output as
+  a caveat; diff as a role with BYPASSRLS for a complete result. Settings that
+  cap result rows (MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET`)
+  are reset for the session, and if a side's checksums ever cover fewer rows
+  than it holds, the run is not identical.
 - **Keys must be unique.** A non-unique key is detected up front and rejected.
   Silently collapsing duplicate rows would hide real differences.
 - **`Infinity` and `NaN`** in float columns are compared as those literal
@@ -462,12 +468,12 @@ stated plainly rather than buried.
 
 | Engine | Status |
 |---|---|
-| PostgreSQL | supported (tested against 16 and 18) |
-| DuckDB | supported (tested against 1.5) |
-| MySQL | supported (tested against 8.0) |
+| PostgreSQL | supported: 9.6 or newer (12 or newer for FLOAT columns); every version 12-18 verified identical; the database must be UTF-8 or its text is hashed as UTF-8 |
+| DuckDB | supported: 1.3 or newer (1.3-2.0 verified identical; older versions are refused, as they render some values ambiguously) |
+| MySQL | supported: 8.0, 8.4 LTS and 9.x verified identical; 9.7+ needs `INSTALL COMPONENT 'file://component_classic_hashing'` (MD5) |
 | Snowflake | supported (verified live on AWS; `pip install "parity-diff[snowflake]"`) |
 | BigQuery | supported (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
-| SQL Server / Azure SQL | supported (SQL Server 2019+; verified live against 2022; `pip install "parity-diff[mssql]"`) |
+| SQL Server / Azure SQL | supported (SQL Server 2019+; 2019 and 2022 verified identical; FLOAT columns need database compatibility level 130 or more; `pip install "parity-diff[mssql]"`) |
 | Redshift, Databricks, Fabric | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
 
 ## Scope

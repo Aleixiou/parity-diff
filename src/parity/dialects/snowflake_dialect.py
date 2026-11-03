@@ -141,6 +141,10 @@ class SnowflakeDialect(Dialect):
             # Timestamps render through this; pin it so two accounts in
             # different regions cannot disagree on the same instant.
             cur.execute("alter session set timezone = 'UTC'")
+            # A user or account ROWS_PER_RESULTSET caps every result - column
+            # introspection and checksum buckets - so columns and buckets past
+            # it went unseen on both sides: identical (RT-G2). 0 is no limit.
+            cur.execute("alter session set rows_per_resultset = 0")
         finally:
             cur.close()
 

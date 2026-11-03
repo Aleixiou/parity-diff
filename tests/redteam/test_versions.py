@@ -207,13 +207,6 @@ def test_pg_before_12_refuses_float_naming_the_version(url):
         run_diff(a, get_dialect(url, side="B"), "rtg.f", "rtg.f")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G9: PostgreSQL 9.5 and older cannot be connected at all - the "
-    "session pins include idle_in_transaction_session_timeout (9.6+) - and the "
-    "error is 'unrecognized configuration parameter', naming no version; the "
-    "minimum server version is not documented",
-)
 @pytest.mark.parametrize("url", PG_VERSION_URLS, ids=short)
 def test_rt_g9_pg_95_is_refused_naming_the_version(url):
     """A 9.5 legacy server (end of life 2021, still common behind a
@@ -260,13 +253,6 @@ def test_mysql_version_finds_the_planted_battery(url, tmp_path):
     assert found(_mysql_battery(url, tmp_path)) == BATTERY
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G13: MySQL 9.7 removed MD5() from the server into the optional "
-    "component_classic_hashing; without it every diff dies in the first checksum "
-    "with 'FUNCTION <db>.md5 does not exist', which names neither the cause nor "
-    "the remedy, and nothing says so before the walk starts",
-)
 @pytest.mark.parametrize("url", MYSQL_VERSION_URLS, ids=short)
 def test_rt_g13_mysql_without_md5_is_refused_naming_the_component(url, tmp_path):
     """A default MySQL 9.7 install: parity cannot hash there, and must say
@@ -335,6 +321,8 @@ def _mysql_battery(url: str, tmp_path: Path):
 def test_mysql_version_renders_like_the_reference(url):
     """MySQL 8.4 and 9.x render every conformance value as 8.0 does."""
     _mysql_version(url)
+    if not _mysql_has_md5(url):
+        pytest.skip("no MD5() on this server: refused at connect (RT-G13)")
     _mysql_version(MYSQL_VERSION_URLS[-1])
     conformance_path()
     from cov_engines import MySQLCov
@@ -349,6 +337,8 @@ def test_mysql_version_renders_like_the_reference(url):
 def test_mysql_version_renders_the_adversarial_floats_as_the_spec(url):
     """1,565 hard doubles on each MySQL version, at scale 6."""
     _mysql_version(url)
+    if not _mysql_has_md5(url):
+        pytest.skip("no MD5() on this server: refused at connect (RT-G13)")
     d = get_dialect(url, side="A")
     try:
         got = render(d, "mysql", SAMPLE)
@@ -421,10 +411,9 @@ def test_mssql_2019_renders_like_2022(monkeypatch):
     [
         pytest.param(
             c,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="RT-G5: below compatibility level 130 float -> decimal is not "
-                "exact, so FLOAT renders off the canonical form",
+            marks=pytest.mark.skip(
+                reason="RT-G5: FLOAT is refused below level 130 "
+                "(test_settings.py pins the refusal)"
             ),
         )
         if c < 130
@@ -444,13 +433,14 @@ def test_mssql_compatibility_level_renders_like_the_default(compat, monkeypatch)
 
 @pytest.mark.parametrize("compat", [100, 110, 120])
 def test_mssql_low_compatibility_level_differs_only_in_float(compat, monkeypatch):
-    """Scope of RT-G5, pinned: at 100-120 the only cells that differ from the
-    default level are FLOAT and REAL ones - DECIMAL, datetime and the rest are
-    unaffected (datetime renders its display, independent of the level)."""
-    ref = _Ms.cells(MSSQL_ADMIN_URL, None, monkeypatch)
-    got = _Ms.cells(MSSQL_ADMIN_URL, compat, monkeypatch)
-    natives = {k[0] for k in ref if got.get(k) != ref[k]}
-    assert natives <= {"float", "real"}, natives
+    """Scope of RT-G5, pinned: at 100-120 FLOAT and REAL - the only types that
+    rendered differently there (31 cells, measured before the fix) - are
+    refused; the conformance run over them stops with the refusal, naming the
+    level. The other types' equality to level 160 is pinned by the run of
+    `test_mssql_compatibility_level_renders_like_the_default` at 130+ and by
+    the measurement recorded in CLAUDE.md 4.11."""
+    with pytest.raises(ValueError, match=rf"compatibility level {compat}"):
+        _Ms.cells(MSSQL_ADMIN_URL, compat, monkeypatch)
 
 
 # =================================================================== DuckDB
@@ -504,13 +494,15 @@ def _ids(v: tuple[int, ...]) -> str:
 def _duck_params(
     affected: tuple[tuple[int, ...], tuple[int, ...]] | None = None, reason: str = ""
 ):
-    """One param per configured interpreter; xfail(strict) for versions in
-    the half-open range `affected` = (first bad, first fixed)."""
+    """One param per configured interpreter. Versions below the supported
+    minimum (1.3: RT-G10, G11, G14 were false matches there) are refused at
+    connect, which `test_duckdb_below_the_minimum_is_refused` pins, so the
+    rendering tests skip them; `affected`/`reason` record the finding."""
     out = []
     for python, version in _DUCKS:
         marks = []
-        if affected and affected[0] <= version < affected[1]:
-            marks.append(pytest.mark.xfail(strict=True, reason=reason))
+        if version < (1, 3):
+            marks.append(pytest.mark.skip(reason="refused at connect (DuckDB < 1.3)"))
         out.append(pytest.param(python, version, marks=marks, id=_ids(version)))
     return out or [pytest.param(None, (0,), id="no-duckdb-venvs")]
 
@@ -637,3 +629,17 @@ def test_rt_g14_duckdb_decimal_rounds_half_away_from_zero(python, version, tmp_p
     _need(python)
     got = _probe(python, "scenarios", tmp_path)["decimal_half"]
     assert got["found"] == [["1", "different", ["x"]], ["2", "different", ["x"]]], got
+
+
+@pytest.mark.parametrize(("python", "version"), list(_DUCKS) or [(None, (0,))])
+def test_duckdb_below_the_minimum_is_refused(python, version, tmp_path):
+    """RT-G10, G11, G14 were false matches on DuckDB 1.0-1.2 (unquoted list
+    text, pre-epoch nanoseconds, truncated DECIMAL). Those versions are now
+    refused at connect, naming the version; 1.3 and newer open."""
+    _need(python)
+    got = _probe(python, "refuse", tmp_path)
+    if version < (1, 3):
+        assert got["error"] and "is not supported" in got["error"], got
+        assert got["version"] in got["error"] and "side A" in got["error"], got
+    else:
+        assert got["error"] is None, got

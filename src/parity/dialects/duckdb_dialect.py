@@ -45,6 +45,21 @@ def duckdb_path(connection_string: str) -> str:
     return rest.removeprefix("/")
 
 
+#: Oldest DuckDB whose rendering is verified (RT-G10, G11, G14 below it).
+MIN_DUCKDB = (1, 3)
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """`1.5.5` -> (1, 5, 5); a suffix such as `.dev12` is ignored."""
+    out = []
+    for part in version.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
 class DuckDBDialect(Dialect):
     name = "duckdb"
     default_schema = "main"
@@ -59,6 +74,16 @@ class DuckDBDialect(Dialect):
         """
         import duckdb
 
+        # Before 1.3 DuckDB rendered lists unquoted (['NULL'] = [NULL], RT-G10),
+        # 1.1 lost pre-epoch nanoseconds (RT-G11) and 1.0 truncated DECIMAL
+        # where it must round (RT-G14): verified false matches, so refused.
+        if _version_tuple(duckdb.__version__) < MIN_DUCKDB:
+            raise self._err(
+                f"DuckDB {duckdb.__version__} is not supported: parity needs "
+                f"DuckDB {'.'.join(map(str, MIN_DUCKDB))} or newer (older "
+                "versions render some values differently, which can hide a "
+                "difference). Upgrade with: pip install -U duckdb"
+            )
         path = duckdb_path(connection_string)
         if not path or path == ":memory:":
             # An in-memory database holds no user data to protect, and a

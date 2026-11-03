@@ -629,7 +629,10 @@ def diff(
             # Anything else the dialect knows makes this comparison less than
             # exact - SQL Server without snapshot isolation, say - reaches the
             # output the same way, naming the side it applies to.
-            for note in dialect.caveats([*key_cols, *cols]):
+            # Key columns always render every stored digit (`normalize_key`),
+            # so they are passed as `sub_micro` and draw no precision caveat.
+            exact_keys = [dataclasses.replace(c, sub_micro=True) for c in key_cols]
+            for note in dialect.caveats([*exact_keys, *cols]):
                 warnings.append(f"side {side} ({dialect.name}): {note}")
 
         ks_a, ks_b = both("key_stats", key_a, _args_b=(key_b,))
@@ -730,6 +733,29 @@ def diff(
                     f"range is unverified"
                 )
 
+        def check_totals(
+            cs_a: dict[int, tuple[int, int]], cs_b: dict[int, tuple[int, int]]
+        ) -> None:
+            """The first level covers the whole key range, so each side's
+            bucket counts must add up to the rows it reported holding. A server
+            setting that caps result rows (MySQL sql_select_limit, Snowflake
+            ROWS_PER_RESULTSET) dropped buckets on both sides alike, and they
+            then read as empty - identical (RT-G1, G2). Any shortfall, or a
+            table changing between the two queries, is never identical."""
+            for side, table, cs, ks in (
+                ("A", a_table, cs_a, ks_a),
+                ("B", b_table, cs_b, ks_b),
+            ):
+                total = sum(count for count, _ in cs.values())
+                if total != ks.rows:
+                    unexplained.append(
+                        f"side {side} ({table}) holds {ks.rows:,} row(s), but its "
+                        f"checksums covered {total:,}: rows were hidden from the "
+                        f"comparison (a server setting limiting result rows) or "
+                        f"the table changed during the run, so the result is "
+                        f"unverified"
+                    )
+
         if bounds:
             # Half-open [lo, hi): +1 so the largest key is inside the range.
             lo, hi = min(bounds), max(bounds) + 1
@@ -759,6 +785,7 @@ def diff(
                     # one-row table moves rows and breaks the zero-download
                     # promise every other identical table keeps.
                     cs_a, cs_b = checksums(s_lo, s_hi, 1)
+                    check_totals(cs_a, cs_b)
                     va, vb = cs_a.get(0, EMPTY), cs_b.get(0, EMPTY)
                     if va != vb:
                         compare(s_lo, s_hi, va, vb)
@@ -766,6 +793,8 @@ def diff(
 
                 n = min(bisection_factor, span)
                 cs_a, cs_b = checksums(s_lo, s_hi, n)
+                if (s_lo, s_hi) == (lo, hi):
+                    check_totals(cs_a, cs_b)
 
                 differing = [
                     i for i in range(n) if cs_a.get(i, EMPTY) != cs_b.get(i, EMPTY)

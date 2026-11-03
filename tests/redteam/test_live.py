@@ -863,16 +863,11 @@ def test_mssql_login_language_and_database_ansi_options_do_not_move_the_verdict(
     assert found(result) == [(3, "different", ("s",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D6: a database with NUMERIC_ROUNDABORT ON makes every DECIMAL/FLOAT "
-    "rounding raise; the dialect does not pin it OFF and the error names no side",
-)
 def test_mssql_numeric_roundabort_database_still_diffs(mss, tmp_path):
-    """NUMERIC_ROUNDABORT is a database option the ODBC driver does *not*
-    reset. On, every `cast(x as decimal(38,6))` that drops a digit raises
-    error 8115 - so any DECIMAL with more than six places, and the FLOAT
-    rendering, cannot be compared at all."""
+    """RT-D6, fixed: NUMERIC_ROUNDABORT is a database option the ODBC driver
+    does *not* reset. On, every `cast(x as decimal(38,6))` that drops a digit
+    raised error 8115, so no DECIMAL past six places and no FLOAT could be
+    compared. The dialect now sets it OFF for its session (RT-G8)."""
     adm, url = mss
     t = _mssql_types_table(adm, MSSQL_DB, f"roundabort_{RUN}")
     adm.run("master", f"alter database [{MSSQL_DB}] set numeric_roundabort on")

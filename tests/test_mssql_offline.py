@@ -225,7 +225,11 @@ def test_connect_pins_snapshot_and_turns_autocommit_off(fake_driver):
     d.connect("mssql://u:p@h/wh?trust_server_certificate=yes")
     conn = fake_driver[0]
     assert conn.opened_autocommit is True and conn.autocommit is False
-    assert conn.calls[-1] == "set transaction isolation level snapshot"
+    # The isolation level, then NUMERIC_ROUNDABORT off (RT-D6, RT-G8).
+    assert conn.calls[-2:] == [
+        "set transaction isolation level snapshot",
+        "set numeric_roundabort off",
+    ]
     assert d.snapshot and d.default_schema == "sales" and d.database == "wh"
     assert d.caveats([]) == []
     d.close()
@@ -237,7 +241,10 @@ def test_connect_without_snapshot_stays_read_committed_and_says_so(fake_driver):
     fake_driver.append(FakeConn(_probe(snapshot=0, schema=None)))
     d = SQLServerDialect(side="B")
     d.connect("mssql://u:p@h/wh")
-    assert fake_driver[0].calls[-1] == "set transaction isolation level read committed"
+    assert fake_driver[0].calls[-2:] == [
+        "set transaction isolation level read committed",
+        "set numeric_roundabort off",
+    ]
     assert d.default_schema == "dbo"
     (note,) = d.caveats([])
     assert "ALLOW_SNAPSHOT_ISOLATION OFF" in note and "'wh'" in note

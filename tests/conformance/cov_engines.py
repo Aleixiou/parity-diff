@@ -997,7 +997,11 @@ class SnowflakeCov(CovEngine):
             marks = ", ".join(["?"] * len(columns))
             sql = f'insert into "{table}" values ({marks})'
             # Server-side binding: the default pyformat style interpolates
-            # values into the SQL text client-side - exactly a literal.
+            # values into the SQL text client-side - exactly a literal. The
+            # connection is switched to qmark outright, because connector 4.x
+            # (the supported line) ignores `_force_qmark_paramstyle` in
+            # executemany and formats with `%` instead.
+            self.w._conn._paramstyle = "qmark"
             cur.executemany(sql, [list(r) for r in rows], _force_qmark_paramstyle=True)
             if variant:
                 exprs = ", ".join(

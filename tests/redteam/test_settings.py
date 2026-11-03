@@ -87,12 +87,6 @@ def _init_connect_hook(monkeypatch, statement: str) -> None:
     monkeypatch.setattr(MySQLConnectionAbstract, "_post_connection", post_connection)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G1: MySQL sql_select_limit is not pinned; it truncates the column "
-    "introspection, so columns past the limit are silently not compared, and the "
-    "checksum buckets past it, which then read as empty on both sides - a false match",
-)
 def test_rt_g1_mysql_sql_select_limit_session_default(mysql_url, monkeypatch):
     """`sql_select_limit` caps the rows of every SELECT without a LIMIT. As an
     `init_connect` statement (or a GLOBAL default, below) it reaches parity's
@@ -120,11 +114,6 @@ def mysql_root():
     conn.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G1: a GLOBAL sql_select_limit or init_connect reaches parity's "
-    "session and truncates columns() and the checksum results - a false match",
-)
 @pytest.mark.parametrize(
     ("setting", "reset"),
     [
@@ -213,20 +202,15 @@ def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-@pytest.mark.sample_check_may_disagree  # the sample check sees the NULL; the walk did not
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G3: past max_allowed_packet MySQL's REPLACE returns NULL (warning 1301 "
-    "only); escape_text's REPLACE is coalesced to the NULL sentinel, so a long text "
-    "holding a backslash compares equal to NULL - a false match, on every engine pair",
-)
 def test_rt_g3_mysql_escaped_text_past_max_allowed_packet_is_not_null(mysql_root):
     """A 20,000-character TEXT holding one backslash, against NULL, on a server
     whose max_allowed_packet (GLOBAL) is 16 KiB - stored while the limit was
     higher, as data outlives configuration. Doubling the backslash makes
     REPLACE grow the value, and REPLACE returns NULL for any result past the
     limit. `_binary_text` guards exactly this for binary columns; text has no
-    guard, so the coalesce turns the value into the NULL sentinel."""
+    guard, so the coalesce turned the value into the NULL sentinel. Fixed as
+    binary is: the value is refused, naming the side and its size - a loud
+    stop, never a NULL."""
     a, b = f"rtg_pkt_a_{RUN}", f"rtg_pkt_b_{RUN}"
     for t in (a, b):
         mysql_run(
@@ -241,12 +225,13 @@ def test_rt_g3_mysql_escaped_text_past_max_allowed_packet_is_not_null(mysql_root
         "set global max_allowed_packet = 16384",
     )
     try:
-        result = run_diff(
-            get_dialect(MYSQL_USER_URL, side="A"),
-            get_dialect(MYSQL_USER_URL, side="B"),
-            a,
-            b,
-        )
+        with pytest.raises(ValueError, match=r"side A.*max_allowed_packet"):
+            run_diff(
+                get_dialect(MYSQL_USER_URL, side="A"),
+                get_dialect(MYSQL_USER_URL, side="B"),
+                a,
+                b,
+            )
     finally:
         mysql_run(
             mysql_root,
@@ -254,7 +239,6 @@ def test_rt_g3_mysql_escaped_text_past_max_allowed_packet_is_not_null(mysql_root
             f"drop table if exists `{a}`",
             f"drop table if exists `{b}`",
         )
-    assert found(result) == [(1, "different", ("v",))]
 
 
 def test_mysql_long_text_without_escapes_past_max_allowed_packet_is_found(mysql_root):
@@ -492,13 +476,6 @@ def test_pg_no_user_settable_parameter_moves_the_canonical_text(pg_url, pg_rich)
     assert not moved, "\n".join(moved)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G7: quote_all_identifiers is not pinned; on, information_schema "
-    "reports date/text/uuid as '\"date\"' etc., map_type sees UNKNOWN, and those "
-    "columns are compared as raw ::text (BC dates as '0044-03-15 BC') with bogus "
-    "type-mismatch warnings, and the sample check stops on an infinite date",
-)
 def test_rt_g7_pg_quote_all_identifiers_keeps_the_logical_types(pg_url, pg_rich):
     """A role or database default `quote_all_identifiers = on` (pg_dump's
     `--quote-all-identifiers`, kept for a migration role) must not change how a
@@ -515,12 +492,6 @@ def test_rt_g7_pg_quote_all_identifiers_keeps_the_logical_types(pg_url, pg_rich)
     assert got == want
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G7: under quote_all_identifiers a DATE column is compared as ::text, "
-    "so the same BC date reads '0044-03-15 BC' on one side and '-43-03-15' on the "
-    "other - a false alarm on identical tables",
-)
 def test_rt_g7_pg_quote_all_identifiers_same_table_reads_identical(pg_url, pg_rich):
     """One table, read by a default session and by one with
     quote_all_identifiers on: identical data must read identical."""
@@ -550,11 +521,6 @@ def test_pg_role_statement_timeout_fails_loudly_naming_the_side(pg_url):
         conn.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G6: row-level security silently filters what parity reads; two "
-    "tables differing only in rows the policy hides read identical, with no caveat",
-)
 def test_rt_g6_pg_row_level_security_is_not_silent(pg_url):
     """Legacy tables often carry RLS (tenant isolation). Here the policy hides
     ids above 50 from the reading role, and the only difference is row 51: the
@@ -584,12 +550,6 @@ def test_rt_g6_pg_row_level_security_is_not_silent(pg_url):
     assert warned or not result.identical, (found(result), result.warnings)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G12 (incidental): a PostgreSQL time '24:00:00' - a legal value - "
-    "cannot be loaded by psycopg, so fetch_sample raises and the independent "
-    "sample check does not run for the whole table",
-)
 def test_rt_g12_pg_time_2400_does_not_stop_the_sample_check(pg_url):
     """`time` is UNKNOWN to the rules, so the check could never compare it, but
     its raw value is still fetched, and one '24:00' in any row ends the check
@@ -614,12 +574,6 @@ def test_rt_g12_pg_time_2400_does_not_stop_the_sample_check(pg_url):
 
 
 @pytest.mark.sample_check_may_disagree  # the sample check sees the mojibake row
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G4: in a non-UTF-8 PostgreSQL database md5() hashes the server "
-    "encoding's bytes, so LATIN1 'Ã©' hashes like UTF-8 'é' (false match) and a "
-    "correct 'é' never matches another engine (unexplained mismatch)",
-)
 @pytest.mark.parametrize("encoding", ["LATIN1", "WIN1252"])
 def test_rt_g4_pg_non_utf8_database_hashes_text_as_utf8(tmp_path, encoding):
     """A legacy PostgreSQL database in LATIN1 or WIN1252 against DuckDB. Row 1
@@ -837,12 +791,6 @@ def test_mssql_server_user_options_the_driver_resets(tmp_path):
     assert found(result) == [(4, "different", ("vc",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G8: server-wide 'user options' NUMERIC_ROUNDABORT (8192) - RT-D6 by "
-    "the server route - makes every rounding DECIMAL cast raise 8115; the dialect "
-    "does not SET NUMERIC_ROUNDABORT OFF, so the diff cannot run",
-)
 def test_rt_g8_mssql_server_user_options_numeric_roundabort(tmp_path):
     """The same table under 'user options' = 8192: every session on the server
     starts with NUMERIC_ROUNDABORT ON, which the driver does not reset."""
@@ -850,20 +798,13 @@ def test_rt_g8_mssql_server_user_options_numeric_roundabort(tmp_path):
     assert found(result) == [(4, "different", ("vc",))]
 
 
-@pytest.mark.sample_check_may_disagree  # the sample check sees the rounding
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G5: below compatibility level 130 SQL Server converts float to "
-    "decimal through 17 significant digits, not exactly; the canonical FLOAT form "
-    "is built on the exact conversion, so values render off the spec - false "
-    "alarms against every engine and false matches like -262.4724295 = -262.472429",
-)
 @pytest.mark.parametrize("compat", [100, 110, 120])
 def test_rt_g5_mssql_float_below_compatibility_level_130(tmp_path, compat):
-    """A database kept at an old compatibility level - the normal state of a
-    legacy database restored onto a new server. Row 1: -262.4724295 (canonical
-    `-262.472430`) against DuckDB -262.472429: must differ. Row 2: 2^63 on both
-    sides (canonical `9223372036854775808.000000`): must match."""
+    """RT-G5: below compatibility level 130 SQL Server converts float to
+    decimal through 17 significant digits, so the canonical FLOAT form (built
+    on the exact conversion) rendered -262.4724295 as -262.472429 - a false
+    match against DuckDB. FLOAT columns there are now refused, naming the
+    side, the column and the level; every other type renders as at 130+."""
     db = f"rtg_compat_{compat}_{RUN}"
     url = _ms_database(db, "Latin1_General_100_CI_AS_SC_UTF8", compat)
     try:
@@ -876,10 +817,12 @@ def test_rt_g5_mssql_float_below_compatibility_level_130(tmp_path, compat):
             "create table t (id int, f double)",
             "insert into t values (1, -262.472429), (2, 9223372036854775808.0)",
         )
-        result = run_diff(open_mssql(url, "A"), open_duckdb(duck, "B"), "dbo.t", "main.t")
+        with pytest.raises(
+            ValueError, match=rf"side A.*'f'.*compatibility level {compat}"
+        ):
+            run_diff(open_mssql(url, "A"), open_duckdb(duck, "B"), "dbo.t", "main.t")
     finally:
         mssql_drop_database(MSSQL_ADMIN_URL, db)
-    assert found(result) == [(1, "different", ("f",))]
 
 
 def test_mssql_float_at_compatibility_level_130(tmp_path):
@@ -950,11 +893,6 @@ def _sf_with_user_parameter(snowflake_url: str, parameter: str):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-G2: Snowflake ROWS_PER_RESULTSET (a user/account parameter) is not "
-    "pinned; it truncates columns() and the checksum results - a false match",
-)
 def test_rt_g2_snowflake_rows_per_resultset(snowflake_url):
     """ROWS_PER_RESULTSET = 2 on the login, as an administrator might set it
     to protect a shared warehouse: parity sees columns "id" and "a" only and

@@ -8,6 +8,7 @@ PostgreSQL and DuckDB disagree - and every workaround says which.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import unquote
 
@@ -79,7 +80,17 @@ SESSION_PINS: tuple[tuple[str, str], ...] = (
     # reach operators or the shared row-text SQL. Every table is
     # schema-qualified (`qualify`), so no relation lookup depends on it.
     ("search_path", "pg_catalog"),
+    # On, `format_type` quotes type names (`"date"`, `"text"`), which then map
+    # to no logical type: bogus type warnings, BC dates rendered two ways, and
+    # a sample check that died on an infinite date (RT-G7). A role or database
+    # default can carry it.
+    ("quote_all_identifiers", "off"),
 )
+
+#: Oldest server the session pins exist on: 9.6 added
+#: idle_in_transaction_session_timeout, and 9.5 refused to connect with an
+#: error naming no version (RT-G9).
+MIN_SERVER_VERSION = 90600
 
 #: PostgreSQL 17 added `transaction_timeout`, which kills the held snapshot
 #: transaction just as idle_in_transaction_session_timeout does (RT-D13).
@@ -208,13 +219,21 @@ class PostgresDialect(Dialect):
             # whenever redaction had to remove something.
             cause = exc if clean == text else None
             raise self._err(f"could not connect: {clean}") from cause
-        for setting, value in SESSION_PINS:
-            self._conn.execute(f"set {setting} = {value}")
         # PostgreSQL 11 and older print 17 significant digits instead of the
         # shortest repr, so FLOAT columns cannot be rendered canonically there;
         # `normalize` refuses them rather than report rounding-only diffs.
         row = self._conn.execute("show server_version_num").fetchone()
         self._server_version_num = int(row[0]) if row else 0
+        if self._server_version_num < MIN_SERVER_VERSION:
+            shown = self._conn.execute("show server_version").fetchone()
+            self._conn.close()
+            raise self._err(
+                f"PostgreSQL {shown[0] if shown else self._server_version_num} is "
+                "not supported: parity needs PostgreSQL 9.6 or newer (12 or newer "
+                "to compare FLOAT columns)"
+            )
+        for setting, value in SESSION_PINS:
+            self._conn.execute(f"set {setting} = {value}")
         if self._server_version_num >= TRANSACTION_TIMEOUT_FROM:
             self._conn.execute("set transaction_timeout = 0")
         self._conn.autocommit = False
@@ -309,7 +328,9 @@ class PostgresDialect(Dialect):
         introspection runs exactly the SQL it always did.
         """
         try:
-            return self._with_enums(table, super().columns(table))
+            cols = self._with_enums(table, super().columns(table))
+            self._note_row_security(table)
+            return cols
         except ValueError as exc:
             try:
                 schema, name = self.split_table(table, self.default_schema)
@@ -319,6 +340,37 @@ class PostgresDialect(Dialect):
             if found is None:
                 raise
             return found
+
+    def _note_row_security(self, table: str) -> None:
+        """Remember a table whose rows a row-level security policy filters.
+
+        RLS silently hides rows from the reading role: two tables differing
+        only in hidden rows read identical over the rows that remain (RT-G6).
+        It applies when it is enabled and the role neither bypasses it
+        (superuser, BYPASSRLS) nor owns the table without FORCE.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        rows = self.query(
+            "select c.relrowsecurity and not (r.rolsuper or r.rolbypassrls) "
+            "and (c.relforcerowsecurity or c.relowner <> r.oid) "
+            "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+            "join pg_roles r on r.rolname = current_user "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)}"
+        )
+        if rows and rows[0][0]:
+            self._row_security = [*getattr(self, "_row_security", []), table]
+
+    def caveats(self, columns: Sequence[Column]) -> list[str]:
+        """Row-level security that filters what this side can read."""
+        out = list(super().caveats(columns))
+        for table in getattr(self, "_row_security", []):
+            out.append(
+                f"row-level security filters {table} for this role: rows its "
+                "policies hide are not compared at all, so a difference there "
+                "cannot be seen. Diff as a role that bypasses RLS (BYPASSRLS) "
+                "for a complete result"
+            )
+        return out
 
     def _with_enums(self, table: str, columns: list[Column]) -> list[Column]:
         """Map enum columns to STRING.
@@ -618,9 +670,13 @@ class PostgresDialect(Dialect):
         60 bits, not 64: at 64 PostgreSQL's bit-to-bigint cast wraps negative
         and the two engines stop agreeing.
         """
-        return (
-            f"(('x' || substr(md5({text_expr}), 1, {HASH_HEX_CHARS}))::bit(60)::bigint)"
-        )
+        # md5(text) hashes the *server encoding's* bytes. In a LATIN1 or
+        # WIN1252 database that made the mojibake 'Ã©' hash like UTF-8 'é'
+        # elsewhere (a false match) and a correct 'é' never match (RT-G4).
+        # convert_to(..., 'UTF8') hashes UTF-8 bytes everywhere - the identity
+        # in a UTF-8 database, so no checksum moves there.
+        utf8 = f"convert_to({text_expr}, 'UTF8')"
+        return f"(('x' || substr(md5({utf8}), 1, {HASH_HEX_CHARS}))::bit(60)::bigint)"
 
     def int_div(self, numerator: str, denominator: str) -> str:
         """Exact integer division, truncating toward zero."""
