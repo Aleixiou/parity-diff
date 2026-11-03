@@ -255,7 +255,115 @@ def test_where_and_map_postgres_quoting(schema):
         _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "nm"})
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HP7: no connect_timeout is set, so a URL whose port has no listener "
+    "(on Windows psycopg retries a refused connect) hangs with no output (hang)",
+)
+def test_rt_hp7_unreachable_server_fails_within_a_minute():
+    import subprocess
+    import sys
+
+    cmd = [sys.executable, "-c", "import sys; from parity.cli import main; sys.exit(main())",
+           "diff", "--a", "postgres://rth:x@127.0.0.1:1/rth", "--a-table", "t",
+           "--b", "duckdb:///:memory:", "--b-table", "t", "--key", "id"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        pytest.fail("no answer after 60 s")
+    assert p.returncode == 2 and "side A" in p.stderr
+
+
 # ------------------------------------------------- held (regression tests)
+
+
+def test_partitions_generated_columns_and_missing_grants(schema):
+    s = schema
+    _exec(
+        ADMIN,
+        f"create table {s}.pa (id int, r text, x text, primary key (id, r)) partition by list (r)",
+        f"create table {s}.pa_e partition of {s}.pa for values in ('eu')",
+        f"create table {s}.pa_u partition of {s}.pa for values in ('us')",
+        f"create table {s}.pb (id int, r text, x text, primary key (id, r))",
+        f"insert into {s}.pa select g, case when g % 2 = 0 then 'eu' else 'us' end, 'v' "
+        "from generate_series(1, 1000) g",
+        f"insert into {s}.pb select * from {s}.pa",
+        f"update {s}.pb set x = 'D' where id = 501",
+        f"create table {s}.ga (id int primary key, a int, s int generated always as (a * 2) stored, "
+        "v int generated always as (a * 3) virtual)",
+        f"create unlogged table {s}.gb (id int primary key, a int, s int, v int)",
+        f"insert into {s}.ga (id, a) select g, g from generate_series(1, 100) g",
+        f"insert into {s}.gb select id, a, s, v from {s}.ga",
+        f"update {s}.gb set v = 0 where id = 50",
+    )
+    r = _diff(ADMIN, f"{s}.pa", ADMIN, f"{s}.pb", key=["id", "r"])
+    assert [(d.key, d.kind) for d in r.diffs] == [("501\x1fus", "different")]
+    r = _diff(ADMIN, f"{s}.pa_u", ADMIN, f"{s}.pb", key=["id", "r"], where_b="r = 'us'")
+    assert [d.key for d in r.diffs] == ["501\x1fus"]
+    r = _diff(ADMIN, f"{s}.ga", ADMIN, f"{s}.gb")
+    assert [(d.key, d.columns) for d in r.diffs] == [(50, ["v"])]
+    url = _role(f"rth_postgres_np_{RUN}")
+    try:
+        with pytest.raises(ValueError, match=r"side A.*exists but this role cannot read it"):
+            _diff(url, f"{s}.pa", ADMIN, f"{s}.pb", key=["id", "r"])
+    finally:
+        _exec(ADMIN, f"drop role rth_postgres_np_{RUN}")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgres://rth:S3cr3tPw!@127.0.0.1:15618/rth",
+        "POSTGRES://rth:S3cr3t Pw@127.0.0.1:15618/rth",
+        "postgres://rth@127.0.0.1:15618/rth?password=S3cr3tPw!&sslmode=bogus",
+    ],
+)
+def test_cli_connection_errors_never_print_the_password(url, schema):
+    import subprocess
+    import sys
+
+    pg_connect(ADMIN).close()
+    cmd = [sys.executable, "-c", "import sys; from parity.cli import main; sys.exit(main())",
+           "diff", "--a", url, "--a-table", f"{schema}.t", "--b", ADMIN,
+           "--b-table", f"{schema}.t", "--key", "id"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2
+    assert "side A" in p.stderr and "S3cr3t" not in p.stdout + p.stderr
+
+
+def test_live_writer_mid_walk_is_invisible_then_seen(schema):
+    s = schema
+    _exec(ADMIN,
+          f"create table {s}.a (id bigint primary key, x text, n numeric(12,2))",
+          f"insert into {s}.a select g, md5(g::text), g / 100.0 from generate_series(1, 200000) g",
+          f"create table {s}.b as select * from {s}.a", f"alter table {s}.b add primary key (id)",
+          f"update {s}.b set x = 'first' where id = 1",
+          f"update {s}.b set n = n + 0.01 where id = 200000",
+          f"insert into {s}.b values (9223372036854775807, 'max', 0)")
+    planted = [(1, "different"), (200000, "different"), (9223372036854775807, "only_in_b")]
+    a, b = get_dialect(ADMIN, side="A"), get_dialect(ADMIN, side="B")
+    original, fired = b.segment_checksums, []
+
+    def wrapped(*args, **kw):
+        out = original(*args, **kw)
+        if not fired:
+            fired.append(True)
+            _exec(ADMIN, f"update {s}.b set x = 'LIVE' where id = 2",
+                  f"delete from {s}.b where id = 3", f"insert into {s}.b values (-5, 'new', 0)")
+        return out
+
+    b.segment_checksums = wrapped
+    try:
+        r = diff(a, b, f"{s}.a", f"{s}.b", "id")
+    finally:
+        a.close()
+        b.close()
+    assert fired and sorted((d.key, d.kind) for d in r.diffs) == planted and not r.unexplained
+    r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b")
+    assert sorted((d.key, d.kind) for d in r.diffs) == sorted(
+        [*planted, (-5, "only_in_b"), (2, "different"), (3, "only_in_a")])
+    r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b", max_diffs=2)
+    assert r.truncated and not r.identical and len(r.diffs) == 2
 
 
 @pytest.mark.parametrize("encoding", ["EUC_JP", "SQL_ASCII", "EUC_KR"])
