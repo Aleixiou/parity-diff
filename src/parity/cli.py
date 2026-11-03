@@ -57,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "exit codes: 0 identical, 1 not identical (row differences, a "
-            "column only one side has, or a checksum mismatch the rows could "
-            "not explain), 2 error. "
+            "column only one side has, a checksum mismatch the rows could "
+            "not explain, or a sample check that could not run), 2 error. "
             "Connection strings look like postgres://user:pw@host/db or "
             "duckdb:///path/to.duckdb"
         ),
@@ -162,8 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
         f"{DEFAULT_VERIFY_SAMPLE:,}; 0 to skip) from the raw values each "
         f"driver returns, by the documented rules in Python - an independent "
         f"check that a mistake in the tool's own SQL cannot fool. Tables of N "
-        f"rows or fewer are re-compared in full. Any contradiction means not "
-        f"identical.",
+        f"rows or fewer are re-compared in full. Any contradiction, or a check "
+        f"that cannot run, means not identical.",
     )
     d.add_argument("--json", action="store_true", help="machine-readable output")
     d.add_argument(
@@ -422,6 +422,13 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             f"{sym['bad']} schemas differ: no row differences in {total:,} rows, "
             f"but not every column could be compared"
         )
+    elif result.verification and result.verification.error:
+        # The run asked for a second method and did not get one: the checksums
+        # alone found nothing, but that is not the proof that was requested.
+        headline = (
+            f"{sym['bad']} not proven: the independent sample check could not "
+            f"run: {_escape(result.verification.error)}"
+        )
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
     if result.filtered:
@@ -551,9 +558,23 @@ def _render_verification(result: DiffResult, w: _Writer, sym: dict[str, str]) ->
     """The independent sample check, in a line or two - every failure listed."""
     v = result.verification
     if v is None:
+        if result.verify_sample == 0:
+            # Switched off on purpose: say so, so a reader knows the verdict
+            # rests on the checksums alone and that no risk line was computed.
+            w.line(
+                "  ! independent sample check off (--verify-sample 0): the verdict "
+                "rests on the checksums alone; risk: not computed"
+            )
         return
     if v.error:
-        w.line(f"  ! independent sample check could not run: {_escape(v.error)}")
+        w.line(
+            f"  {sym['bad']} not proven: the independent sample check could not "
+            f"run: {_escape(v.error)}"
+        )
+        w.line(
+            "    risk: not computed; fix the cause and re-run, or pass "
+            "--verify-sample 0 to rest the verdict on the checksums alone"
+        )
         return
     rows = max(v.rows_a, v.rows_b)
     scope = (
@@ -660,7 +681,8 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
         # not account for it. Non-empty means not identical.
         "unexplained": result.unexplained,
         # The independent sample check; null when skipped. Non-empty
-        # `failures` means not identical.
+        # `failures`, or an `error` (the check could not run), means not
+        # identical.
         "verification": None
         if result.verification is None
         else {
@@ -674,6 +696,8 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
             "notes": result.verification.notes,
             "error": result.verification.error,
         },
+        # The sample size asked for; 0 means the check was switched off.
+        "verify_sample": result.verify_sample,
         # The run's measurable residual risk; see `risk_figures`.
         "risk": risk_figures(result),
         "difference_count": len(result.diffs),

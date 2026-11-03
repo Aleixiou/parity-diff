@@ -55,9 +55,11 @@ Changed after that run from the documentation, then verified live on
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, cast
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from parity.dialects.base import (
     FLOAT_EXACT_INT_FROM,
@@ -71,6 +73,247 @@ from parity.dialects.base import (
 )
 from parity.types import Column, LogicalType
 
+#: Query parameters a `snowflake://` URL may carry. Anything else is refused,
+#: never ignored: a dropped parameter is a setting the user believes is in
+#: force (a role that limits what is read, a key that replaces the password)
+#: and is not - the same rule as MySQL, SQL Server and BigQuery.
+URL_PARAMS = ("private_key_file", "role", "warehouse")
+
+#: Where a private key's passphrase is read from. Never the URL: a URL lands
+#: in shell history, CI logs and the process list, and the passphrase is the
+#: only thing protecting the key file. `<name>_A` / `<name>_B` take
+#: precedence for one side, so two Snowflake sides can use two keys.
+KEY_PASSPHRASE_ENV = "PARITY_SNOWFLAKE_KEY_PASSPHRASE"  # noqa: S105 - a variable name
+
+_URL_SHAPE = (
+    "snowflake://user:password@account/database/schema?warehouse=WH&role=ROLE "
+    "or, for key-pair authentication, "
+    "snowflake://user@account/database/schema?private_key_file=/path/key.p8"
+)
+
+
+@dataclass
+class SnowflakeURL:
+    """The parts of a `snowflake://` URL, password included - never print one."""
+
+    account: str
+    user: str
+    password: str | None = field(default=None, repr=False)
+    database: str | None = None
+    schema: str | None = None
+    warehouse: str | None = None
+    role: str | None = None
+    #: A PEM private key for key-pair (JWT) authentication; a path, so it may
+    #: be printed. Its passphrase comes from `KEY_PASSPHRASE_ENV`.
+    private_key_file: str | None = None
+
+
+def parse_snowflake_url(connection_string: str) -> SnowflakeURL:
+    """Parse ``snowflake://user[:password]@account/database/schema?params``.
+
+    Raises ValueError without the side (`connect` adds it), and no message
+    below ever contains the userinfo or a parameter's value: a URL is the one
+    place a password is written down, and these errors land in CI logs.
+    """
+    rest = connection_string.split("://", 1)[1] if "://" in connection_string else ""
+    # An unencoded `/`, `?` or `#` in a password ends urlparse's authority
+    # early: the start of the password becomes the account (or a "port") and
+    # the rest of it the database name, which the server would then echo in
+    # "database ... does not exist". An `@` after the authority can only come
+    # from such a password (an account, a database or a key path never needs
+    # one unencoded), so refuse the URL rather than send any of it anywhere.
+    ends = [i for i in (rest.find(c) for c in "/?#") if i >= 0]
+    authority_end = min(ends, default=len(rest))
+    if "@" in rest[authority_end:]:
+        raise ValueError(
+            "malformed snowflake URL: percent-encode `/ ? # @ %` in the "
+            f"password (`/` as %2F, `@` as %40); expected {_URL_SHAPE}"
+        )
+    try:
+        url = urlparse(connection_string)
+        account, username, password = url.hostname, url.username, url.password
+    except ValueError:
+        # urlparse's own messages ("Invalid IPv6 URL") carry no URL text, but
+        # say nothing of it either way.
+        raise ValueError(f"malformed snowflake URL; expected {_URL_SHAPE}") from None
+    if not account:
+        raise ValueError(f"snowflake URL needs an account; expected {_URL_SHAPE}")
+    if not username:
+        raise ValueError(f"snowflake URL needs a user; expected {_URL_SHAPE}")
+    parts = [p for p in url.path.split("/") if p]
+    if len(parts) > 2:
+        raise ValueError(
+            f"snowflake URL path is /database/schema, got {len(parts)} parts; "
+            f"expected {_URL_SHAPE}"
+        )
+    out = SnowflakeURL(
+        account=account,
+        user=unquote(username),
+        password=unquote(password) if password else None,
+        database=unquote(parts[0]) if parts else None,
+        schema=unquote(parts[1]) if len(parts) > 1 else None,
+    )
+    # Split by hand rather than with parse_qs, whose `+` means a space: a key
+    # file path may hold a `+`, and a path quietly changed is a file not found.
+    seen: set[str] = set()
+    for item in url.query.split("&") if url.query else []:
+        name, _, value = item.partition("=")
+        name, value = unquote(name), unquote(value)
+        if name == "password":
+            raise ValueError(
+                "snowflake URL: the password goes in the userinfo "
+                "(user:password@account), never in a parameter"
+            )
+        if name not in URL_PARAMS:
+            raise ValueError(
+                f"unknown snowflake connection parameter {name!r}: a parameter "
+                f"is refused rather than ignored. Supported: {', '.join(URL_PARAMS)}"
+            )
+        if name in seen:
+            raise ValueError(f"snowflake connection parameter {name!r} is given twice")
+        seen.add(name)
+        if not value:
+            raise ValueError(f"snowflake connection parameter {name!r} is empty")
+        setattr(out, name, value)
+    if out.private_key_file and out.password is not None:
+        # Which one would the connector use? Refuse rather than let it pick.
+        raise ValueError(
+            "snowflake URL has both a password and private_key_file; give one: "
+            "user:password@account, or user@account/...?private_key_file=..."
+        )
+    if not out.private_key_file and out.password is None:
+        raise ValueError(
+            "snowflake URL has no password and no private_key_file: give "
+            "user:password@account, or key-pair authentication with "
+            "?private_key_file=/path/key.p8 (passphrase in "
+            f"{KEY_PASSPHRASE_ENV})"
+        )
+    if out.private_key_file:
+        out.private_key_file = os.path.expanduser(out.private_key_file)
+    return out
+
+
+def key_passphrase(side: str) -> str | None:
+    """The private key's passphrase from the environment, or None if unset.
+
+    The per-side variable wins, so A and B can hold different keys. An empty
+    value counts as unset: a variable cleared with `set X=` is not a
+    passphrase of no characters.
+    """
+    for name in (f"{KEY_PASSPHRASE_ENV}_{side}", KEY_PASSPHRASE_ENV):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def load_private_key(path: str, passphrase: str | None) -> bytes:
+    """Read a PEM RSA private key and return it as unencrypted PKCS#8 DER.
+
+    Loaded here rather than by the connector (`private_key_file`) so every
+    failure is one message naming the file and what to do, never a driver
+    traceback - and never the key or the passphrase. The connector takes DER
+    bytes as `private_key` in every 4.x release. Encryption is read from the
+    PEM header first, so a missing or superfluous passphrase is named as such
+    rather than guessed from a library message.
+
+    A passphrase given for a key that is not encrypted is refused, not
+    ignored: the user believes the key on disk is protected, and it is not -
+    or the path names a different file than intended.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        raise ValueError(f"private key file not found: {path}") from None
+    except OSError as exc:
+        raise ValueError(
+            f"private key file {path} could not be read: {exc.strerror}"
+        ) from None
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+
+    if b"-----BEGIN" not in data or b"PRIVATE KEY-----" not in data:
+        raise ValueError(
+            f"private key file {path} is not a PEM private key (expected "
+            "-----BEGIN [ENCRYPTED] PRIVATE KEY-----, as `openssl genrsa` + "
+            "`openssl pkcs8` write it)"
+        )
+    encrypted = b"-----BEGIN ENCRYPTED PRIVATE KEY-----" in data or (
+        b"Proc-Type: 4,ENCRYPTED" in data
+    )
+    if encrypted and passphrase is None:
+        raise ValueError(
+            f"private key file {path} is encrypted; set {KEY_PASSPHRASE_ENV} "
+            "to its passphrase"
+        )
+    if not encrypted and passphrase is not None:
+        raise ValueError(
+            f"private key file {path} is not encrypted, but {KEY_PASSPHRASE_ENV} "
+            "is set: unset it, or check that the path names the key you meant"
+        )
+    try:
+        key = serialization.load_pem_private_key(
+            data, password=passphrase.encode("utf-8") if passphrase else None
+        )
+    except (ValueError, TypeError):
+        # The library's text says "Bad decrypt" or "Could not deserialize";
+        # neither carries key material, but neither tells the user more.
+        reason = (
+            f"wrong passphrase in {KEY_PASSPHRASE_ENV}?"
+            if encrypted
+            else "the PEM data is damaged or not a private key"
+        )
+        raise ValueError(
+            f"private key file {path} could not be loaded: {reason}"
+        ) from None
+    if not isinstance(key, RSAPrivateKey):
+        raise ValueError(
+            f"private key file {path} holds a {type(key).__name__}; Snowflake "
+            "key-pair authentication takes an RSA key"
+        )
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def connect_kwargs(url: SnowflakeURL, private_key: bytes | None) -> dict[str, Any]:
+    """The keyword arguments for `snowflake.connector.connect`.
+
+    Kept apart from `connect` so the offline tests can pin exactly what
+    reaches the driver - the telemetry switches above all, which must ride on
+    every login, password or key.
+    """
+    kwargs: dict[str, Any] = {
+        # CLAUDE.md section 6: no telemetry, ever. The connector reports
+        # driver usage (imported packages, connection shape) to Snowflake
+        # unless told not to, and does so *during* connect - so the session
+        # parameter has to ride in the login request; setting it afterwards
+        # would be too late. The server does not list this parameter
+        # (it is a client one); the connector's own state is False -
+        # verified live. Connector 5.x flushes a session-telemetry batch
+        # at logout that no switch stops, hence the `<5` pin (README).
+        "session_parameters": {"CLIENT_TELEMETRY_ENABLED": False},
+        "log_imported_packages_in_telemetry": False,
+        "account": url.account,
+        "user": url.user,
+        "database": url.database,
+        "schema": url.schema,
+        "warehouse": url.warehouse,
+        "role": url.role,
+        "autocommit": True,
+    }
+    if private_key is not None:
+        # Key-pair: the connector signs a JWT with the key. No password is
+        # passed at all, so nothing can fall back to password sign-in.
+        kwargs["authenticator"] = "SNOWFLAKE_JWT"
+        kwargs["private_key"] = private_key
+    else:
+        kwargs["password"] = url.password
+    return kwargs
+
 
 class SnowflakeDialect(Dialect):
     name = "snowflake"
@@ -79,18 +322,30 @@ class SnowflakeDialect(Dialect):
     #: schema as stored.
     default_schema = "PUBLIC"
 
-    def connect(self, connection_string: str) -> None:  # pragma: no cover
+    def connect(self, connection_string: str) -> None:
         """Open a connection, pinned to UTC.
 
         URL grammar mirrors SQLAlchemy's Snowflake dialect:
-        ``snowflake://user:password@account/database/schema?warehouse=wh&role=r``
+        ``snowflake://user:password@account/database/schema?warehouse=wh&role=r``,
+        or ``snowflake://user@account/...?private_key_file=/path/key.p8`` for
+        key-pair authentication (`parse_snowflake_url`).
 
         Note the honest gap: Snowflake supports only READ COMMITTED, so there
         is no equivalent of PostgreSQL's REPEATABLE READ - the diff cannot hold
         one snapshot across the walk. UTC is still pinned so timestamps render
         deterministically.
         """
-        import os
+        passphrase = None
+        try:
+            url = parse_snowflake_url(connection_string)
+            private_key = None
+            if url.private_key_file:
+                passphrase = key_passphrase(self.side)
+                private_key = load_private_key(url.private_key_file, passphrase)
+        except ValueError as exc:
+            # `get_dialect` passes a ValueError through untouched, trusting it
+            # to name the side already - so it has to.
+            raise self._err(str(exc)) from None
 
         # CLAUDE.md section 6: no calls anywhere but the warehouse. Connector
         # 5.x probes the AWS, Azure and GCP metadata services at every login
@@ -100,40 +355,25 @@ class SnowflakeDialect(Dialect):
         os.environ.setdefault("SNOWFLAKE_DISABLE_PLATFORM_DETECTION", "true")
         import snowflake.connector
 
-        url = urlparse(connection_string)
-        parts = [p for p in url.path.split("/") if p]
-        database = parts[0] if parts else None
-        schema = parts[1] if len(parts) > 1 else None
-        params = parse_qs(url.query)
+        if url.schema:
+            self.default_schema = url.schema
 
-        def opt(key: str) -> str | None:
-            """First value of a query parameter, or None."""
-            values = params.get(key)
-            return values[0] if values else None
-
-        if schema:
-            self.default_schema = schema
-
-        self._conn = snowflake.connector.connect(
-            # CLAUDE.md section 6: no telemetry, ever. The connector reports
-            # driver usage (imported packages, connection shape) to Snowflake
-            # unless told not to, and does so *during* connect - so the session
-            # parameter has to ride in the login request; setting it afterwards
-            # would be too late. The server does not list this parameter
-            # (it is a client one); the connector's own state is False -
-            # verified live. Connector 5.x flushes a session-telemetry batch
-            # at logout that no switch stops, hence the `<5` pin (README).
-            session_parameters={"CLIENT_TELEMETRY_ENABLED": False},
-            log_imported_packages_in_telemetry=False,
-            account=url.hostname,
-            user=unquote(url.username) if url.username else None,
-            password=unquote(url.password) if url.password else None,
-            database=database,
-            schema=schema,
-            warehouse=opt("warehouse"),
-            role=opt("role"),
-            autocommit=True,
-        )
+        try:
+            self._conn = snowflake.connector.connect(**connect_kwargs(url, private_key))
+        except Exception as exc:  # noqa: BLE001 - any driver error, redacted
+            # The connector's messages are not known to echo a password, but
+            # nothing promises they never will, and these errors land in CI
+            # logs: strip every secret this connection carries, and drop the
+            # chained driver exception (which holds the same text) whenever
+            # anything had to go.
+            text = str(exc).strip()
+            clean = text
+            for secret in (url.password, passphrase):
+                if secret:
+                    clean = clean.replace(secret, "***")
+            raise self._err(f"could not connect: {clean}") from (
+                exc if clean == text else None
+            )
         # Belt and braces: the client-side switch, for anything logged later.
         self._conn.telemetry_enabled = False
         cur = self._conn.cursor()

@@ -940,9 +940,7 @@ def test_enum_against_text_does_not_predict_every_row_differs(pg, tmp_path, enum
     b = _duck(tmp_path, "b", dk, "insert into en values (1, 'happy'), (2, 'sad')")
     result = _run(PG_URL, f"duckdb:///{b}", f"{PG_SCHEMA}.en", "en", "id")
     assert _found(result) == [(2, "different", ["v"])]
-    assert not [w for w in result.warnings if "very likely all differ" in w], (
-        result.warnings
-    )
+    assert not [w for w in result.warnings if "expect differences" in w], result.warnings
 
 
 # ===================================================== generated columns, held

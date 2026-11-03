@@ -138,10 +138,11 @@ parity: [side A] no dialect for scheme 'postgress'. Supported: duckdb, postgres,
   reserved characters (`@ : / ? # %`) percent-encoded (`@` → `%40`). MySQL
   accepts `/ # ? :` as they are but needs `@` as `%40` (`malformed MySQL URL;
   expected mysql://user:password@host:port/database (percent-encode an `@` in
-  the password as %40)`). Connection errors do not print the password (tested
-  for PostgreSQL, MySQL and SQL Server).
-- **Unknown options are refused, not ignored**, on MySQL, SQL Server and
-  BigQuery: `unknown mssql connection parameter(s) ['encrypted']; supported:
+  the password as %40)`). Snowflake URLs need `/ ? # @ %` percent-encoded in
+  the password. Connection errors do not print the password (tested for
+  PostgreSQL, MySQL, SQL Server and Snowflake).
+- **Unknown options are refused, not ignored**, on MySQL, SQL Server,
+  BigQuery and Snowflake: `unknown mssql connection parameter(s) ['encrypted']; supported:
   [...]`, `MySQL URL option 'sslmode' is not supported, and an option is
   refused rather than ignored. …`. The message lists what is accepted.
   Snowflake reads only `warehouse` and `role` and **ignores** any other
@@ -161,8 +162,10 @@ parity: [side A] no dialect for scheme 'postgress'. Supported: duckdb, postgres,
   `snowflake-connector-python>=4.0,<5`, because 5.x sends a telemetry batch at
   every logout that no setting stops. If something else in your environment
   upgraded it, reinstall: `pip install "snowflake-connector-python>=4.0,<5"`.
-  Snowflake logs in with user and password only (no SSO, MFA prompt or key
-  pair yet), so an account policy that requires those for the user blocks it.
+  Snowflake logs in with a password or a key pair
+  (`?private_key_file=`, passphrase in `PARITY_SNOWFLAKE_KEY_PASSPHRASE`; see
+  [engines.md](engines.md#snowflake)); SSO and MFA prompts are not supported,
+  so an account policy that requires those for the user blocks it.
 - **BigQuery credentials.** BigQuery uses Application Default Credentials;
   a URL holding a user or password is refused (`bigquery connection string
   must not contain credentials …`). Run `gcloud auth application-default

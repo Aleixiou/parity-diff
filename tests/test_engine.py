@@ -1107,7 +1107,7 @@ def test_a_key_type_that_cannot_match_is_named(key_b, warned):
 
 def test_enum_against_text_is_not_predicted_to_differ():
     """RT-C13: an enum (UNKNOWN) renders its label, exactly the text on the
-    other side; no "will very likely all differ". The planted change is found."""
+    other side; no "expect differences". The planted change is found."""
     a = FakeDialect(
         DictTable(
             [Column("v", LogicalType.UNKNOWN, "USER-DEFINED")], {1: ("x",), 2: ("y",)}
@@ -1120,7 +1120,46 @@ def test_enum_against_text_is_not_predicted_to_differ():
     )
     result = diff(a, b, "a.t", "b.t", "id")
     assert kinds(result) == [(2, "different")]
-    assert not any("very likely all differ" in w for w in result.warnings)
+    assert not any("expect differences" in w for w in result.warnings)
+
+
+def test_a_type_mismatch_warning_says_what_actually_happens(tmp_path):
+    """VARCHAR '1' against BIGINT 1 renders `1` on both sides and compares
+    equal - the warning must not predict that every row differs. It says
+    values match where the texts coincide, and the planted difference (a
+    decimal-looking text that no integer renders) is still found."""
+    from conftest import duckdb_write
+
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+
+    paths = {}
+    for side, ddl, rows in (
+        ("a", "id bigint, v varchar", "(1, '1'), (2, '20'), (3, '3.0')"),
+        ("b", "id bigint, v bigint", "(1, 1), (2, 20), (3, 3)"),
+    ):
+        paths[side] = str(tmp_path / f"{side}.duckdb")
+        con = duckdb_write(paths[side])
+        con.execute(f"create table t ({ddl}); insert into t values {rows}")
+        con.close()
+    a, b = DuckDBDialect(side="A"), DuckDBDialect(side="B")
+    a.connect(f"duckdb:///{paths['a']}")
+    b.connect(f"duckdb:///{paths['b']}")
+    try:
+        result = diff(a, b, "t", "t", "id")
+    finally:
+        a.close()
+        b.close()
+    assert [(d.key, d.kind, d.columns) for d in result.diffs] == [(3, "different", ["v"])]
+    (warning,) = [w for w in result.warnings if w.startswith("column 'v'")]
+    assert warning == (
+        "column 'v' is VARCHAR on side A but BIGINT on side B; values are "
+        "compared as text: a row matches only where both types render the same "
+        "text (integer 1 and text '1' both render 1 and compare equal; decimal "
+        "1.5 renders 1.500000 against text '1.5' and differs), so expect "
+        "differences wherever the spellings diverge, and a match does not mean "
+        "the type change is harmless"
+    )
+    assert "very likely all differ" not in warning
 
 
 def test_a_dialect_closes_itself_as_a_context_manager():

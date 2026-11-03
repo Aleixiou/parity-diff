@@ -5,6 +5,42 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Behaviour change: a sample check that cannot run is no longer
+  "identical".** If the independent sample check was asked for (the default)
+  and its fetch failed, the result used to stay identical with exit 0 and
+  only a `!` line. It is now not identical, exit 1, headed `✗ not proven: the
+  independent sample check could not run: <error>`, with `identical: false`
+  in JSON. `--verify-sample 0` still rests the verdict on the checksums alone
+  - deliberately - and the report now says the check was off (`! independent
+  sample check off (--verify-sample 0) ...`); JSON gains `verify_sample`.
+  Sample-check notes stay non-blocking.
+- **Snowflake key-pair authentication**: `snowflake://user@account/db/schema
+  ?private_key_file=<path>`, the key's passphrase read from
+  `PARITY_SNOWFLAKE_KEY_PASSPHRASE` (or `_A` / `_B` per side), never from the
+  URL. parity loads the PEM RSA key and passes it to the connector as DER
+  bytes with `authenticator=SNOWFLAKE_JWT` and no password; the telemetry
+  switches ride on this login as on a password one. A missing file, a wrong
+  or missing passphrase, a passphrase set for an unencrypted key, a non-RSA
+  key, or a URL with both a password and a key are refused naming the side
+  and the key path - never the key or passphrase. Verified offline against
+  connector 4.x (the connector's own key-pair authenticator signs a JWT the
+  public key verifies); the live test `tests/test_snowflake_keypair.py` runs
+  when `PARITY_TEST_SNOWFLAKE_KEYPAIR` is set.
+- **Snowflake refuses unknown URL parameters**, as MySQL, SQL Server and
+  BigQuery do: anything but `warehouse`, `role` and `private_key_file` - and
+  a repeated or empty one - used to be dropped silently. The error names the
+  side and the parameter and lists the accepted ones. A URL whose password
+  holds an unencoded `/ ? #` is refused too, before any of it reaches the
+  server, and connection errors are scrubbed of the password and passphrase.
+  Password redaction is now tested for Snowflake as for PostgreSQL, MySQL and
+  SQL Server.
+- **The column type-mismatch warning no longer predicts that every row
+  differs.** A VARCHAR `'1'` against a BIGINT `1` compares equal (both render
+  `1`), so "will very likely all differ" was wrong; the warning now says rows
+  match where both types render the same text and differ where they do not,
+  and that a match does not make the type change harmless.
+- CONTRIBUTING no longer says a dialect is about eighty lines (the smallest
+  is about 570).
 - **User documentation restructured** for someone who has never seen the
   tool. The README is now install, a five-minute first try on two DuckDB
   files (no server needed), use on real databases, reading the output, CI,

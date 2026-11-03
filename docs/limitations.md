@@ -275,5 +275,5 @@ BigQuery `und:ci`; the six that changed anything are now pinned or refused.
   ignores `SET TRANSACTION ISOLATION LEVEL`; Synapse dedicated pools read
   uncommitted by default), and neither has been verified.
 - **SQL Server authenticates with SQL logins only** so far (no Windows or
-  Entra ID authentication), and **Snowflake with user and password only** —
-  see [`engines.md`](engines.md).
+  Entra ID authentication), and **Snowflake with a password or a key pair
+  only** (no SSO, OAuth or MFA prompt) — see [`engines.md`](engines.md).

@@ -547,9 +547,12 @@ def _select_columns(
             warnings.append(f"not compared, present only on side {side}: {names}")
 
     # A column whose logical type differs between sides renders through a
-    # different canonical encoding, so every row would report as changed. That
-    # looks like a catastrophic data difference but is really a schema
-    # difference, so name it explicitly.
+    # different canonical encoding. Rows still compare by that text, so they
+    # match wherever the two encodings coincide (BIGINT 1 and VARCHAR '1' both
+    # render `1`) and differ wherever they do not (DECIMAL 1.5 renders
+    # `1.500000`, VARCHAR '1.5' stays `1.5`). Many differences then look like
+    # a catastrophic data change but are a schema change, and a clean run
+    # still hides the type change itself - so name it either way.
     for f in shared:
         name = cols_a[f].name
         ta, tb = cols_a[f].logical_type, cols_b[f].logical_type
@@ -569,7 +572,13 @@ def _select_columns(
                 f"value identically"
             )
             continue
-        warnings.append(f"{what} and will very likely all differ")
+        warnings.append(
+            f"{what}: a row matches only where both types render the same "
+            f"text (integer 1 and text '1' both render 1 and compare equal; "
+            f"decimal 1.5 renders 1.500000 against text '1.5' and differs), so "
+            f"expect differences wherever the spellings diverge, and a match "
+            f"does not mean the type change is harmless"
+        )
 
     # Timezone-awareness is invisible to the logical type - both sides map to
     # TIMESTAMP - but it is a real semantic difference and `timestamptz` to
@@ -1075,6 +1084,7 @@ def diff(
             # A pair mapping a name onto itself (`id=ID`) renames nothing.
             if bf != af and (af in shared or af in key_folds)
         },
+        verify_sample=verify_sample,
     )
 
 

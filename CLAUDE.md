@@ -729,12 +729,22 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   batch at logout that no switch in 5.1.0 stops, so the extra pins
   `>=4.0,<5`; on 4.8.1 a live test confirms only login, query and logout
   endpoints are contacted (`test_a_session_contacts_only_the_account_...`).
+  URL parameters are whitelisted (`URL_PARAMS`), as on MySQL, SQL Server and
+  BigQuery. **Key-pair sign-in** (`?private_key_file=`, passphrase only from
+  `PARITY_SNOWFLAKE_KEY_PASSPHRASE[_A|_B]`, never the URL): parity loads the
+  PEM itself and passes DER bytes with `authenticator=SNOWFLAKE_JWT` and no
+  password, through the same `connect_kwargs` that carries the telemetry pins
+  (pinned offline in `test_snowflake_connect_offline.py`; live test gated on
+  `PARITY_TEST_SNOWFLAKE_KEYPAIR`). No browser or token authenticator.
 - **The walk is checked by a second method** (`engine._verify`,
   `parity/reference.py`). About `verify_sample` rows, chosen by a hash of the
   key text (`fetch_sample`), are fetched as raw driver values and compared in
   Python by the rules - no `normalize` SQL - and must agree with the walk on
   every sampled key; a disagreement is a failure and the result is not
-  identical. It compares by canonical text (`canonical_text`), not by typed
+  identical. A check that was asked for and **could not run**
+  (`verification.error`) is not identical either (exit 1, "not proven"): only
+  `verify_sample=0` rests the verdict on the checksums alone, and the report
+  then says the check was off. It compares by canonical text (`canonical_text`), not by typed
   value, because that is the walk's equality. Driver workarounds live in
   `sample_select`/`sample_value` per dialect, never in the reference. The
   test suite's autouse fixture `_sample_check_never_disagrees` fails any test
@@ -931,8 +941,9 @@ class Dialect(ABC):
 ```
 
 Shared, non-abstract helpers on the base class build `concat_ws(...)` row text,
-the per-segment checksum query, and the small-range row fetch — so a new
-dialect is roughly 80 lines.
+the per-segment checksum query, and the small-range row fetch — so the
+required methods are short, though a verified dialect is several hundred lines
+(DuckDB, the smallest, about 570).
 
 ## 6. Engineering conventions
 

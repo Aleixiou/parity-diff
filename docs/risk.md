@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: bdddfe06334da9ee`
+Source fingerprint: `src-sha256: 3599972b4f280264`
 
 ## Summary
 
@@ -30,6 +30,7 @@ For one run that reports **identical**, on columns the rules cover:
 | An engine renders a value differently from the rules | **0 of 4,142** checks at float scale 6 outside the 26 required refusals (4,116 exact), every type with a rule × 6 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
+| The sample check could not run, and the run reads as checked | **0**: a check that was asked for and failed to fetch its rows makes the run "not proven", never identical (exit 1). Only `--verify-sample 0` rests the verdict on the checksums alone, and the report then says the check was off and computes no risk figure | By design (enforced) |
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
 | A renamed column (`--map`) compared against the wrong counterpart | **0**: pairing is exact, ambiguous maps are refused | By design (tested) |
 | A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
@@ -59,6 +60,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Session settings change how values render | **0** for every pinned setting; round G set every user-settable PostgreSQL setting at each value, MySQL sql_mode, charset, time_zone and init_connect variants, SQL Server collations, ANSI options and 'user options', Snowflake output formats and BigQuery `und:ci`: the 6 that changed anything are now pinned or refused | Measured |
 | Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
 | Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
+| The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
 
@@ -150,7 +152,11 @@ What it does: after the walk, about `--verify-sample` rows (default 10,000;
 all rows of a smaller table), chosen by a hash of the key with a fresh random
 residue each run, are fetched as raw driver values on both sides and compared
 in Python by the rules (`parity/reference.py`), with none of the engine SQL.
-Any disagreement means not identical.
+Any disagreement means not identical, and so does a check that could not
+run (its fetch failed): the run asked for a second method and did not get
+one. With `--verify-sample 0` the check is off by choice, the report says so,
+and the rendering-error row of the summary has no bound for that run - only
+the checksum figures apply.
 
 Chance that a rendering error affecting a share p of rows is **missed** by
 n sampled rows: (1 − p)ⁿ.

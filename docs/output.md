@@ -29,7 +29,7 @@ logs) the same report uses `x = - ?` instead.
 | Code | Meaning |
 |---|---|
 | `0` | identical |
-| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, the independent sample check contradicted the checksums, or the walk stopped at `--max-diffs` |
+| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, the independent sample check contradicted the checksums or could not run, or the walk stopped at `--max-diffs` |
 | `2` | error: bad connection string, missing table, unusable key, a refused value, a database error. The message goes to stderr and starts with `parity:` |
 
 An error is never `1`, so a CI job can always tell "the tables differ" from
@@ -47,6 +47,7 @@ Exactly one of these. `R` is the larger of the two sides' row counts.
 | `✗ schemas differ: no row differences in R rows, but not every column could be compared` | 1 | The shared columns match, but a column exists on one side only, so it was never compared. If the column was added or dropped on purpose, pass it to `--exclude` and re-run; it then becomes a warning. |
 | `✗ not verified: checksums differ in N key ranges that the downloaded rows cannot explain` | 1 | The engines' checksums prove those ranges differ, but the rows downloaded from them compare equal (or a side returned fewer rows than it counted). Something between the database and the comparison altered or hid values: a driver, a row-capping setting, or the table changing mid-run. Re-run on a quiet table; if it persists, report it. |
 | `✗ not verified: the independent sample check found N rows the checksum comparison called equal` | 1 | The second method contradicted the first: the tool's own SQL rendered two different values alike for these data. **Do not trust this comparison**, and please report it with the lines that follow. |
+| `✗ not proven: the independent sample check could not run: <error>` | 1 | The checksums found nothing, but the second method the run asked for never ran (its fetch failed: usually a permission or driver problem, named in the message), so there is no risk figure and no all-clear. Fix the cause and re-run; or, to rest the verdict on the checksums alone on purpose, pass `--verify-sample 0`. |
 
 The order matters: a truncated run always says so first, and a run with any
 row differences leads with the count even if other problems are listed below.
@@ -102,10 +103,12 @@ residue each run, so the exact count varies a little around the target.
 | `! not covered by the sample check (type outside its rules): ['s']` | These columns are of a type the rules do not define (structs, nested lists, geometry, ...). They were compared as raw text by the checksums, but the second method could not check them and **no risk figure covers them**. |
 | `! sample: key 42: reported different in ['note'], which the raw values do not show (a false alarm, or a difference outside the reference rules)` | The walk reported a difference the second method does not see. Not a false match; worth a look. |
 | `! sample: 3 value(s) of column 'x' are outside the reference rules and were not independently checked` | Some values (not the whole column) could not be checked. |
-| `! independent sample check could not run: <error>` | The check failed to fetch its rows. **The verdict then stands on the checksums alone**, with no risk line: the exit code is not changed by this. Fix the cause (usually the message names a driver or permission problem) and re-run if you need the figure. |
+| `✗ not proven: the independent sample check could not run: <error>` then `risk: not computed; ...` | The check failed to fetch its rows. **The result is not identical (exit 1)**: the run asked for a second method and did not get one. Fix the cause (usually the message names a driver or permission problem) and re-run. Up to 0.4.0 this was a `!` warning and the exit code stood on the checksums alone. |
+| `! independent sample check off (--verify-sample 0): the verdict rests on the checksums alone; risk: not computed` | You switched the check off. The verdict and exit code come from the checksums alone, and no risk figure is computed. |
 
-The check is skipped with `--verify-sample 0`, and it does not run when the
-walk stopped early (`--max-diffs`) or both tables are empty.
+The check is skipped with `--verify-sample 0` (and the report says so), and
+it does not run when the walk stopped early (`--max-diffs`) or both tables are
+empty.
 
 ### The risk line
 
@@ -165,7 +168,7 @@ Everything the comparison decided on your behalf. The ones you will meet:
 | `side A (snowflake): Snowflake offers only READ COMMITTED, so each query of the walk sees the table as of its own start, not one snapshot ...` | No single snapshot on this side; rows written during the run can show as differences that never existed, or be missed. Same idea for `database 'x' has ALLOW_SNAPSHOT_ISOLATION OFF ...` (SQL Server), `... is not a base table, and BigQuery ignores time travel on a view ...` and `table t uses the MyISAM storage engine, which has no transactions ...` (MySQL). | Diff a quiet table, a clone or a snapshot; or re-run and see whether the differences move. On SQL Server, turn on `ALLOW_SNAPSHOT_ISOLATION`. |
 | `side A (postgres): row-level security filters public.t for this role: rows its policies hide are not compared at all ...` | Rows hidden by RLS were never compared. | Diff as a role with `BYPASSRLS`. |
 | `... columns ['ts'] hold nanoseconds and the other side microseconds only; they are compared at microseconds ...` (also `hold 100-nanosecond ticks` on SQL Server, `can hold nanoseconds` on Snowflake) | Differences below one microsecond are not seen. | Nothing, if microseconds are what the target holds. |
-| `column 'v' is VARCHAR on side A but BIGINT on side B; values are compared as text and will very likely all differ` | The column's type changed in the migration. Values compare by canonical text, so they match only where both types print the same text (here they did: `'1'` and `1`). | If every row differs, cast one side in a view. |
+| `column 'v' is VARCHAR on side A but BIGINT on side B; values are compared as text: a row matches only where both types render the same text ...` | The column's type changed in the migration. Values compare by canonical text, so they match where both types print the same text (`'1'` and `1` both print `1`, and compare equal) and differ where they do not (`'1.5'` against a DECIMAL `1.500000`). A clean run therefore does not mean the type change is harmless: the values print alike, but whatever reads the column downstream still sees the new type. | If many rows differ, cast one side in a view. |
 | `key column 'id' is VARCHAR on side A but BIGINT on side B; ... every row will report as only in A and only in B` | The key cannot match across these types. | Compare through a view that casts one side's key. |
 | `column 'ts' is timezone-aware on side A but not on side B; both are read in UTC, so a migration that stored local wall-clock time rather than UTC will show every row as different` | `timestamptz` → `timestamp` is a common migration change. | If every row differs by a whole number of hours, the target stored local time: convert in a view. |
 | `non-integer key (VARCHAR): bucketed by a 60-bit hash of ['code']. Rows are still matched and reported by their real key ...` (also `composite key: ...`) | Informational: how the key space is divided. | Nothing. |
@@ -219,6 +222,7 @@ in every one of those cases.
     "checked": ["amount", "ordered_on", "status"], "unchecked": [],
     "failures": [], "notes": [], "error": null
   },
+  "verify_sample": 1000,
   "risk": {
     "confidence": 0.999,
     "checksum_collision_bound": 8.673617379884035e-19,
@@ -255,11 +259,12 @@ with `--verify-sample 1000`, reflowed.)
 
 | Field | |
 |---|---|
-| `identical` | `true` only if no row differed, no column exists on one side only, every checksum mismatch was explained, the sample check found no contradiction, and the whole key space was walked. |
+| `identical` | `true` only if no row differed, no column exists on one side only, every checksum mismatch was explained, the sample check (when on) ran and found no contradiction, and the whole key space was walked. |
 | `truncated` | The walk stopped at `--max-diffs`; the result is partial. |
 | `schema_differences` | Columns one side lacks that were not set aside. |
 | `unexplained` | Key ranges (or row counts) the downloaded rows could not account for. |
-| `verification` | The sample check: which rows (`modulus`, `residue` — every row whose key hash ≡ `residue` mod `modulus`), how many per side, the `checked` and `unchecked` columns, `failures`, `notes`, `error`. `null` when skipped or when the walk stopped early. |
+| `verification` | The sample check: which rows (`modulus`, `residue` — every row whose key hash ≡ `residue` mod `modulus`), how many per side, the `checked` and `unchecked` columns, `failures`, `notes`, `error`. `null` when skipped or when the walk stopped early. A non-empty `failures` or a non-null `error` makes `identical` false. |
+| `verify_sample` | The sample size asked for; `0` means the check was switched off with `--verify-sample 0`. |
 | `risk` | The risk line's figures as numbers. `max_hidden_fraction` / `max_hidden_rows` are `null` when the check failed, could not run or was skipped; `0` when every row was compared. |
 | `difference_count`, `differences` | Every difference (not capped at 100). `key` is an integer for an integer key, otherwise the key's canonical text, with composite parts joined by chr(31). `a` / `b` hold the canonical text of each side's values: `\N` is NULL, a backslash in text is doubled and chr(31) is written `\s` — the exact bytes the engines hashed. For `only_in_*`, the missing side is `{}`. |
 | `float_scale`, `columns_compared`, `warnings` | As in the human report. |
