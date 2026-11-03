@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from typing import Any, TextIO
 
 from parity import __version__
-from parity.dialects.base import NULL_SENTINEL
+from parity.dialects.base import decode_canonical_field
 from parity.engine import DEFAULT_MAX_DIFFS
 from parity.types import DiffResult, LogicalType, RowDiff
 
@@ -263,14 +263,18 @@ def _display(value: str, quoted: bool = True) -> str:
     report nobody can act on. Quoting also escapes newlines and terminal
     control sequences (see `_escape`).
 
-    The value is the canonical text the engines compared, and `NULL_SENTINEL`
-    is how that text spells NULL. JSON output keeps the raw canonical text.
+    The value is the canonical text the engines compared, in which text is
+    escaped (`\\` doubled, chr(31) as `\\s`) so that no value can spell the
+    NULL sentinel. It is decoded back first, so `C:\\x` prints as the user
+    stored it and a real `'\\N'` string prints quoted, never as NULL (RT-A15).
+    JSON output keeps the raw canonical text.
     """
-    if value == NULL_SENTINEL:
+    decoded = decode_canonical_field(value)
+    if decoded is None:
         return "NULL"
     if quoted:
-        return repr(value)
-    return _escape(value)
+        return repr(decoded)
+    return _escape(decoded)
 
 
 def _display_key(key: int | str) -> str:

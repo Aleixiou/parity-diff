@@ -736,3 +736,22 @@ def test_an_error_quoting_unencodable_data_still_reaches_stderr(base):
     err.flush()
     assert code == EXIT_ERROR
     assert rb"\u6771" in raw.getvalue() and b"side A" in raw.getvalue()
+
+
+def test_human_report_decodes_escaped_text_and_never_shows_backslash_n_as_null():
+    r"""Canonical text escapes `\` and chr(31) so that no value can spell the
+    NULL sentinel. The human report must undo that: a stored `C:\x` prints as
+    itself, the two characters `\N` print quoted (not as NULL - RT-A15), a
+    real NULL prints bare, and a composite key with a chr(31) inside one part
+    shows that part intact rather than split in two.
+    """
+    from parity.cli import _display, _display_key
+    from parity.dialects.base import NULL_SENTINEL, escape_canonical_text
+
+    bs = chr(92)
+    for stored in (f"C:{bs}x", f"{bs}N", f"{bs}{bs}s"):
+        assert _display(escape_canonical_text(stored)) == repr(stored)
+    assert _display(NULL_SENTINEL) == "NULL"
+    part = f"a{chr(31)}b"
+    key = chr(31).join([escape_canonical_text(part), escape_canonical_text("c")])
+    assert _display_key(key) == f"{part!r} | 'c'"
