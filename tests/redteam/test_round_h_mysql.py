@@ -928,3 +928,116 @@ def test_storage_engines_without_transactions_are_compared_with_a_caveat(tables,
     assert found(r) == [(2, "different", ("v",))]
     caveats = " ".join(r.warnings)
     assert "ARCHIVE" in caveats and "CSV" in caveats
+
+
+# ====================================================================
+# Versions: RT-HM1/HM2/HM4 on MySQL 8.0, 8.4 and 9.x (Docker)
+# ====================================================================
+
+#: Plain logins on `rth-mysql-80`, `rth-mysql-84` and `rth-mysql-97` (9.7,
+#: component_classic_hashing installed by root so MD5() exists).
+VERSION_URLS = [
+    u.strip()
+    for u in os.environ.get(
+        "PARITY_RTH_MYSQL_VERSIONS",
+        "mysql://rth:rth@127.0.0.1:13480/rth,mysql://rth:rth@127.0.0.1:13484/rth,"
+        "mysql://rth:rth@127.0.0.1:13497/rth",
+    ).split(",")
+]
+
+VERSION_CASES = [
+    ("sjis", "v varchar(10) character set sjis", "_sjis x'F040'", "_sjis x'F041'"),
+    ("ucs2", "v varchar(10) character set ucs2", "_ucs2 x'D83DDE00'", "_ucs2 x'D83DDE01'"),
+]
+
+
+@pytest.mark.xfail(strict=True, reason="RT-HM1/RT-HM2: lossy conversion on every version")
+@pytest.mark.parametrize("url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0])
+@pytest.mark.parametrize(("label", "col", "va", "vb"), VERSION_CASES, ids=[c[0] for c in VERSION_CASES])
+def test_rt_hm1_hm2_on_every_version(tables, url, label, col, va, vb):
+    r = _mysql_pair(
+        tables, url, f"id int primary key, {col}",
+        [f"insert into {{t}} values (1, {va}), (2, 'same')"],
+        [f"insert into {{t}} values (1, {vb}), (2, 'same')"],
+        tag=f"ver_{label}",
+    )  # fmt: skip
+    assert found(r) == [(1, "different", ("v",))]
+
+
+@pytest.mark.parametrize("url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0])
+def test_identifiers_are_case_sensitive_on_a_case_sensitive_server(tables, url):
+    """lower_case_table_names=0 (Linux): `t_Case` and `t_case` are two tables,
+    and each side's columns come from exactly the one it names."""
+    conn = mysql_connect(url)
+    try:
+        if mysql_run(conn, "select @@lower_case_table_names")[0][0][0] != 0:
+            pytest.skip("this server folds table names")
+    finally:
+        conn.close()
+    up = tables(url, "Case", "id int primary key, upper_only int, v int",
+                "insert into {t} values (1, 0, 10), (2, 0, 20)")  # fmt: skip
+    low = tables(url, "case", "id int primary key, v int, lower_only int",
+                 "insert into {t} values (1, 10, 0), (2, 21, 0)")  # fmt: skip
+    r = run_diff(get_dialect(url, side="A"), get_dialect(url, side="B"), up, low)
+    assert found(r) == [(2, "different", ("v",))]
+    assert r.schema_differences == [
+        "not compared, present only on side A: ['upper_only']",
+        "not compared, present only on side B: ['lower_only']",
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM14: a MySQL 9 VECTOR column kills the run with 'Incorrect arguments to cast_as_char'",
+)
+def test_rt_hm14_vector_column_is_compared_or_refused_by_name(tables):
+    """MySQL 9 added VECTOR. It is unmapped, so it falls through to
+    `cast(c as char)`, which MySQL refuses for a vector (error 1210) - the
+    first checksum dies naming neither the column nor the type. Rendering it
+    like binary (its stored floats as hex) or refusing it by name up front,
+    with --exclude as the way out, would both do."""
+    url = VERSION_URLS[-1]
+    conn = mysql_connect(url)
+    try:
+        if not mysql_run(conn, "select version()")[0][0][0].startswith("9."):
+            pytest.skip("VECTOR needs MySQL 9")
+    finally:
+        conn.close()
+    ddl = "id int primary key, v vector(2)"
+    ta = tables(url, "vec_a", ddl, "insert into {t} values (1, string_to_vector('[1,2]')), "
+                "(2, string_to_vector('[1,2]'))")  # fmt: skip
+    tb = tables(url, "vec_b", ddl, "insert into {t} values (1, string_to_vector('[1,2]')), "
+                "(2, string_to_vector('[1,3]'))")  # fmt: skip
+    try:
+        r = run_diff(get_dialect(url, side="A"), get_dialect(url, side="B"), ta, tb)
+    except ValueError as exc:
+        assert "'v'" in str(exc) and "vector" in str(exc).lower()
+        return
+    assert found(r) == [(2, "different", ("v",))]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM15: a table the login may not read is reported as 'table not found'",
+)
+def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
+    """MySQL hides a table the login holds no privilege on from
+    information_schema, so the tool says `table not found: t (looked in
+    schema 'rth')` - sending the user to check the name instead of the
+    grants. A `select 1 from t limit 0` probe answers 1142 'SELECT command
+    denied', which is what `_exists_but_unreadable` exists to report."""
+    t = tables(ROOT80, "nogrant", "id int primary key, v int", "insert into {t} values (1, 1)")
+    other = tables(ROOT80, "granted", "id int primary key")
+    user = f"rth_ng_{RUN}"
+    mysql_run(
+        root80,
+        f"drop user if exists {user}@'%'",
+        f"create user {user}@'%' identified by 'rthng'",
+        f"grant select on rth.{other} to {user}@'%'",
+    )
+    url = f"mysql://{user}:rthng@127.0.0.1:13480/rth"
+    try:
+        with pytest.raises(ValueError, match=r"side A.*(denied|privilege|permission)"):
+            run_diff(get_dialect(url, side="A"), get_dialect(USER80, side="B"), t, t)
+    finally:
+        mysql_run(root80, f"drop user if exists {user}@'%'")
