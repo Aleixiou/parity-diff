@@ -124,6 +124,29 @@ range, for data not crafted to collide). They cover the columns the sample
 check covers, and nothing the documented rules ignore on purpose. How to quote
 them to someone else: [`risk.md`](risk.md).
 
+### Filtered runs (`--where`, `--a-where`, `--b-where`)
+
+```
+✓ no differences in 1,204 rows (filtered rows only)
+  filtered: A where created_at >= '2026-10-01'; B where created_at >= '2026-10-01'
+```
+
+A filtered verdict covers only the rows the predicates select: nothing is
+proven about the rest of the table. The headline says `(filtered rows only)`,
+the `filtered:` line names each side's predicate (`whole table` for a side
+without one), the risk figures count filtered rows, and JSON carries
+`where_a`, `where_b` and `risk.filtered`. A caveat warns that a predicate
+which changes during the run (`random()`, `clock_timestamp()`, or `now()`
+without one snapshot) can select different rows in different queries; the
+run then reports those ranges as unexplained, never identical. A separate
+warning appears when only one side is filtered.
+
+### Renamed columns (`--map`)
+
+A renamed column is reported under side A's name with side B's beside it,
+`customer_name (B: cust_nm)`, after a `renamed columns:` line; JSON carries
+`column_map` and per-row `b_columns`.
+
 ### Float scale
 
 ```

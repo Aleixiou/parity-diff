@@ -13,9 +13,10 @@ differ, and only once those ranges are small.
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import random
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import contextmanager
@@ -230,6 +231,117 @@ def _fold_columns(columns: list[Column], side: str, table: str) -> dict[str, Col
     return out
 
 
+def _near(name: str, cols: dict[str, Column]) -> str:
+    """` Did you mean ...?` for a column name not found, or nothing."""
+    by_fold = {f: c.name for f, c in cols.items()}
+    close = difflib.get_close_matches(name.casefold(), list(by_fold), n=3, cutoff=0.6)
+    if not close:
+        return ""
+    return f" Did you mean {' or '.join(repr(by_fold[f]) for f in close)}?"
+
+
+def _apply_column_map(
+    column_map: Mapping[str, str],
+    cols_a: dict[str, Column],
+    cols_b: dict[str, Column],
+    a_table: str,
+    b_table: str,
+    exclude: Sequence[str],
+    columns: Sequence[str] | None,
+) -> tuple[dict[str, Column], dict[str, str]]:
+    """Re-key side B's columns so a renamed column matches its side-A name.
+
+    `--map a_name=b_name` says B's `b_name` holds what A calls `a_name`. Every
+    later step matches columns by the folded name they are keyed under (see
+    `_fold_columns`), so re-keying B's column under A's folded name is all
+    the pairing needs: the key, `--columns`, `--exclude`, the compared column
+    list and its order all follow from A's names alone, and each side still
+    quotes its own stored name. Matching stays case-insensitive.
+
+    Returns side B's re-keyed columns and `{b_fold: a_fold}` for the mapped
+    pairs. Anything that would make the pairing ambiguous is refused, never
+    resolved by a guess - two A columns onto one B column, a mapped B column
+    that a same-named A column would also claim, a B column still matching a
+    mapped A column by name - because a column compared against the wrong
+    counterpart is a wrong verdict on every row.
+    """
+    a_to_b: dict[str, str] = {}
+    b_to_a: dict[str, str] = {}
+    for a_name, b_name in column_map.items():
+        a_name, b_name = a_name.strip(), b_name.strip()
+        if not a_name or not b_name:
+            raise ValueError(f"--map needs a_name=b_name, got {a_name!r}={b_name!r}")
+        af, bf = a_name.casefold(), b_name.casefold()
+        if af not in cols_a:
+            raise ValueError(
+                f"[side A] --map names column {a_name!r}, which is not in "
+                f"{a_table}.{_near(a_name, cols_a)} Columns are: "
+                f"{sorted(c.name for c in cols_a.values())}"
+            )
+        if bf not in cols_b:
+            raise ValueError(
+                f"[side B] --map names column {b_name!r}, which is not in "
+                f"{b_table}.{_near(b_name, cols_b)} Columns are: "
+                f"{sorted(c.name for c in cols_b.values())}"
+            )
+        if a_to_b.get(af, bf) != bf:
+            raise ValueError(
+                f"--map pairs side A's {cols_a[af].name!r} with two side B "
+                f"columns: {cols_b[a_to_b[af]].name!r} and {cols_b[bf].name!r}"
+            )
+        if b_to_a.get(bf, af) != af:
+            raise ValueError(
+                f"--map pairs two side A columns, {cols_a[b_to_a[bf]].name!r} and "
+                f"{cols_a[af].name!r}, with one side B column {cols_b[bf].name!r}"
+            )
+        a_to_b[af], b_to_a[bf] = bf, af
+
+    excluded = {e.casefold() for e in exclude}
+    for af, bf in a_to_b.items():
+        if af in excluded:
+            raise ValueError(
+                f"--map and --exclude both name {cols_a[af].name!r}: leave it out "
+                f"of one of them"
+            )
+        # A's column of B's name, left unmapped, would have matched B's
+        # column by name - which the map gives to another A column.
+        if bf != af and bf in cols_a and bf not in a_to_b and bf not in excluded:
+            raise ValueError(
+                f"--map pairs side B's {cols_b[bf].name!r} with side A's "
+                f"{cols_a[af].name!r}, but side A also has a column "
+                f"{cols_a[bf].name!r}, which would otherwise have matched it by "
+                f"name. Map side A's {cols_a[bf].name!r} too, or --exclude it"
+            )
+    # --exclude and --columns take side A's names. A mapped B name that is
+    # not also an A name is a slip - say which name to use instead.
+    for flag, names in (("--exclude", exclude), ("--columns", columns or ())):
+        for n in names:
+            f = n.casefold()
+            if f in b_to_a and f not in cols_a and f != b_to_a[f]:
+                raise ValueError(
+                    f"{flag} names {n!r}, side B's name for side A's "
+                    f"{cols_a[b_to_a[f]].name!r} (renamed by --map); {flag} "
+                    f"takes side A's names"
+                )
+
+    rekeyed: dict[str, Column] = {}
+    for f, c in cols_b.items():
+        k = b_to_a.get(f, f)
+        if k in rekeyed:
+            # Only reachable when an unmapped B column carries the name of a
+            # mapped A column: both would pair with A's column.
+            other = rekeyed[k]
+            mapped, by_name = (other, c) if f == k else (c, other)
+            raise ValueError(
+                f"--map pairs side A's {cols_a[k].name!r} with side B's "
+                f"{mapped.name!r}, but side B also has a column {by_name.name!r}, "
+                f"which matches it by name. Map side B's {by_name.name!r} too "
+                f"(to the A column it holds), or compare through a view"
+            )
+        rekeyed[k] = c
+    return rekeyed, b_to_a
+
+
 def _resolve_key(
     key: str | Sequence[str],
     cols_a: dict[str, Column],
@@ -275,6 +387,11 @@ def _resolve_key(
             raise ValueError(
                 f"[side {side}] key column(s) {missing} not in {table}. "
                 f"Columns are: {sorted(c.name for c in cols.values())}"
+                + (
+                    ". If side B renamed it, pair the two with --map A_COL=B_COL"
+                    if side == "B"
+                    else ""
+                )
             )
 
     a_key = tuple(cols_a[n.casefold()] for n in names)
@@ -506,6 +623,9 @@ def diff(
     threshold: int = 10_000,
     max_diffs: int | None = DEFAULT_MAX_DIFFS,
     verify_sample: int = DEFAULT_VERIFY_SAMPLE,
+    where_a: str | None = None,
+    where_b: str | None = None,
+    column_map: Mapping[str, str] | None = None,
 ) -> DiffResult:
     """Compare ``a_table`` on side ``a`` with ``b_table`` on side ``b``.
 
@@ -513,6 +633,15 @@ def diff(
     the raw values the drivers return, by the documented rules in Python
     (`parity.reference`) - an independent second opinion that a mistake in a
     dialect's SQL cannot fool. ``verify_sample=0`` switches it off.
+
+    ``where_a`` / ``where_b`` filter each side's rows by a SQL predicate in
+    that engine's own dialect: only matching rows are compared, and every
+    query that reads the table applies it (`Dialect.rows_from`). The verdict
+    is about the filtered rows only, and the result says so.
+
+    ``column_map`` pairs renamed columns, ``{a_name: b_name}``: side B's
+    ``b_name`` is compared with side A's ``a_name``. ``key``, ``columns`` and
+    ``exclude`` take side A's names; differences are reported under them.
 
     The caller owns both dialects and must close them, whether this returns
     or raises: `diff` never closes what it was handed, so a dialect can be
@@ -541,6 +670,17 @@ def diff(
     # Checked before any query: two sides rounding floats differently would
     # report every float row as changed.
     require_matching_scales(a, b)
+    # A row filter is checked before any query, on the side that runs it.
+    for dialect, where in ((a, where_a), (b, where_b)):
+        if where is not None:
+            dialect.check_where(where)
+    where_a = where_a.strip() if where_a else None
+    where_b = where_b.strip() if where_b else None
+    # Passed to the four queries that read rows, and only when set, so an
+    # unfiltered run makes exactly the calls - and emits exactly the SQL -
+    # it always did.
+    wa: tuple[str, ...] = (where_a,) if where_a else ()
+    wb: tuple[str, ...] = (where_b,) if where_b else ()
 
     # Both sides in parallel from here on. One pool for the whole walk - the
     # comparison is almost entirely IO-wait on two independent engines.
@@ -577,6 +717,14 @@ def diff(
         # keeps its own Column, with its real stored name, for quoting in SQL.
         cols_a = _fold_columns(cols_a_list, "A", a_table)
         cols_b = _fold_columns(cols_b_list, "B", b_table)
+        # Renamed columns: side B's are re-keyed under side A's folded
+        # names, so everything below pairs them exactly as it pairs columns
+        # that kept their name - in the same position of the row text.
+        b_to_a: dict[str, str] = {}
+        if column_map:
+            cols_b, b_to_a = _apply_column_map(
+                column_map, cols_a, cols_b, a_table, b_table, exclude, columns
+            )
         # Introspection is metadata, not a scan; do not inflate the query count
         # users read as "how much work did this cost".
         stats.queries -= 2
@@ -641,8 +789,9 @@ def diff(
             exact_keys = [dataclasses.replace(c, sub_micro=True) for c in key_cols]
             for note in dialect.caveats([*exact_keys, *cols]):
                 warnings.append(f"side {side} ({dialect.name}): {note}")
+        warnings.extend(_filter_caveats(a, b, where_a, where_b))
 
-        ks_a, ks_b = both("key_stats", key_a, _args_b=(key_b,))
+        ks_a, ks_b = both("key_stats", key_a, *wa, _args_b=(key_b, *wb))
 
         # A non-unique key is fatal, not a warning: `fetch_range` maps key to
         # row, so duplicates collapse and their differences disappear.
@@ -687,7 +836,8 @@ def diff(
                 s_lo,
                 s_hi,
                 n,
-                _args_b=(key_b, b_cols, s_lo, s_hi, n),
+                *wa,
+                _args_b=(key_b, b_cols, s_lo, s_hi, n, *wb),
             )
 
         def compare(
@@ -711,7 +861,8 @@ def diff(
                 a_cols,
                 r_lo,
                 r_hi,
-                _args_b=(key_b, b_cols, r_lo, r_hi),
+                *wa,
+                _args_b=(key_b, b_cols, r_lo, r_hi, *wb),
             )
             stats.rows_downloaded += len(rows_a) + len(rows_b)
             found = _compare_rows(rows_a, rows_b, [c.name for c in a_cols], diffs)
@@ -766,7 +917,46 @@ def diff(
         if bounds:
             # Half-open [lo, hi): +1 so the largest key is inside the range.
             lo, hi = min(bounds), max(bounds) + 1
-            queue: list[tuple[int, int]] = [(lo, hi)]
+            #: Each range to walk, with both sides' (count, checksum) for it
+            #: from the level above - None for the whole range.
+            queue: list[tuple[int, int, tuple[Any, Any] | None]] = [(lo, hi, None)]
+
+            def check_level(
+                s_lo: int,
+                s_hi: int,
+                cs_a: dict[int, tuple[int, int]],
+                cs_b: dict[int, tuple[int, int]],
+                parent: tuple[Any, Any] | None,
+            ) -> None:
+                """A range's buckets must add up, count and checksum alike, to
+                what the level above measured for the whole range: the sums
+                are exact and the buckets tile the range. On one snapshot
+                with a deterministic filter they always do. When they do not,
+                the rows changed between the two queries - a row filter with
+                random() or clock_timestamp(), or a live table on an engine
+                without one snapshot - and a difference seen above could
+                vanish below without a trace. Never identical, then."""
+                if parent is None:
+                    return
+                for side, table, cs, want in (
+                    ("A", a_table, cs_a, parent[0]),
+                    ("B", b_table, cs_b, parent[1]),
+                ):
+                    got = (
+                        sum(c for c, _ in cs.values()),
+                        sum(h for _, h in cs.values()),
+                    )
+                    if got != tuple(want):
+                        other = " with another checksum" if got[0] == want[0] else ""
+                        unexplained.append(
+                            f"{what} [{s_lo}, {s_hi}): side {side} ({table}) "
+                            f"counted {want[0]:,} row(s) there at one level of "
+                            f"the walk, but its buckets at the next add up to "
+                            f"{got[0]:,} row(s){other}: "
+                            f"its rows changed between two queries (a row filter "
+                            f"that is not stable, or a table written during the "
+                            f"run), so this range is unverified"
+                        )
 
             def limit_reached() -> bool:
                 """Whether enough differences have been collected to stop."""
@@ -777,7 +967,7 @@ def diff(
                     unchecked += len(queue)
                     break
 
-                s_lo, s_hi = queue.pop()
+                s_lo, s_hi, parent = queue.pop()
                 span = s_hi - s_lo
                 if span <= 0:
                     continue
@@ -802,6 +992,7 @@ def diff(
                 cs_a, cs_b = checksums(s_lo, s_hi, n)
                 if (s_lo, s_hi) == (lo, hi):
                     check_totals(cs_a, cs_b)
+                check_level(s_lo, s_hi, cs_a, cs_b, parent)
 
                 differing = [
                     i for i in range(n) if cs_a.get(i, EMPTY) != cs_b.get(i, EMPTY)
@@ -819,7 +1010,7 @@ def diff(
                     if max(va[0], vb[0]) <= threshold or b_hi_i - b_lo_i <= 1:
                         compare(b_lo_i, b_hi_i, va, vb)
                     else:
-                        queue.append((b_lo_i, b_hi_i))
+                        queue.append((b_lo_i, b_hi_i, (va, vb)))
 
         verification: Verification | None = None
         complete = not unchecked and (max_diffs is None or len(diffs) <= max_diffs)
@@ -837,7 +1028,8 @@ def diff(
                     a_cols,
                     modulus,
                     residue,
-                    _args_b=(key_b, b_cols, modulus, residue),
+                    *wa,
+                    _args_b=(key_b, b_cols, modulus, residue, *wb),
                 )
             except ValueError as exc:
                 verification.error = str(exc)
@@ -875,7 +1067,46 @@ def diff(
         schema_differences=schema_differences,
         unexplained=unexplained,
         verification=verification,
+        where_a=where_a,
+        where_b=where_b,
+        column_map={
+            cols_a[af].name: cols_b[af].name
+            for bf, af in b_to_a.items()
+            # A pair mapping a name onto itself (`id=ID`) renames nothing.
+            if bf != af and (af in shared or af in key_folds)
+        },
     )
+
+
+def _filter_caveats(
+    a: Dialect, b: Dialect, where_a: str | None, where_b: str | None
+) -> list[str]:
+    """What a row filter does to the verdict, for the output (CLAUDE.md 8).
+
+    A filtered "identical" is a statement about the filtered rows only, and
+    a filter re-evaluated by every query is only as stable as its
+    expression - so both are said on every filtered run, not left to the docs.
+    """
+    out: list[str] = []
+    for side, dialect, where in (("A", a, where_a), ("B", b, where_b)):
+        if where:
+            out.append(
+                f"side {side} ({dialect.name}) is filtered by ({where}): only "
+                f"the rows it selects are compared, so this result says nothing "
+                f"about the rest of the table. Each query evaluates it afresh: "
+                f"an expression that can change during the run (random(), "
+                f"clock_timestamp(), or now() and current_date on an engine "
+                f"without one snapshot) can select different rows in different "
+                f"queries - prefer fixed literals"
+            )
+    if bool(where_a) != bool(where_b):
+        only, other = ("A", "B") if where_a else ("B", "A")
+        out.append(
+            f"only side {only} is filtered: side {other}'s whole table is "
+            f"compared with side {only}'s filtered rows, so every side {other} "
+            f"row outside the filter reads as only in {other}"
+        )
+    return out
 
 
 def _verify(

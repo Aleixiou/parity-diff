@@ -134,7 +134,8 @@ machine-readable form.
 
 ```
 parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
-            [--columns a,b,c] [--exclude x,y]
+            [--columns a,b,c] [--exclude x,y] [--map a_col=b_col[,...]]
+            [--where SQL] [--a-where SQL] [--b-where SQL]
             [--bisection-factor 32] [--threshold 10000] [--float-scale 6]
             [--max-diffs 10000] [--verify-sample 10000] [--json] [--quiet]
 ```
@@ -145,6 +146,8 @@ parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
 | `--a-table`, `--b-table` | the table on each side; `schema.table`, or unqualified for the engine's default schema. Matched exactly, including case |
 | `--key` | the column(s) that identify a row, on both sides (matched case-insensitively). One integer column is bisected directly; a uuid, a text key or several columns are hashed. Must be unique and non-NULL |
 | `--columns` / `--exclude` | compare only these columns / skip these. Default: every column both sides share |
+| `--map` | pair a renamed column: `a_col=b_col` (side A's name = side B's); see *Renamed columns* below |
+| `--where` / `--a-where` / `--b-where` | compare only the rows a predicate selects, on both sides or on one; the verdict then covers those rows only (see *Comparing a slice* below) |
 | `--float-scale` | decimal places at which floats and decimals are compared (default 6), always the same on both sides |
 | `--max-diffs` | stop after N differences (default 10,000; `0` for no limit). The result is then marked partial |
 | `--verify-sample` | rows for the independent sample check (default 10,000; `0` skips it) |
@@ -182,6 +185,54 @@ An error is never `1`. A CI job can always tell "the tables differ" from "the
 tool could not run". A column added or dropped on purpose is a schema
 difference until you say so: pass it to `--exclude` (or leave it out of
 `--columns`) and it becomes a warning instead.
+
+### Comparing a slice: `--where`
+
+`--where SQL` compares only the rows matching a predicate, on both sides;
+`--a-where` / `--b-where` give one side its own predicate and replace
+`--where` there. Each is that engine's own SQL over that side's own column
+names (a column renamed with `--map` keeps its side B name here). Use it to check last week, or one
+partition, without paying for a full pass over a huge BigQuery or Snowflake
+table:
+
+```
+parity diff ... --key order_id --where "created_at >= '2026-10-01'"
+```
+
+The predicate is pasted, in parentheses and ANDed with the tool's own
+conditions, into every query that reads the table: the row count and key
+checks, every checksum level, every download and the sample check. **A
+filtered verdict is about the filtered rows only**: the headline says
+`(filtered rows only)`, a `filtered: A where ...; B where ...` line follows,
+JSON carries `where_a`/`where_b`, and the risk figures count filtered rows.
+Each query evaluates the predicate afresh, so prefer fixed literals: an
+expression that changes during the run (`random()`, `clock_timestamp()`,
+or `now()` / `current_date` on an engine without one snapshot) can select
+different rows in different queries, which the run reports as unverified.
+Sessions are pinned to UTC, so a literal compared with a timezone-aware
+column is read as UTC; on PostgreSQL `search_path` is pinned to
+`pg_catalog`, so qualify any table a subquery names.
+
+It is your own SQL against your own database, so this is not a security
+boundary, but it must stay one read: a predicate containing `;`, `--`, `/*`,
+`#`, a backslash before a quote, a triple- or dollar-quoted string, or
+unbalanced quotes or parentheses is refused before any query (on SQL Server
+also `"` and the words the dialect's SELECT guard refuses). The sessions are
+read-only besides. From Python: `diff(..., where_a=..., where_b=...)`.
+
+### Renamed columns: `--map`
+
+`--map a_col=b_col` pairs a column the migration renamed: side B's `b_col`
+is compared with side A's `a_col`. Repeat it, or comma-separate pairs
+(`--map customer_name=cust_nm,amount=amt`). It works for key columns too
+(`--key id --map id=order_id`). `--key`, `--columns` and `--exclude` take
+side A's names, differences are reported under them, and the report names
+both sides (`customer_name (B: cust_nm)`; JSON `column_map` and per-row
+`b_columns`). Matching stays case-insensitive. A mapping that would pair a
+column twice — two A columns onto one B column, or a B column the map claims
+while a same-named column still matches it by name — is refused, as is a
+mapped name absent on its side (with near misses listed) and a column both
+mapped and excluded. From Python: `diff(..., column_map={"a_col": "b_col"})`.
 
 ## Reading the output
 

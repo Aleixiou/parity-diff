@@ -820,6 +820,41 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,
   not defended: a keyed or non-linear checksum would be the defence.
+- **A row filter reaches every query that reads the table, or none**
+  (`--where`, 2026-11-03). Every row-reading query - `key_stats`,
+  `_segment_sql`, `fetch_range`, `fetch_sample` - names its table through
+  `Dialect.rows_from`, which puts `(<predicate>)` first in the WHERE, ANDed
+  with the tool's own bounds; a dialect overriding one of those four must
+  pass `where` through (SQL Server's `_segment_sql`/`segment_checksums` do).
+  `tests/test_where_sql.py` records every statement on all six dialects and
+  fails on one without the predicate. The engine passes `where` only when
+  set, so unfiltered SQL is byte-identical. The predicate is the user's own
+  SQL, so not a security boundary, but it must stay one read:
+  `row_filter_problem` refuses `;`, comments (incl. MySQL `#`), and what
+  engines quote differently (a backslash before a quote, `'''`, `$$`), then
+  checks quotes, `[...]` and parentheses balance, so `1=1) or (1=1` cannot
+  escape; `check_where` adds SQL Server's SELECT guard. A filtered verdict
+  covers the filtered rows only and says so in the headline, a `filtered:`
+  line, JSON `where_a`/`where_b`, `risk.filtered` and a caveat.
+- **Each level of the walk must add up to the level above** (found by the
+  `--where` work). A queued range carries both sides' (count, checksum)
+  from its parent bucket; its buckets must sum to exactly that, per side,
+  or the range is unexplained. Without it a difference seen at one level
+  could leave an unstable filter (`random()`, `clock_timestamp()`) or be
+  rewritten on an engine without one snapshot before the next level looked,
+  and the run read identical with the evidence discarded. Exact (sums are
+  exact, buckets tile the range), so a single-snapshot run never trips it.
+- **Renamed columns are re-keyed, never re-ordered** (`--map`). Side B's
+  folded column dict is re-keyed under side A's folded names
+  (`_apply_column_map`) before key resolution and column selection, so the
+  compared list, its order and the key all follow from A's names and a
+  mapped B column lands in A's position of the row text. Ambiguity is
+  refused, never guessed: a name absent on its side, one A column onto two
+  B columns or two onto one, a mapped B column a same-named column would
+  still match, a column both mapped and excluded, `--exclude`/`--columns`
+  by B's name. A swap (`x=y,y=x`) is legal and pinned by tests both ways
+  (swapped data matches except the plant; unswapped data differs on every
+  row). Differences carry A's name; `DiffResult.column_map` gives B's.
 
 ## 5. Architecture
 

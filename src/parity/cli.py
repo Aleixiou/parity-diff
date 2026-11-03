@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from typing import Any, TextIO
 
 from parity import __version__
-from parity.dialects.base import decode_canonical_field
+from parity.dialects.base import decode_canonical_field, row_filter_problem
 from parity.engine import DEFAULT_MAX_DIFFS, DEFAULT_VERIFY_SAMPLE
 from parity.types import (
     CHECKSUM_COLLISION_BOUND,
@@ -90,6 +90,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare only these columns (default: every column both sides share)",
     )
     d.add_argument("--exclude", metavar="x,y", help="skip these columns")
+    d.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="A_COL=B_COL[,...]",
+        help="pair a renamed column: side B's B_COL holds what side A calls "
+        "A_COL (repeatable, or comma-separated). --key, --columns and "
+        "--exclude take side A's names, and differences are reported under "
+        "them. Matching stays case-insensitive.",
+    )
+    d.add_argument(
+        "--where",
+        metavar="SQL",
+        help="compare only the rows matching this SQL predicate, on both sides "
+        "(e.g. \"created_at >= '2026-10-01'\"). Each engine runs it as its "
+        "own SQL, inside every query that reads the table. The result is "
+        "about the filtered rows only, and says so. Refused if it contains "
+        "';', a comment, or unbalanced quotes or parentheses.",
+    )
+    d.add_argument(
+        "--a-where",
+        metavar="SQL",
+        help="row filter for side A only, in side A's SQL; replaces --where there",
+    )
+    d.add_argument(
+        "--b-where",
+        metavar="SQL",
+        help="row filter for side B only, in side B's SQL; replaces --where there",
+    )
     d.add_argument(
         "--bisection-factor",
         type=int,
@@ -161,6 +190,29 @@ def _non_negative_int(value: str) -> int:
             f"must be 0 (no limit) or a positive number, got {n}"
         )
     return n
+
+
+def _column_map(values: Sequence[str]) -> dict[str, str]:
+    """Parse every `--map a=b[,a2=b2]` into `{a: b}`.
+
+    Malformed pairs are refused here; pairings that conflict (one A column
+    onto two B columns, two onto one) are refused by the engine, which also
+    sees the case-insensitive collisions this cannot.
+    """
+    out: dict[str, str] = {}
+    for value in values:
+        for pair in _split(value):
+            a_name, sep, b_name = pair.partition("=")
+            a_name, b_name = a_name.strip(), b_name.strip()
+            if not sep or not a_name or not b_name or "=" in b_name:
+                raise ValueError(f"--map takes A_COL=B_COL pairs, got {pair!r}")
+            if out.get(a_name, b_name) != b_name:
+                raise ValueError(
+                    f"--map pairs side A's {a_name!r} with two side B columns: "
+                    f"{out[a_name]!r} and {b_name!r}"
+                )
+            out[a_name] = b_name
+    return out
 
 
 def _split(value: str | None) -> list[str]:
@@ -372,6 +424,9 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         )
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
+    if result.filtered:
+        # The headline is the line people quote: it must carry the filter.
+        headline += " (filtered rows only)"
     w.line(headline)
 
     dot = f" {sym['dot']} "
@@ -391,6 +446,14 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             w.line(f"  {dot.join(counts).strip()}")
 
     w.line()
+    if result.filtered:
+        w.line(f"  filtered: {_filter_text(result)}")
+    if result.column_map:
+        pairs = ", ".join(
+            f"{_escape(a_name)} = B {_escape(b_name)}"
+            for a_name, b_name in result.column_map.items()
+        )
+        w.line(f"  renamed columns (A = B): {pairs}")
     for schema in result.schema_differences:
         w.line(f"  {sym['bad']} schema: {_escape(schema)}")
     for note in result.unexplained:
@@ -408,13 +471,21 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             for d in result.by_kind(kind):
                 if shown >= DISPLAY_LIMIT:
                     break
-                _render_diff(d, w, quoted)
+                _render_diff(d, w, quoted, result.column_map)
                 shown += 1
         if len(result.diffs) > DISPLAY_LIMIT:
             w.line(
                 f"  ... {len(result.diffs) - DISPLAY_LIMIT:,} more difference(s) "
                 f"found but not shown here; use --json for the full list"
             )
+
+
+def _filter_text(result: DiffResult) -> str:
+    """`A where <...>; B where <...>`, naming an unfiltered side as such."""
+    return "; ".join(
+        f"{side} where {_escape(where)}" if where else f"{side} whole table"
+        for side, where in (("A", result.where_a), ("B", result.where_b))
+    )
 
 
 def _risk_line(result: DiffResult) -> str:
@@ -425,12 +496,20 @@ def _risk_line(result: DiffResult) -> str:
     conf = f"{r['confidence'] * 100:g}%"
     collision = "a checksum collision is below 1 in 10^18"
     if r["max_hidden_fraction"] == 0.0:
+        if result.filtered:
+            return (
+                f"every filtered row was compared by both methods, so no "
+                f"filtered row can hide a rendering error; {collision}"
+            )
         return (
             f"every row was compared by both methods, so no row can hide a "
             f"rendering error; {collision}"
         )
+    # A filtered run's counts are of the filtered rows, and its bound covers
+    # nothing outside them.
+    rows = "filtered rows" if result.filtered else "rows"
     return (
-        f"with {conf} confidence fewer than {r['max_hidden_fraction']:.3%} of rows "
+        f"with {conf} confidence fewer than {r['max_hidden_fraction']:.3%} of {rows} "
         f"(at most {r['max_hidden_rows']:,} of {r['rows']:,}) could differ in a way "
         f"the checksums missed; {collision}"
     )
@@ -460,6 +539,9 @@ def risk_figures(result: DiffResult) -> dict[str, Any]:
         "max_hidden_fraction": frac,
         "max_hidden_rows": hidden,
         "rows": rows,
+        # True when `rows` counts only the rows a `--where` selected: the
+        # bound then says nothing about the rest of the table.
+        "filtered": result.filtered,
         "covered_columns": [] if v is None else v.checked,
         "uncovered_columns": [] if v is None else v.unchecked,
     }
@@ -501,7 +583,12 @@ def _render_verification(result: DiffResult, w: _Writer, sym: dict[str, str]) ->
         w.line(f"  ! sample: {_escape(note)}")
 
 
-def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
+def _render_diff(
+    d: RowDiff,
+    w: _Writer,
+    quoted: dict[str, bool],
+    renamed: dict[str, str] | None = None,
+) -> None:
     """Write one difference.
 
     A changed row shows both values side by side, which is far easier to scan
@@ -514,7 +601,12 @@ def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
         w.line(f"  {label:<11} key {shown_key}")
         return
 
-    cols = {c: _escape(c) for c in d.columns}
+    # A renamed column is named on both sides, `name (B: other)`, so the
+    # reader can look it up in either table.
+    renamed = renamed or {}
+    cols = {
+        c: _escape(f"{c} (B: {renamed[c]})" if c in renamed else c) for c in d.columns
+    }
     w.line(f"  {label:<11} key {shown_key:<14} columns: {', '.join(cols.values())}")
     name_w = max((len(c) for c in cols.values()), default=0)
 
@@ -587,6 +679,12 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
         "difference_count": len(result.diffs),
         "float_scale": result.float_scale,
         "columns_compared": [c.name for c in result.columns],
+        # The row filter of each side, null for the whole table. A filtered
+        # `identical` is about the filtered rows only.
+        "where_a": result.where_a,
+        "where_b": result.where_b,
+        # Renamed columns, side A's name to side B's (`--map`).
+        "column_map": result.column_map,
         "warnings": result.warnings,
         "stats": {
             "queries": stats.queries,
@@ -608,6 +706,9 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
                 "key": d.key,
                 "kind": d.kind,
                 "columns": d.columns,
+                # Side B's names for the same columns: differs from
+                # `columns` only where `--map` renamed one.
+                "b_columns": [result.column_map.get(c, c) for c in d.columns],
                 "a": d.values_a,
                 "b": d.values_b,
             }
@@ -632,6 +733,16 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
     from parity.dialects.base import get_dialect
     from parity.engine import diff
 
+    # Parsed before either side is opened: a malformed pair, or a filter
+    # that could end or escape its statement, is a usage error.
+    column_map = _column_map(args.map)
+    # A per-side filter replaces --where on its side.
+    where_a = args.where if args.a_where is None else args.a_where
+    where_b = args.where if args.b_where is None else args.b_where
+    for label, where in (("A", where_a), ("B", where_b)):
+        problem = None if where is None else row_filter_problem(where)
+        if problem:
+            raise ValueError(f"[side {label}] row filter {where!r} {problem}")
     a = b = None
     try:
         # Each side is opened separately so a failure can name which one.
@@ -652,6 +763,9 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
             # 0 is the documented way to ask for no limit at all.
             max_diffs=args.max_diffs or None,
             verify_sample=args.verify_sample,
+            where_a=where_a,
+            where_b=where_b,
+            column_map=column_map,
         )
     finally:
         for side in (a, b):

@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 5d369f978d4859da`
+Source fingerprint: `src-sha256: bdddfe06334da9ee`
 
 ## Summary
 
@@ -31,6 +31,10 @@ For one run that reports **identical**, on columns the rules cover:
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
+| A renamed column (`--map`) compared against the wrong counterpart | **0**: pairing is exact, ambiguous maps are refused | By design (tested) |
+| A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
+| A filtered "identical" read as one about the whole table | **0**: the headline, a `filtered:` line, JSON and a caveat state the filter; a filtered run **proves nothing about rows outside it** | By design (enforced) |
+| A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()` without one snapshot) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
@@ -56,7 +60,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
 | Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
-| Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
+| Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
 
 ## 2. Matching schemas and columns
 
@@ -65,6 +69,23 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | A column present on one side only is silently skipped | **0** — it is a schema difference, exit 1 | By design (tested) |
 | Two columns differing only in case are confused | **0** — such a table is refused | By design (tested) |
 | A type mismatch between sides goes unnoticed | **0** — a warning is printed; values compare by canonical text | By design (tested) |
+| A renamed column (`--map`) paired with the wrong column | **0** — side B's column is re-keyed under side A's name before any other matching, so the compared list, its order (the row text's field order) and the key follow from A's names alone; exact, so no new rendering or checksum risk. Refused: a mapped name absent on its side, one column mapped twice either way, a mapped B column a same-named column would still match, mapped and excluded. Pinned both ways: swapped columns mapped as a swap match except the planted row, unswapped ones differ on every row | By design (tested) |
+
+### 2b. Row filters (`--where`)
+
+What it does: compares only the rows a SQL predicate selects on each side.
+**A filtered run proves nothing about the rows outside its filter**: its
+verdict, its row counts and its sample-check bound (section 8) are all of
+the filtered rows, and the report says so in the headline, a `filtered:`
+line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
+
+| Risk | Odds | Kind |
+|---|---|---|
+| One query that reads the table runs unfiltered (a row counted but never checksummed, or sampled but never walked) | **0** — the key stats, every checksum level, every download and the sample all name the table through one builder that adds the predicate; `tests/test_where_sql.py` records every statement on all six dialects | By design (tested) |
+| The predicate escapes its parentheses (`1=1) or (1=1`) or ends the statement | **0** for what the check knows: `;`, comments, MySQL `#`, a backslash before a quote, triple- and dollar-quoted strings and unbalanced quotes, brackets or parentheses are refused before any query; on SQL Server the SELECT guard also applies. Not a security boundary: it is the user's own SQL, and the sessions are read-only | By design (tested) |
+| The predicate selects different rows in different queries (`random()`, `clock_timestamp()`; `now()`/`current_date` where an engine gives each query its own snapshot) | a change between the row count and the first level, or between two levels of one range, is **never identical** (unexplained); a row entering the filter beyond the key range measured first is **not compared**; beyond that **not bounded** — every filtered run's caveat says to prefer fixed literals | Not quantifiable |
+| A deterministic predicate inside one snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables; `now()` is stable within PostgreSQL's transaction) | **no new risk**: every query sees the same rows, so the walk is the unfiltered walk over a smaller table | By design (tested) |
+| The two sides' predicates select different slices | **not the tool's to know**: rows in one slice only read as only in A / only in B, and a one-sided filter draws a warning | By design |
 
 ## 3. Checking keys
 
@@ -113,6 +134,7 @@ them per key range in a wide type and counts rows.
 |---|---|---|
 | A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine), property-tested against `bucket_bounds` | By design (tested) |
 | An empty range on one side is skipped | **0** — empty sums are 0 on both sides | By design (tested) |
+| A difference vanishes between two levels (rows changed between the queries) | **0** false matches — each level's buckets must add up, in rows and checksum, to the level above, or the range is unexplained | By design (tested) |
 
 ## 7. Downloading differing ranges and comparing rows
 
@@ -152,6 +174,10 @@ of rows can carry a hidden error, at 99.9% confidence (the default since
 | 1,000,000 | 0.00069% | 69 |
 | whole table | 0 | 0 |
 
+With `--where` the sample is drawn from the filtered rows on each side, n
+and the bound are of the filtered rows, and nothing is said about rows the
+filter left out.
+
 Assumptions: the key hash spreads keys evenly over residues (MD5), the
 residue is random (`random.SystemRandom`), and the data is not crafted
 against the sample. The bound covers the run's `covered_columns`; columns
@@ -170,6 +196,7 @@ walk defect or a table changed mid-run.
   second on server settings and versions), and the sample check on every
   run.
 - **Tables changing during a run** without one snapshot (section 1).
+- **Rows outside a `--where` filter**: never compared (section 2b).
 - **Crafted data** against the checksum or the sample (sections 5, 8).
 - **Uncovered column types**, named in each report (section 4).
 - **The engines themselves**: a database or driver bug that returns wrong

@@ -288,6 +288,21 @@ class DiffResult:
     #: The independent sample check, or None when it was switched off
     #: (``verify_sample=0``) or the walk stopped early.
     verification: Verification | None = None
+    #: The row filter each side was read through (`--where`), or None for
+    #: the whole table. A filtered verdict covers the filtered rows only, so
+    #: the output always states both - a filtered "identical" must never be
+    #: read as one about the whole table.
+    where_a: str | None = None
+    where_b: str | None = None
+    #: Renamed columns (`--map`), side A's stored name to side B's, for the
+    #: compared and key columns that were paired by the map rather than by
+    #: name. Differences are reported under side A's name.
+    column_map: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def filtered(self) -> bool:
+        """Whether either side was read through a row filter."""
+        return bool(self.where_a or self.where_b)
 
     @property
     def identical(self) -> bool:

@@ -24,6 +24,39 @@ with the caveat that 0.x means the CLI surface may still move.
   check (exact counts unchanged: 4 queries / 0 rows and 28 queries / 7,628
   rows), and `demo/benchmark.py` now prints the sample check's queries and
   rows.
+- **Row filters: `--where SQL`, `--a-where SQL`, `--b-where SQL`**
+  (library `diff(..., where_a=..., where_b=...)`). Compares only the rows
+  a predicate selects - one partition, last week - so a slice of a huge
+  warehouse table can be checked without a full pass. The predicate is
+  parenthesised and ANDed, first, into every query that reads the table
+  (`Dialect.rows_from`: key stats, every checksum level, every download, the
+  sample check), and `tests/test_where_sql.py` records every statement on
+  all six dialects to prove it. A filtered verdict says so everywhere:
+  `(filtered rows only)` in the headline, a `filtered: A where ...; B where
+  ...` line, JSON `where_a`/`where_b` and `risk.filtered`, and a caveat on
+  every filtered run. Refused before any query: `;`, comments (`--`, `/*`,
+  MySQL `#`), a backslash before a quote, triple- and dollar-quoted strings,
+  unbalanced quotes or parentheses, and on SQL Server whatever its SELECT
+  guard refuses. Unfiltered runs emit byte-identical SQL.
+- **The walk checks that each level adds up to the one above.** A range's
+  buckets must sum, in rows and in checksum, to what the level above
+  measured for it - exact, since the sums are exact and the buckets tile the
+  range. Found while testing `--where`: a difference seen at one level could
+  leave a non-deterministic filter (or, on an engine without one snapshot,
+  be rewritten) before the next level looked, and the run then read
+  **identical** with the evidence discarded. Now that range is unexplained,
+  never identical. No extra query; a single-snapshot run never trips it.
+- **Column renames: `--map a_col=b_col[,...]`** (repeatable; library
+  `diff(..., column_map={...})`), for key columns too. Side B's columns are
+  re-keyed under side A's names at matching, so they land in the same
+  position of the row text; `--key`, `--columns` and `--exclude` take side
+  A's names and differences are reported under them, with side B's shown
+  (`customer_name (B: cust_nm)`, JSON `column_map` and per-row `b_columns`).
+  Refused: a mapped name absent on its side (near misses listed), one A
+  column onto two B columns or two onto one, a mapped B column that a
+  same-named column on either side would still match by name, a column both
+  mapped and excluded, and `--exclude`/`--columns` naming a column by its
+  side B name.
 - **Bit strings, intervals, times with a time zone, lists, network addresses
   and SQL Server variants have exact rules** (new logical types BITS,
   INTERVAL, TIMETZ, LIST, INET, VARIANT; `tests/test_types_rules2.py`):
