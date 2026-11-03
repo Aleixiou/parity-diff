@@ -268,6 +268,8 @@ _BARE_TYPES = frozenset(
         LogicalType.BOOLEAN,
         LogicalType.DATE,
         LogicalType.TIMESTAMP,
+        LogicalType.TIME,
+        LogicalType.BINARY,  # `\x` + hex, printed as PostgreSQL prints bytea
     }
 )
 

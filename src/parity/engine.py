@@ -67,6 +67,10 @@ _MAX_LISTED = 20
 _RENDER_ALIKE = (
     _NUMERIC_EQUIVALENT,
     frozenset({LogicalType.STRING, LogicalType.UNKNOWN}),
+    # A JSON column against text holding JSON - SQL Server has no JSON type,
+    # so its nvarchar documents meet another engine's json - matches wherever
+    # the text is already spelled in the canonical layout.
+    frozenset({LogicalType.STRING, LogicalType.JSON}),
 )
 
 #: For a *key*, text against anything can still line up - a varchar holding
@@ -586,6 +590,29 @@ def diff(
             if a.holds_sub_micro(ca) and b.holds_sub_micro(cb):
                 a_cols[i] = dataclasses.replace(ca, sub_micro=True)
                 b_cols[i] = dataclasses.replace(cb, sub_micro=True)
+        # JSON is compared as each engine's normal form, and the engines
+        # normalise differently (key order, duplicate keys, number spelling).
+        # Equal text is always the same document, so this can only cost false
+        # alarms - but a run reporting every JSON row of a correct migration
+        # as changed must say why, and the dialects know how they differ.
+        json_forms = [
+            (ca.name, sa, sb)
+            for ca, cb in zip(a_cols, b_cols, strict=True)
+            if ca.logical_type is LogicalType.JSON
+            and cb.logical_type is LogicalType.JSON
+            and (sa := a.json_semantics(ca)) != (sb := b.json_semantics(cb))
+        ]
+        if json_forms:
+            names = [n for n, _, _ in json_forms]
+            _, sa, sb = json_forms[0]
+            warnings.append(
+                f"JSON columns {names} are compared as each engine's normalised "
+                f"document, and the two engines normalise differently - side A: "
+                f"{sa}; side B: {sb}. Documents that are equal can therefore be "
+                f"reported as different (never the reverse): compare a canonical "
+                f"text form of them through a view on each side if that is not "
+                f"what you want"
+            )
         # A dialect whose FLOAT rendering is not verified against the shared
         # canonical form says so, and the caveat reaches the output rather
         # than only the docs (CLAUDE.md section 8).
@@ -857,6 +884,7 @@ def _verify(
             padded=dialect.padded_char(column),
             single_precision=dialect.single_precision(column),
             sub_micro=column.sub_micro,
+            json_verbatim=dialect.json_verbatim(column),
         )
 
     failures: list[str] = []

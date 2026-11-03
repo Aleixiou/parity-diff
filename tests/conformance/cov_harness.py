@@ -37,7 +37,7 @@ from cov_engines import EXTRA, CovEngine, Native
 from cov_known import REFUSED
 from cov_values import GROUPS, REFUSE, Val
 
-from parity.dialects.base import Dialect
+from parity.dialects.base import NULL_SENTINEL, Dialect
 from parity.reference import UNCHECKED, canonical_text, reference_token
 from parity.types import Column, LogicalType
 
@@ -236,6 +236,7 @@ def _expected(d: Dialect, col: Column, value: Any, scale: int) -> tuple[str | No
             scale,
             padded=d.padded_char(col),
             single_precision=d.single_precision(col),
+            json_verbatim=d.json_verbatim(col),
         )
     except Exception as exc:
         return None, f"reference raised {_short(exc)}"
@@ -332,6 +333,13 @@ def _cell(
     if n.group in REFUSE:
         cell.status = "disagree"
         cell.detail = "rendered a value the canonical form must refuse"
+        return cell
+    if v.value is None and cell.text != NULL_SENTINEL:
+        # Checked against the *input*, not the value read back: BigQuery's
+        # TO_JSON_STRING turned a SQL NULL into 'null' on both paths, so the
+        # read-back agreed with the rendering and hid a false match.
+        cell.status = "disagree"
+        cell.detail = "a NULL did not render as the NULL sentinel"
         return cell
     if col.logical_type is LogicalType.UNKNOWN:
         cell.status = "unruled"

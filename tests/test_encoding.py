@@ -683,8 +683,8 @@ def test_union_and_variant_keep_their_type_tag():
         ("timestamp with time zone", LogicalType.TIMESTAMP),
         # Planted difference: something genuinely unmapped must NOT quietly
         # claim to be a known type.
-        ("json", LogicalType.UNKNOWN),
-        ("bytea", LogicalType.UNKNOWN),
+        ("json", LogicalType.JSON),
+        ("bytea", LogicalType.BINARY),
         ("int4range", LogicalType.UNKNOWN),
     ],
 )

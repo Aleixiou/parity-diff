@@ -19,7 +19,7 @@ import pytest
 from cov_cross import collisions, compare, load_runs
 from cov_harness import RESULTS
 from cov_known import COLLISIONS, SPLITS
-from cov_values import RULED
+from cov_values import FORM_DEPENDENT, RULED
 
 
 @pytest.mark.parametrize("scale", [6, 2])
@@ -35,7 +35,10 @@ def test_every_ruled_value_renders_alike_on_every_engine(scale: int):
     bad = [
         s
         for s in splits
-        if s.family in RULED and s.same_logical and s.family not in SPLITS
+        if s.family in RULED
+        and s.same_logical
+        and s.family not in SPLITS
+        and s.family not in FORM_DEPENDENT
     ]
     assert not bad, "\n".join(s.describe() for s in bad)
 

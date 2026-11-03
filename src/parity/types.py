@@ -31,6 +31,19 @@ class LogicalType(str, Enum):
     STRING = "string"
     DATE = "date"
     TIMESTAMP = "timestamp"
+    #: Time of day, to the microsecond: `HH:MM:SS.ffffff`. MySQL's TIME is a
+    #: duration (up to +-838:59:59) and renders as one past the day; no other
+    #: engine can hold those values, so they can only match MySQL.
+    TIME = "time"
+    #: Bytes, exactly: `\\x` + lower-case hex (the escaped spelling of
+    #: PostgreSQL's bytea text, which is what PostgreSQL and MySQL rendered
+    #: before the type had a rule, so their checksums did not move).
+    BINARY = "binary"
+    #: A JSON document, as its engine's normalised serialisation laid out one
+    #: way everywhere (`canonical_json_text`). Engines normalise differently
+    #: - key order, number spelling - so cross-engine equality holds only
+    #: where their normal forms coincide, and the engine warns otherwise.
+    JSON = "json"
     UNKNOWN = "unknown"
 
 

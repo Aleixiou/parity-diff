@@ -401,9 +401,9 @@ def test_map_type_covers_what_information_schema_reports():
         "DATE": LogicalType.DATE,
         "DATETIME": LogicalType.TIMESTAMP,
         "TIMESTAMP": LogicalType.TIMESTAMP,
-        "BYTES": LogicalType.UNKNOWN,
-        "TIME": LogicalType.UNKNOWN,
-        "JSON": LogicalType.UNKNOWN,
+        "BYTES": LogicalType.BINARY,
+        "TIME": LogicalType.TIME,
+        "JSON": LogicalType.JSON,
         "ARRAY<INT64>": LogicalType.UNKNOWN,
         "STRUCT<x INT64, y STRING>": LogicalType.UNKNOWN,
     }

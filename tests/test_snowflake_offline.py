@@ -111,7 +111,7 @@ def test_map_type_splits_number_by_scale_and_maps_the_rest():
     assert map_type_snowflake("DATETIME", None) is LogicalType.TIMESTAMP
     assert map_type_snowflake("TEXT", None) is LogicalType.STRING
     assert map_type_snowflake("VARCHAR", None) is LogicalType.STRING
-    assert map_type_snowflake("VARIANT", None) is LogicalType.UNKNOWN
+    assert map_type_snowflake("VARIANT", None) is LogicalType.JSON
     # A non-integer scale value is treated defensively as decimal, not a crash.
     assert map_type_snowflake("NUMBER", "oops") is LogicalType.DECIMAL
 
@@ -175,10 +175,11 @@ def test_timestamp_tz_is_moved_to_utc_and_ntz_is_not():
 
 
 def test_variant_keeps_its_json_type():
-    """RT-C15: TYPEOF plus TO_JSON, so the number 1 and the string "1" differ."""
+    """RT-C15: TO_JSON keeps the quotes, so the number 1 and the string "1"
+    differ; a type JSON cannot name (DATE, BINARY, ...) keeps its TYPEOF."""
     d = _d()
     for raw in ("VARIANT", "OBJECT", "ARRAY"):
         col = Column("V", map_type_snowflake(raw, None), raw)
-        assert d.normalize(col) == (
-            "coalesce(typeof(\"V\") || ':' || to_json(\"V\"), (chr(92) || 'N'))"
-        )
+        sql = d.normalize(col)
+        assert 'to_json("V")' in sql
+        assert 'when "V" is not null then typeof("V") || \':\' ||' in sql

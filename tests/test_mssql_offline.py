@@ -392,9 +392,9 @@ def test_quoting_is_the_injection_boundary():
         ("sysname", LogicalType.STRING),
         ("uniqueidentifier", LogicalType.STRING),
         # rowversion, not a point in time - the shared map would say TIMESTAMP.
-        ("timestamp", LogicalType.UNKNOWN),
-        ("time", LogicalType.UNKNOWN),
-        ("varbinary", LogicalType.UNKNOWN),
+        ("timestamp", LogicalType.BINARY),
+        ("time", LogicalType.TIME),
+        ("varbinary", LogicalType.BINARY),
         ("xml", LogicalType.UNKNOWN),
     ],
 )
@@ -432,6 +432,13 @@ def _escaped(expr: str) -> str:
     )
 
 
+#: BINARY_PREFIX + lower-case hex (style 2), the rule every engine shares.
+_BINARY_HEX = (
+    "(((nchar(92) + nchar(92)) + 'x') + "
+    "lower(convert(nvarchar(max), convert(varbinary(max), [c]), 2)))"
+)
+
+
 @pytest.mark.parametrize(
     ("column", "expr"),
     [
@@ -467,16 +474,12 @@ def _escaped(expr: str) -> str:
         (_col("c", "uniqueidentifier"), "lower(convert(nvarchar(max), [c]))"),
         (_col("c", "nvarchar"), _escaped(_utf16_safe("cast([c] as nvarchar(max))"))),
         (_col("c", "varchar"), _escaped("cast([c] as nvarchar(max))")),
-        (
-            _col("c", "timestamp"),
-            "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
-        ),
-        (
-            _col("c", "varbinary"),
-            "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
-        ),
+        # BINARY_PREFIX + lower-case hex (style 2), the rule every engine shares.
+        (_col("c", "timestamp"), _BINARY_HEX),
+        (_col("c", "varbinary"), _BINARY_HEX),
         (_col("c", "geography"), _escaped("cast([c].ToString() as nvarchar(max))")),
-        (_col("c", "time", 7), _escaped("cast([c] as nvarchar(max))")),
+        # TIME to the microsecond, the seventh digit truncated.
+        (_col("c", "time", 7), "left(convert(nvarchar(max), cast([c] as time(7))), 15)"),
     ],
 )
 def test_every_type_renders_as_nvarchar_max_inside_the_coalesce(column, expr):
@@ -562,10 +565,9 @@ def test_checksum_and_stats_queries_use_t_sql_spellings():
 
 
 def test_caveats_report_sub_microsecond_columns():
-    """datetime2(7)/datetimeoffset(7) lose their seventh digit, and say so;
-    lower precisions are exact and stay quiet."""
+    """datetime2(7)/datetimeoffset(7)/time(7) lose their seventh digit
+    against an engine without one, and say so; lower precisions stay quiet."""
     d = _d()
-    # time(7) is compared as raw text, all seven digits, so it is not listed.
     cols = [
         _col("a", "datetime2", 7),
         _col("b", "datetime2", 6),
@@ -573,7 +575,7 @@ def test_caveats_report_sub_microsecond_columns():
         _col("d", "time", 7),
     ]
     (note,) = d.caveats(cols)
-    assert "['a', 'c']" in note and "microseconds" in note
+    assert "['a', 'c', 'd']" in note and "microseconds" in note
 
 
 # --------------------------------------------- hooks: other engines unchanged

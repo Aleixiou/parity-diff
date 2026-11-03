@@ -280,27 +280,92 @@ class SnowflakeDialect(Dialect):
                     f"case when date_part(nanosecond, {raw_c}) % 1000 = 0 "
                     f"then {expr} else {nine} end"
                 )
-        elif _base(column.raw_type) == "TIME":
-            # TIME is unmapped, and its varchar cast follows TIME_OUTPUT_FORMAT
-            # (HH24:MI:SS by default), which drops the fraction: 12:34:56.5 and
-            # 12:34:56 printed alike - a false match (COV-6). The fraction
-            # without trailing zeros, as PostgreSQL and DuckDB print a time.
-            nine = f"to_char({c}, 'HH24:MI:SS.FF9')"
-            expr = f"rtrim(rtrim({nine}, '0'), '.')"
-        elif _base(column.raw_type) in ("VARIANT", "OBJECT", "ARRAY"):
-            # A plain varchar cast of a VARIANT prints a string without its
-            # JSON quotes, so the number 1 and the string "1" render alike - a
-            # false match on the very type semi-structured data lands in.
-            # TO_JSON keeps the quotes, and TYPEOF keeps what JSON cannot say
-            # (a TIMESTAMP and the VARCHAR spelling it print the same JSON).
-            # Verified live: 1 and "1", a DATE and its text, differ.
-            expr = f"typeof({c}) || ':' || to_json({c})"
+        elif t is LogicalType.TIME:
+            # The varchar cast follows TIME_OUTPUT_FORMAT (HH24:MI:SS by
+            # default), which drops the fraction: 12:34:56.5 and 12:34:56
+            # printed alike - a false match (COV-6). FF6 is six digits always,
+            # the rest *truncated* (verified: 23:59:59.9999999 prints
+            # `.999999`), as for timestamps; `caveats` says so for TIME(7-9).
+            expr = f"to_char({c}, 'HH24:MI:SS.FF6')"
+            if column.sub_micro:
+                # Both sides hold nanoseconds (COV-2): nine digits when any
+                # are past the microsecond, as for timestamps.
+                expr = (
+                    f"case when date_part(nanosecond, {c}) % 1000 = 0 then {expr} "
+                    f"else to_char({c}, 'HH24:MI:SS.FF9') end"
+                )
+        elif t is LogicalType.BINARY:
+            # BINARY_PREFIX + lower-case hex. The varchar cast follows
+            # BINARY_OUTPUT_FORMAT (upper-case hex by default, or base64).
+            expr = f"{self.binary_prefix_sql()} || lower(hex_encode({c}))"
+        elif t is LogicalType.JSON:
+            expr = self._json_text(c)
         else:
             # STRING, and every unmapped type through its varchar cast:
             # arbitrary text, so escaped. Verified live against DuckDB, also
             # under an `en-ci` collation, which REPLACE ignores here.
             expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    #: VARIANT types whose TO_JSON is the value itself. Any other (DATE, TIME,
+    #: TIMESTAMP_*, BINARY) prints as a JSON *string*, which a VARCHAR
+    #: spelling it would match, so those keep their type name in front.
+    _JSON_NATIVE = (
+        "'OBJECT', 'ARRAY', 'VARCHAR', 'INTEGER', 'DECIMAL', 'DOUBLE', "
+        "'BOOLEAN', 'NULL_VALUE'"
+    )
+
+    def _json_text(self, c: str) -> str:
+        """A VARIANT, OBJECT or ARRAY as canonical JSON text.
+
+        A plain varchar cast prints a string without its JSON quotes, so the
+        number 1 and the string "1" rendered alike - a false match on the
+        very type semi-structured data lands in. TO_JSON keeps the quotes and
+        is Snowflake's normal form: keys by code point, compact, numbers as
+        stored. Its escaping is canonical except for U+007F, which it writes
+        as `\\u007f` (verified live), so that escape is undone first - with
+        every escaped backslash parked on chr(2) meanwhile, so a literal
+        backslash followed by `u007f` is never mistaken for it. A DATE, TIME,
+        TIMESTAMP or BINARY at the top level is not JSON and prints as a
+        string, so it keeps its TYPEOF tag, as it did before: never equal to
+        a VARCHAR, nor to any other engine's JSON, which cannot hold one.
+        Inside an OBJECT or ARRAY such a value is its JSON string, as every
+        engine's JSON holds it (documented).
+        """
+        # Backslashes from code points (RT-D1), never in a literal.
+        bs = self.spell_sql("\\\\")
+        fixed = (
+            f"replace(replace(replace(to_json({c}), {bs}, chr(2)), "
+            f"{self.spell_sql(chr(92) + 'u007f')}, chr(127)), chr(2), {bs})"
+        )
+        canonical = self.escape_text(self.json_compact_layout(fixed))
+        return (
+            f"case when typeof({c}) in ({self._JSON_NATIVE}) then {canonical} "
+            f"when {c} is not null then typeof({c}) || ':' || {self.escape_text(f'to_json({c})')} end"
+        )
+
+    def json_compact_layout(self, expr: str) -> str:
+        """The three steps of the base docstring. Snowflake's regular
+        expressions have no non-capturing group, so the separator is group 3.
+        Verified live."""
+        pattern = self.spell_sql(r'("(\\.|[^"\\])*"|[^",:]*)([,:]?)')
+        marked = (
+            f"regexp_replace({expr}, {pattern}, "
+            f"{self.spell_sql(chr(92) + '1' + chr(92) + '3' + chr(1))})"
+        )
+        return (
+            f"replace(replace(replace({marked}, ',' || chr(1), ', '), "
+            f"':' || chr(1), ': '), chr(1), '')"
+        )
+
+    def json_semantics(self, column: Column) -> str:
+        """Snowflake's VARIANT normal form."""
+        return (
+            "Snowflake VARIANT: object keys ordered by code point, duplicate keys "
+            "refused on load, integers and decimals exact (1.0 becomes 1, 1.50 "
+            "becomes 1.5), doubles in exponent form (1e2 becomes "
+            "1.000000000000000e+02)"
+        )
 
     def _float_text(self, c: str, s: int, column: Column) -> str:
         """The canonical text of a double (`canonical_float_text`, base.py).
@@ -365,10 +430,12 @@ class SnowflakeDialect(Dialect):
         )
 
     def holds_sub_micro(self, column: Column) -> bool:
-        """A Snowflake timestamp of precision above 6 (the default is 9)."""
-        return column.logical_type is LogicalType.TIMESTAMP and _sub_micro(
-            column.raw_type
-        )
+        """A Snowflake timestamp or time of precision above 6 (the default
+        is 9)."""
+        return column.logical_type in (
+            LogicalType.TIMESTAMP,
+            LogicalType.TIME,
+        ) and _sub_micro(column.raw_type)
 
     def sample_select(self, column: Column) -> str:
         """Raw values for the sample check; a nanosecond timestamp as text.
@@ -377,13 +444,33 @@ class SnowflakeDialect(Dialect):
         only, so a timestamp compared past them is read as ISO text with all
         nine digits and its offset instead.
         """
+        c = self.quote(column.name)
+        if column.logical_type is LogicalType.TIME:
+            # All nine digits as text; the reference truncates them unless
+            # the column is compared past microseconds.
+            return f"to_char({c}, 'HH24:MI:SS.FF9')"
         if column.sub_micro:
-            c = self.quote(column.name)
             if _base(column.raw_type) in ("TIMESTAMP_TZ", "TIMESTAMP_LTZ"):
                 c = f"convert_timezone('UTC', {c})"
                 return f"to_char({c}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9TZH:TZM')"
             return f"to_char({c}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9')"
+        if column.logical_type is LogicalType.JSON:
+            # The connector returns a VARIANT pretty-printed; TO_JSON is the
+            # stored value, behind its TYPEOF so `sample_value` can tell a
+            # JSON value from a DATE or BINARY one.
+            return f"typeof({c}) || ':' || to_json({c})"
         return super().sample_select(column)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """A JSON-native VARIANT's text without its tag; any other VARIANT
+        (a DATE, a BINARY, ...) as the tagged text, which is not JSON and so
+        stays outside the reference rules - not checked, never guessed."""
+        if column.logical_type is LogicalType.JSON and isinstance(value, str):
+            tag, _, body = value.partition(":")
+            if f"'{tag}'" in self._JSON_NATIVE:
+                return body
+            return ("not json", value)
+        return value
 
     def decimal_key_text(self, c: str, column: Column) -> str:
         """NUMBER's varchar cast is exact at the declared scale; drop the
@@ -409,6 +496,14 @@ class SnowflakeDialect(Dialect):
                 f"case when {c} is null or date_part(nanosecond, {c}) % 1000 = 0 "
                 f"then {self.normalize(column)} "
                 f"else to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF9') end"
+            )
+        if column.logical_type is LogicalType.TIME:
+            # The same for TIME: a key's nanoseconds are kept.
+            c = self.quote(column.name)
+            return (
+                f"case when {c} is null or date_part(nanosecond, {c}) % 1000 = 0 "
+                f"then {self.normalize(column)} "
+                f"else to_char({c}, 'HH24:MI:SS.FF9') end"
             )
         return super().normalize_key(column)
 
@@ -480,7 +575,11 @@ def _column(name: str, raw: str, numeric_scale: Any, precision: Any) -> Column:
         tz = True
     elif base in ("TIMESTAMP_NTZ", "DATETIME"):
         tz = False
-    if base.startswith("TIMESTAMP") and "(" not in raw and precision is not None:
+    if (
+        (base.startswith("TIMESTAMP") or base == "TIME")
+        and "(" not in raw
+        and precision is not None
+    ):
         try:
             raw = f"{raw}({int(precision)})"
         except (TypeError, ValueError):
@@ -514,4 +613,10 @@ def map_type_snowflake(raw: str, numeric_scale: Any) -> LogicalType:
         return LogicalType.TIMESTAMP
     if t in {"TEXT", "VARCHAR", "CHAR", "CHARACTER", "STRING"}:
         return LogicalType.STRING
+    if t == "TIME":
+        return LogicalType.TIME
+    if t in {"BINARY", "VARBINARY"}:
+        return LogicalType.BINARY
+    if t in {"VARIANT", "OBJECT", "ARRAY"}:
+        return LogicalType.JSON
     return LogicalType.UNKNOWN

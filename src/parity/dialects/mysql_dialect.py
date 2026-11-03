@@ -442,7 +442,19 @@ class MySQLDialect(Dialect):
         """
         if column.logical_type is LogicalType.FLOAT and self.single_precision(column):
             return f"cast({self.quote(column.name)} as double)"
+        if column.logical_type is LogicalType.JSON:
+            # The engine's own normalised text, whatever the connector does
+            # with a JSON result.
+            return f"cast({self.quote(column.name)} as char)"
         return super().sample_select(column)
+
+    def json_semantics(self, column: Column) -> str:
+        """MySQL's JSON normal form."""
+        return (
+            "MySQL JSON: object keys ordered by length then bytes, the last "
+            "duplicate key kept, integers exact to 64 bits and every other number "
+            "a double (1.50 becomes 1.5, 1e2 becomes 100.0)"
+        )
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """A table on a non-transactional engine is not read at one snapshot.
@@ -554,10 +566,26 @@ class MySQLDialect(Dialect):
         elif t is LogicalType.TIMESTAMP:
             # %f is microseconds, six digits, matching the other two engines.
             expr = f"date_format({c}, '%Y-%m-%d %H:%i:%s.%f')"
-        elif raw in _BINARY_TYPES:
+        elif t is LogicalType.TIME:
+            # TIME is a duration here, -838:59:59 .. 838:59:59; time_format's
+            # %H runs past 23 and keeps the sign (verified: `-00:00:00.500000`,
+            # `100:00:00.500000`), which is `canonical_time_text` exactly.
+            # Six digits whatever the column's fsp; the char cast printed
+            # none for time(0), so only time(6) checksums stay put.
+            expr = f"time_format({c}, '%H:%i:%s.%f')"
+        elif t is LogicalType.BINARY:
             # PostgreSQL's bytea text form (bytea_output = hex, its default):
-            # a backslash, `x`, then lower-case hex.
+            # a backslash, `x`, then lower-case hex - BINARY_PREFIX + hex.
             expr = self._binary_text(column, c, prefix=True)
+        elif t is LogicalType.JSON:
+            # MySQL stores JSON normalised - keys ordered by length then
+            # bytes, the last duplicate kept - and prints it in exactly the
+            # canonical layout and string escaping (verified against
+            # `canonical_json_text`), so the char cast is the canonical text:
+            # the SQL the unmapped fallback ran, and no checksum moves.
+            # Laying out compact JSON here would need REGEXP_REPLACE, whose
+            # global-only regexp_time_limit failed on a 400 kB document.
+            expr = self.escape_text(f"cast({c} as char)")
         elif raw in _SPATIAL_TYPES:
             # The stored bytes - SRID, then WKB - in full: exact, and
             # MySQL-to-MySQL only. ST_AsText would round the coordinates.
@@ -811,6 +839,12 @@ def map_type_mysql(raw: str) -> LogicalType:
         return LogicalType.DATE
     if t in {"datetime", "timestamp"}:
         return LogicalType.TIMESTAMP
+    if t == "time":
+        return LogicalType.TIME
+    if t in _BINARY_TYPES:
+        return LogicalType.BINARY
+    if t == "json":
+        return LogicalType.JSON
     if t in {
         "char",
         "varchar",

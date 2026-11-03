@@ -277,7 +277,8 @@ def test_mysql_utf8_valid_binary_differences_are_still_found(my, mysql_url):
         my.execute(f"insert into {t} values (1, {v})")
     result = _run(mysql_url, mysql_url, "rt_sch_ok_a", "rt_sch_ok_b", "id")
     assert _found(result) == [(1, "different", ["v"])]
-    assert any("unmapped" in w and "'v'" in w for w in result.warnings)
+    # BINARY has a rule now: the sample check compares it by its bytes.
+    assert "v" in result.verification.checked
 
 
 def test_mysql_invisible_column_is_compared(my, mysql_url):

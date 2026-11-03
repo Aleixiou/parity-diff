@@ -131,8 +131,8 @@ def test_cov5_the_duckdb_sample_reads_a_ns_timestamp_without_rounding(tmp_path):
 
 @pytest.mark.snowflake
 def test_cov6_snowflake_time_keeps_its_fractional_seconds(snowflake_url):
-    """12:34:56.5 and 12:34:56 are different values; they must render apart
-    (and 12:34:56.5 as PostgreSQL, DuckDB and BigQuery print it)."""
+    """12:34:56.5 and 12:34:56 are different values; they must render apart,
+    and as the TIME rule says every engine renders them (`canonical_time_text`)."""
     w = get_dialect(snowflake_url, side="W")
     table = f"COV_TIME_{RUN}_{os.getpid()}"
     cur = w._conn.cursor()
@@ -146,7 +146,7 @@ def test_cov6_snowflake_time_keeps_its_fractional_seconds(snowflake_url):
         d = get_dialect(snowflake_url, side="A")
         try:
             (col,) = [c for c in d.columns(table) if c.name == "v"]
-            assert col.logical_type is LogicalType.UNKNOWN
+            assert col.logical_type is LogicalType.TIME
             rows = dict(
                 d.query(
                     f'select "id", {d.normalize(col)} from {d.qualify(table)} order by 1'
@@ -159,4 +159,5 @@ def test_cov6_snowflake_time_keeps_its_fractional_seconds(snowflake_url):
         cur.close()
         w.close()
     assert rows[1] != rows[2], rows
-    assert rows[1] == "12:34:56.5", rows
+    assert rows[1] == "12:34:56.500000", rows
+    assert rows[2] == "12:34:56.000000", rows
