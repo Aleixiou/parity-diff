@@ -409,8 +409,8 @@ stated plainly rather than buried.
 | DuckDB | supported (tested against 1.5) |
 | MySQL | supported (tested against 8.0) |
 | Snowflake | supported (verified live on AWS; `pip install "parity-diff[snowflake]"`) |
-| BigQuery | supported, unreleased (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
-| SQL Server / Azure SQL | supported, unreleased (SQL Server 2019+; verified live against 2022; `pip install "parity-diff[mssql]"`) |
+| BigQuery | supported (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
+| SQL Server / Azure SQL | supported (SQL Server 2019+; verified live against 2022; `pip install "parity-diff[mssql]"`) |
 | Redshift, Databricks, Fabric | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
 
 ## Scope
@@ -466,10 +466,14 @@ way it is. `ROADMAP.md` is what is done and what comes next.
 
 ## Changelog
 
-Latest release **0.3.0** — BigQuery support, and fixes for two false matches in
-earlier versions: large or very precise doubles compared across engines, and
-MySQL DECIMAL values of about 1e32 or more. **Upgrade if you use 0.2.x**, and
-re-run comparisons that involved such columns. 0.2.3 hardened the identical
+Latest release **0.4.0** — SQL Server support, and the fixes from a red-team
+campaign that found inputs on which earlier versions reported identical tables
+that were not (a text value `\N` against NULL, a separator character inside
+text, a column dropped on one side, PostgreSQL `infinity` dates, MySQL binary
+columns, rounded DECIMAL keys, and more - listed in `CHANGELOG.md`). **Upgrade
+from any earlier version** and re-run comparisons that touched those cases.
+Exit code `1` now also means a column exists on one side only. 0.3.0 added
+BigQuery and fixed two float/decimal false matches; 0.2.3 hardened the identical
 check, 0.2.2 added Snowflake. See `CHANGELOG.md` for the full history.
 
 ## License

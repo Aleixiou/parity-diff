@@ -11,6 +11,12 @@ document, because it makes a reader distrust the accurate ones.
 
 ## Where it is
 
+**v0.4.0 released** (2026-11-03): adds **SQL Server / Azure SQL**, and fixes
+every false match a seven-angle red-team campaign found (`tests/redteam/`,
+CLAUDE.md §4.11): text escaping, exact keys, schema differences in the verdict,
+PostgreSQL edge dates and session pins, MySQL binary and read-only sessions,
+and more. Full live suite: 1,375 passed.
+
 **v0.3.0 released** (2026-11-02): PostgreSQL, DuckDB, MySQL, **Snowflake** and
 **BigQuery**, with non-integer/composite keys and case-insensitive identifier
 matching across engines. `pip install parity-diff`, MIT. 0.3.0 also fixes two
