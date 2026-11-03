@@ -113,11 +113,13 @@ parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
 | Code | Meaning |
 |---|---|
 | `0` | identical |
-| `1` | differences found |
+| `1` | not proven identical: rows differ, a column exists on one side only, or the checksums disagreed in a way the downloaded rows could not explain |
 | `2` | error (bad connection string, missing table, unusable key) |
 
 An error is never `1`. A CI job can always tell "the tables differ" from "the
-tool could not run".
+tool could not run". A column added or dropped on purpose is a schema
+difference until you say so: pass it to `--exclude` (or leave it out of
+`--columns`) and it becomes a warning instead.
 
 Connection strings:
 
@@ -132,10 +134,23 @@ snowflake://user:password@account/database/schema?warehouse=wh&role=r
 bigquery://project/dataset                      (optional ?location=EU)
 mssql://user:password@host:port/database        (also sqlserver://; port 1433)
 mssql://user:password@host/database?instance=SQLEXPRESS&encrypt=strict
+mysql://user:password@host/database?ssl_mode=VERIFY_IDENTITY&ssl_ca=/path/ca.pem
 ```
 
-Table names may be schema-qualified. Unqualified names default to `public` on
-PostgreSQL and `main` on DuckDB. On BigQuery they default to the dataset in the
+Connection errors never print the password. On MySQL a password may contain
+`/ # ? :` unencoded but must spell `@` as `%40`; the URL takes the TLS options
+`ssl_mode` (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`,
+`VERIFY_IDENTITY`), `ssl_ca`, `ssl_cert`, `ssl_key`, `ssl_verify_cert`,
+`ssl_verify_identity` and `ssl_disabled`, and refuses any other option rather
+than ignore it. With `ssl_mode=REQUIRED` or stricter the run checks that the
+session really is encrypted, since the driver would otherwise fall back to
+plaintext without saying so. A BigQuery URL refuses user credentials outright.
+
+Table names may be schema-qualified. Unqualified names mean `public` on
+PostgreSQL and `main` on DuckDB — always that schema, never whatever the
+session's `search_path` finds first — and on Snowflake the URL's schema (else
+`PUBLIC`). PostgreSQL materialized views can be compared like tables. On
+BigQuery they default to the dataset in the
 connection string, and a table may also be given as `dataset.table` or
 `project.dataset.table` (to read another project's data while running jobs in
 your own).
@@ -152,7 +167,7 @@ SQL Server (2019 or newer, and Azure SQL Database / Managed Instance) uses
 Microsoft's `mssql-python` driver, which needs no separately installed ODBC
 driver. Unqualified tables default to the login's own default schema (normally
 `dbo`). The connection string takes SQL authentication only so far, and a fixed
-set of options — `encrypt` (`yes`, `no`, `strict`, `mandatory`, `optional`),
+set of options: `encrypt` (`yes`, `no`, `strict`, `mandatory`, `optional`),
 `trust_server_certificate` (`yes`/`no`), `application_intent`
 (`readonly`/`readwrite`), `login_timeout` (seconds) and `instance` (a named
 instance); anything else is refused rather than ignored, and every value is
@@ -165,7 +180,11 @@ reaches the server, and never commits — but **use a login that holds only
 itself refuse a write.
 
 `--json` emits the same content as a machine-readable object, including
-`identical`, `truncated`, per-difference values, and the full stats block.
+`identical`, `truncated`, `schema_differences`, `unexplained`, per-difference
+values, and the full stats block. Values in JSON are the exact canonical text
+the engines compared, in which a backslash is doubled and an ASCII Unit
+Separator (chr 31) is written `\s`; the human report shows them decoded, with
+text quoted and a real NULL printed bare as `NULL`.
 
 ### In CI
 
@@ -187,13 +206,9 @@ they load when `get_dialect` needs one.
 ```python
 from parity import diff, get_dialect
 
-a = get_dialect("duckdb:///old.duckdb", side="A")
-b = get_dialect("duckdb:///new.duckdb", side="B")
-try:
+with get_dialect("duckdb:///old.duckdb", side="A") as a, \
+     get_dialect("duckdb:///new.duckdb", side="B") as b:
     result = diff(a, b, "main.orders", "main.orders", key="id")
-finally:
-    a.close()
-    b.close()
 
 if result.identical:
     print("the tables match")
@@ -222,17 +237,23 @@ the comparison is refused before it runs.
 
 | Attribute | |
 |---|---|
-| `identical` | `True` only if nothing differed **and** the whole key space was walked. False whenever `truncated` is set. |
+| `identical` | `True` only if no row differed, no column exists on one side only, every checksum mismatch was explained by the rows downloaded, **and** the whole key space was walked. False whenever `truncated` is set. |
 | `truncated` | The walk stopped early, so this is a partial answer. Never read a truncated result as "the rest matched". |
+| `schema_differences` | Columns one side has and the other lacks, that you did not set aside with `columns` / `exclude`. Any entry makes the result not identical. |
+| `unexplained` | Key ranges whose checksums differed although the rows downloaded from them compared equal (or a side returned a different row count than its checksum counted). The engines proved a difference the tool could not show you, so the result is not identical. |
 | `diffs` | `RowDiff` objects in key order, each with `key`, `kind` (`only_in_a`, `only_in_b`, `different`), the `columns` that moved, and `values_a` / `values_b` as raw canonical text. |
 | `columns` | The columns actually compared, after `columns` and `exclude`. |
-| `warnings` | Everything the comparison decided on your behalf: columns skipped, types that differ between sides, timezone-awareness mismatches. Worth surfacing. |
+| `warnings` | Everything the comparison decided on your behalf: columns set aside, types that differ between sides (key types included), timezone-awareness mismatches, engine caveats such as a missing snapshot. Worth surfacing. |
 | `float_scale` | The rounding in force, so a caller can state it alongside the verdict. |
 | `stats` | `queries`, `rows_downloaded`, `rows_compared_a`, `rows_compared_b`, `segments_checked`, `seconds`. |
 
-`diff` raises `ValueError` for anything it refuses — a non-integer key, a
-non-unique or NULL key, a missing table, mismatched float scales. The message
-always names which side.
+`diff` raises `ValueError` for anything it refuses — a FLOAT key, a non-unique
+or NULL key, a missing table, mismatched float scales — and for any database
+error during the walk, which arrives as a `ValueError` naming the side and the
+table, with the driver's own exception as its `__cause__`. The message always
+names which side. The caller owns the two dialects: close them (or use `with`,
+as above) even when `diff` raises, or a PostgreSQL side keeps its snapshot
+transaction open.
 
 ## Limitations — read these before trusting a result
 
@@ -245,6 +266,21 @@ stated plainly rather than buried.
   divided — and the run says so. Rows are still matched and reported by their
   real key, so a hash collision can only put two rows in the same bucket; it
   can never merge them.
+- **Keys are compared exactly — never at the float scale.** A DECIMAL key
+  compares by its exact value (`1.50` and `1.5000` are the same key, and an
+  integral decimal `42` matches an integer `42`); a timestamp key keeps its
+  sub-microsecond digits where the engine holds them. A **FLOAT key is
+  refused**: no rendering of a double is both exact and identical on every
+  engine. A NULL in any key column is refused, as for an integer key. When the
+  key's type differs between the sides in a way that cannot match (integer
+  against float, a timezone-aware against a naive timestamp), the run warns
+  that every row will read as missing on one side.
+- **Text is compared exactly, including the characters the tool uses
+  internally.** Values are joined with ASCII Unit Separator and NULL is
+  spelled `\N`, so text is escaped first (`\` → `\\`, chr(31) → `\s`): the
+  string `\N` never equals NULL and a separator inside a value cannot shift
+  where a column ends. Text without either character renders exactly as
+  before.
 - **Floats and decimals are compared at 6 decimal places** by default. Two
   values differing only in the 7th place are reported as *equal*. This is a
   deliberate cross-engine rounding contract — the engines do not otherwise
@@ -277,7 +313,10 @@ stated plainly rather than buried.
 - **Keys must be unique.** A non-unique key is detected up front and rejected.
   Silently collapsing duplicate rows would hide real differences.
 - **`Infinity` and `NaN`** in float columns are compared as those literal
-  tokens on both sides.
+  tokens on both sides. Infinite dates and timestamps (PostgreSQL's and
+  DuckDB's `infinity`, common as a "valid until forever" end date) compare as
+  `infinity` / `-infinity`, never as NULL. BC dates use astronomical year
+  numbering (1 BC is year `0000`, 44 BC is `-43`), as DuckDB prints them.
 - **Wide tables are fine.** PostgreSQL caps a function call at 100 arguments,
   so the row concatenation is built as a nested tree; tested to 500 columns.
   Long rows are fine too: SQL Server's `CONCAT_WS` silently cuts its result at
@@ -286,7 +325,15 @@ stated plainly rather than buried.
 - **Supported types:** integer, decimal, float, boolean, string, date,
   timestamp. Anything else is compared as raw text and reported as a warning —
   two engines may render the same JSON or array differently for reasons that
-  have nothing to do with the data.
+  have nothing to do with the data. A few such types are rendered exactly
+  rather than lossily: MySQL binary columns as `\x` + hex (PostgreSQL's
+  `bytea` form) and `bit(n)` as its bits; SQL Server `sql_variant`, DuckDB
+  `UNION`/`VARIANT` and Snowflake `VARIANT` with their type tag, so `1` and
+  `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds when it has any.
+- **A row wider than MySQL's `max_allowed_packet`** (64 MiB by default) is
+  hashed column by column instead of as one string, so it can never drop out
+  of a checksum; against another engine such a row is downloaded and compared
+  value by value.
 - **At most 10,000 differences are reported by default.** Each one costs about
   715 bytes, so two tables that share nothing would need gigabytes rather than
   producing an answer - and pointing the tool at the wrong table or the wrong
@@ -298,16 +345,31 @@ stated plainly rather than buried.
   the two servers' default timezones are. Without that pin, two sides in
   different zones render every `timestamptz` differently and the tool reports
   the entire table as changed.
-- Columns present on only one side are skipped with a warning, not treated as
-  differences.
+- **A column present on only one side is a schema difference**: the run is
+  not identical and exits `1`, even if every row matches on the columns both
+  sides share. `--exclude` it if the change was intended.
 - **A live source table is read at one snapshot on PostgreSQL, MySQL and
-  BigQuery.** PostgreSQL and MySQL run the whole diff in one REPEATABLE READ
-  transaction. BigQuery has no cross-query transaction, so every query reads a
-  base table `FOR SYSTEM_TIME AS OF` the instant of the first one. **A BigQuery
-  view is not pinned** — BigQuery silently ignores time travel on views — so,
-  like every table on Snowflake (READ COMMITTED only), a view that changes
-  during the run can produce differences that never existed at one point in
-  time. Diff the underlying table, or re-run, if the source is busy.
+  BigQuery.** PostgreSQL and MySQL run the whole diff in one REPEATABLE READ,
+  read-only transaction. BigQuery has no cross-query transaction, so every
+  query reads a base table `FOR SYSTEM_TIME AS OF` the instant of the first
+  one. **A BigQuery view is not pinned** — BigQuery silently ignores time
+  travel on views — and neither is a MySQL table on a non-transactional engine
+  (MyISAM, MEMORY); like every table on Snowflake (READ COMMITTED only), such a
+  source changing during the run can produce differences that never existed
+  at one point in time. **Every run says so** when it applies. Diff the
+  underlying table, or re-run, if the source is busy.
+- **Session settings cannot skew the result.** PostgreSQL pins the time zone,
+  float digits, `standard_conforming_strings`, `DateStyle`, `IntervalStyle`,
+  `bytea_output`, `lc_monetary`, the client encoding and `search_path` (so a
+  user function cannot shadow a built-in), and turns off the idle and
+  transaction timeouts that would otherwise kill the snapshot mid-run. MySQL
+  pins the time zone and `sql_mode`.
+- **The checksum detects accidents, not tampering.** Row hashes are summed per
+  key range, and the hash is public, so someone who can write rows on one side
+  could craft several changes whose hashes cancel and read as identical. By
+  accident this happens with odds of about 1 in 2^60 per differing range.
+  Treat a clean run as proof that a migration lost or changed nothing, not as
+  proof against a deliberate adversary.
 - **Interrupting a BigQuery run waits for the in-flight query.** Cancelling a
   BigQuery job needs a write scope, and read-only was judged worth more.
   The same is true of SQL Server, whose driver has no way to cancel a query.
@@ -322,7 +384,8 @@ stated plainly rather than buried.
 - **SQL Server `datetime2(7)` and `datetimeoffset(7)` are compared at
   microseconds**, the precision the other engines hold: the seventh digit (100
   ns) is truncated, never rounded, so `23:59:59.9999995` stays on its day.
-  Every run comparing such a column says so. `datetime` (1/300 s ticks)
+  Every run comparing such a column says so. As a *key* such a column is
+  compared exactly. `datetime` (1/300 s ticks)
   compares as its displayed milliseconds, `.003`/`.007`, which is what tools
   export; a target that stored the exact tick (`.003333`) will differ.
   `datetimeoffset` is compared as an instant in UTC.

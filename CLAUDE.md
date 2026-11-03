@@ -321,8 +321,26 @@ exactly how a parity tool loses trust. Make it configurable later
 ### 4.3 NULL handling and field separation
 
 - NULL renders as the literal sentinel `\N`, never SQL NULL:
-  `coalesce(<expr>, '\N')`. An un-coalesced NULL would poison the whole
-  concatenation and silently mask differences.
+  `coalesce(<expr>, chr(92) || 'N')`. An un-coalesced NULL would poison the
+  whole concatenation and silently mask differences. The backslash is always
+  built from its code point (`chr(92)`, MySQL `char(92 using utf8mb4)`, SQL
+  Server `nchar(92)`), never written as `'\N'`: under PostgreSQL
+  `standard_conforming_strings = off` that literal is `'N'` (RT-D1).
+- **Text is escaped, or the sentinel and the separator are forgeable**
+  (RT-A1–A4, B1–B3). Unescaped, the four bytes of the string `\N` equalled
+  NULL, and a chr(31) inside a value moved a field boundary, so `('a\x1fb',
+  'c')` equalled `('a', 'b\x1fc')` - false matches on ordinary data, and the
+  same collision merged two composite keys. Every STRING value and every
+  unmapped-type fallback cast therefore goes through `Dialect.escape_text`:
+  double each backslash first, then write chr(31) as `\s`. No field can then
+  equal `\N` or contain chr(31), and text without either renders exactly as
+  before, so no ordinary checksum moved. The Python spec is
+  `escape_canonical_text`. **`replace()` follows collation**: it runs under
+  `collate "C"` on PostgreSQL (a nondeterministic ICU collation refuses
+  substring search), `Latin1_General_BIN2` on SQL Server (Windows collations
+  treat chr(31) as ignorable), and `collate(x, '')` on BigQuery - verified
+  live that BigQuery's `REPLACE` under `und:ci` silently leaves chr(31) in
+  place.
 - **The BOOLEAN expression must use `when not c`, never `else`.** With
   `case when c then 'true' else 'false' end` a NULL boolean falls into the
   `else` branch and renders `'false'`, so the `coalesce` never fires and a NULL
@@ -330,9 +348,9 @@ exactly how a parity tool loses trust. Make it configurable later
   that wrong answer, so a cross-engine equality test could not see it - it was
   caught only by a test that planted a NULL-versus-FALSE difference and
   asserted the tool found it. This is the same bug class as NULL versus `''`.
-- Fields join with `concat_ws(chr(31), ...)` — ASCII Unit Separator, which
-  effectively never occurs in warehouse string data and is spelled identically
-  in both engines.
+- Fields join with `concat_ws(chr(31), ...)` — ASCII Unit Separator, spelled
+  identically in every engine. "Effectively never occurs" was not good enough:
+  it is escaped out of every text value (above), so it cannot occur.
 
 ### 4.4 Engine type names — they do not look alike
 
@@ -644,6 +662,63 @@ differences — stopped early".
 
 `--max-diffs 0` on the CLI, or `max_diffs=None` in the library, lifts the limit
 for anyone who genuinely wants every row and has the memory for it.
+
+### 4.11 Red-team findings and the rules they left (2026-11-03)
+
+A campaign of seven adversarial angles (values, keys, schema, live sessions,
+CLI, differential fuzzing, mutation testing; ~600 tests in `tests/redteam/`,
+each confirmed bug a strict xfail until fixed, then a regression test) found
+the false matches listed in the CHANGELOG. Rules that came out of it:
+
+- **Keys are exact, never at the float scale** (`normalize_key`). DECIMAL keys
+  render as their minimal exact text (`1.50` → `1.5`, `42.000` → `42`, so an
+  integral decimal key matches an integer one); FLOAT keys are refused (no
+  rendering of a double is exact *and* identical everywhere); a sub-µs
+  timestamp key renders all its digits only when it has them (DuckDB
+  `TIMESTAMP_NS`, SQL Server `datetime2(7)` as 7 digits + `00`); a NULL in any
+  hashed-key column is refused, as for an integer key.
+- **Key uniqueness is counted by bytes, never under a collation.** MySQL
+  `utf8mb4_0900_ai_ci` ignores chr(31) and folds case, so `(5, 944)` and
+  `(59, 44)` counted as one key (found by the fuzzer); PostgreSQL ICU
+  nondeterministic collations fold case. MySQL counts `cast(identity as
+  binary)`, PostgreSQL `collate "C"`, SQL Server SHA-256.
+- **A one-sided column is a schema difference** (`DiffResult.schema_differences`,
+  exit 1) unless set aside with `--exclude`/`--columns`. It used to be a
+  warning under an exit-0 "no differences" headline, which `--quiet` hid.
+- **An unexplained checksum mismatch is never identical**
+  (`DiffResult.unexplained`). If a bucket's checksums differ but its
+  downloaded rows compare equal (SQL Server's driver dropped trailing NULs), the
+  fetch path is lossy and the verdict must say so.
+- **Every dialect call in the walk names its side and table** (`_on_side` in
+  engine.py), with the driver's exception chained as `__cause__`.
+- **PostgreSQL:** tables are always schema-qualified (an unqualified name was
+  introspected in `public` but read through `search_path`); `search_path` is
+  pinned to `pg_catalog` so no user function can shadow a built-in; infinite
+  dates render `infinity`/`-infinity` (what DuckDB's `strftime` prints - `to_char`
+  returned NULL) and BC dates use DuckDB's astronomical years (`0000`, `-43`);
+  the full set of session pins is `SESSION_PINS` in `postgres_dialect.py`,
+  including `idle_in_transaction_session_timeout = 0` and (17+)
+  `transaction_timeout = 0`, without which a role default kills the held
+  snapshot while the other side is still working.
+- **MySQL:** binary renders `\x` + lower hex (PostgreSQL's `bytea` text) -
+  `cast(binary as char)` was NULL for any non-UTF-8 bytes; the session is
+  `READ ONLY` with `sql_mode` pinned; a row past `max_allowed_packet` makes
+  `concat_ws` return NULL, so `row_hash` falls back to hashing per-column md5s
+  rather than letting the row drop out of `sum()`; non-InnoDB tables get a
+  no-snapshot caveat.
+- **SQL Server:** unpaired surrogates render as a marker plus their bytes
+  (UTF-8 conversion turned them all into U+FFFD); downloads fetch the canonical
+  text as `varbinary` UTF-8 bytes; `sql_variant` renders `<BaseType>:<exact>`;
+  the SELECT guard accepts one plain SELECT only.
+- **DuckDB:** extension autoinstall/autoload are off (no network, §6);
+  HUGEINT key spans past 2^127 bucket exactly in UHUGEINT.
+- **Snowflake changes are unverified live** (no account): UTC rendering of
+  `TIMESTAMP_TZ`, `tz_aware`, `VARIANT` type tag, schema-qualified tables, the
+  exact `int_div`, telemetry off. Each needs one live query to confirm.
+- **Additive checksums are not tamper-proof.** Eight crafted row changes can
+  cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
+  needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,
+  not defended: a keyed or non-linear checksum would be the defence.
 
 ## 5. Architecture
 

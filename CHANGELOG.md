@@ -5,6 +5,101 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+> **Upgrade from any earlier version, and re-run comparisons that touched any
+> of the cases below.** A red-team campaign (about 600 adversarial tests across
+> every engine pair, 9,700 differential fuzz cases and mutation testing of the
+> suite itself) found inputs on which 0.3.0 and earlier **reported identical
+> tables that were not**:
+>
+> - a text value that is literally `\N` against a NULL, and an ASCII Unit
+>   Separator (chr 31) inside a text value or a text key, which could shift a
+>   field boundary;
+> - a column present on one side only (exit code 0, "no differences");
+> - PostgreSQL `infinity` / `-infinity` dates and timestamps (they rendered as
+>   NULL) and BC dates (the era was dropped);
+> - an unqualified PostgreSQL table, introspected in `public` but read through
+>   the session's `search_path` (Snowflake had the same gap);
+> - MySQL binary, blob, `bit(n)` and spatial values that are not valid UTF-8
+>   (they rendered as NULL), MySQL rows wider than `max_allowed_packet`, and
+>   MySQL non-transactional (MyISAM, MEMORY) tables written during the run;
+> - DECIMAL and FLOAT keys, which were matched at the 6-place float scale, and
+>   timestamp keys or DuckDB `TIMESTAMP_NS` values, cut to microseconds;
+> - SQL Server `sql_variant` (lossy, and its type dropped), SQL Server text with
+>   unpaired surrogates or trailing NUL characters, DuckDB `UNION` / `VARIANT`
+>   and Snowflake `VARIANT` (type dropped);
+> - PostgreSQL sessions with `standard_conforming_strings = off`, or a function
+>   on `search_path` shadowing a built-in.
+>
+> Every one is fixed below and pinned by a test that plants exactly that
+> difference. Checksums of ordinary data do not change; those of the affected
+> values do, which matters only if you stored checksums.
+
+### Fixed
+
+- **Text and key encoding.** Text and unmapped-type values are escaped before
+  hashing (`\` → `\\`, chr(31) → `\s`, the backslash always built from its code
+  point, under a binary collation on every engine — BigQuery's `REPLACE` under
+  a case-insensitive collation was verified to skip chr(31) otherwise). Keys
+  render exactly: DECIMAL keys as their minimal exact text, sub-microsecond
+  timestamp keys with all their digits; FLOAT keys and NULLs in any key column
+  are refused.
+- **Verdicts.** A column present on one side only is a schema difference: not
+  identical, exit code 1, unless set aside with `--exclude` / `--columns`. A
+  checksum mismatch that the downloaded rows cannot explain is reported as
+  unverified, never as identical. A key whose type differs between the sides is
+  warned about.
+- **PostgreSQL:** infinite and BC dates render distinctly; unqualified tables
+  always mean `public`; materialized views are supported; session settings
+  (`standard_conforming_strings`, `DateStyle`, `IntervalStyle`,
+  `bytea_output`, `lc_monetary`, client encoding, `search_path`, idle and
+  transaction timeouts) are pinned; keys under a nondeterministic collation are
+  counted by bytes; connection errors no longer echo the password.
+- **MySQL:** binary columns render as `\x` + hex and `bit(n)` as its bits; wide
+  rows fall back to a per-column hash; non-InnoDB tables get a no-snapshot
+  warning; the session is READ ONLY with `sql_mode` pinned; TLS options in the
+  URL are honoured (and unknown options refused); passwords containing `/` or
+  `#` no longer leak through URL-parsing errors; backslashes in table names are
+  escaped; `TIMESTAMP` is treated as an instant. Composite and text keys are
+  counted distinct by bytes, so unique keys such as `(5, 944)` / `(59, 44)` or
+  `'a'` / `'A'` are no longer refused as duplicates.
+- **SQL Server:** unpaired surrogates render distinctly instead of as U+FFFD;
+  downloads carry the exact UTF-8 bytes (the driver dropped trailing NULs);
+  `sql_variant` renders as `<base type>:<exact value>`; the SELECT-only guard
+  is a strict single-statement check; `login_timeout` works; tables past ~300
+  columns no longer hit the 8,060-byte row limit.
+- **DuckDB:** `TIMESTAMP_NS` keeps its nanoseconds; `UNION` / `VARIANT` keep
+  their tag; HUGEINT keys spanning more than 2^127 are bucketed exactly;
+  extension autoinstall and autoload are off.
+- **Snowflake** (unverified live — no account was available): instants are
+  rendered in UTC and marked timezone-aware, precisions above microseconds and
+  READ COMMITTED are warned about, `VARIANT` keeps its type, tables are always
+  schema-qualified, the bucket division is exact, client telemetry is off.
+- **BigQuery:** credentials in the URL are refused; views print a
+  not-one-snapshot warning.
+- **Errors** raised during the walk name the side and the table. A FLOAT value
+  past 2^116 is refused naming the side and the column on every engine.
+- **Output:** a value the console cannot encode no longer crashes the report
+  on Windows; text values and keys are quoted and control characters escaped,
+  so a value cannot forge a line of the report, `'NULL'` cannot pass for NULL,
+  and a real `\N` string prints as itself.
+
+### Changed
+
+- **Exit code 1** now also means "a column exists on one side only" or
+  "checksums disagreed unexplained". JSON gains `schema_differences` and
+  `unexplained`; one-sided columns moved there from `warnings`.
+- The human report lists warnings before the rows, quotes text values, and
+  prints unencodable characters as `\uXXXX`.
+- `--max-diffs` below 0 is a usage error (exit 2); `--key ID,id` names one
+  column, not two.
+- Errors from the walk are a `ValueError` naming the side and the table, with
+  the driver's exception as `__cause__`. Dialects are context managers.
+- Checksums change for: text containing `\` or chr(31); DECIMAL- and
+  sub-microsecond-timestamp-keyed tables; MySQL binary-family, `bit` and
+  spatial columns; infinite and BC dates on PostgreSQL; DuckDB `TIMESTAMP_NS`
+  values with nanoseconds and `UNION` / `VARIANT`; SQL Server `sql_variant`;
+  Snowflake non-UTC `TIMESTAMP_TZ` and `VARIANT`.
+
 ### Added
 
 - **SQL Server support** — SQL Server 2019+ and Azure SQL Database / Managed
