@@ -15,8 +15,10 @@ from parity.dialects.base import (
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
     Dialect,
+    float_range_where,
     float_tiny_sql,
     float_zero_text,
+    sql_literal,
 )
 from parity.types import Column, LogicalType
 
@@ -94,8 +96,21 @@ class DuckDBDialect(Dialect):
         self._conn.close()
 
     def query(self, sql: str) -> list[tuple[Any, ...]]:
-        """Run `sql` and return every row as a list of tuples."""
-        return self._conn.execute(sql).fetchall()
+        """Run `sql` and return every row as a list of tuples.
+
+        The FLOAT refusal past 2^116 (`normalize`) arrives as an Invalid Input
+        Error carrying its own text; re-raise it naming the side.
+        """
+        import duckdb
+
+        try:
+            return self._conn.execute(sql).fetchall()
+        except duckdb.Error as exc:
+            text = str(exc)
+            at = text.find(FLOAT_OUT_OF_RANGE_MESSAGE)
+            if at < 0:
+                raise
+            raise self._err(text[at:].splitlines()[0]) from exc
 
     def quote(self, identifier: str) -> str:
         """Wrap an identifier in double quotes, doubling any it contains.
@@ -154,7 +169,8 @@ class DuckDBDialect(Dialect):
                 f"then cast(cast(cast({c} as varchar) as decimal(38,{s})) as varchar) "
                 f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as double) "
                 f"then cast(cast({c} as hugeint) as varchar) || '{frac}' "
-                f"when {c} is not null then error('{FLOAT_OUT_OF_RANGE_MESSAGE}' || cast({c} as varchar)) end"
+                f"when {c} is not null then error('{FLOAT_OUT_OF_RANGE_MESSAGE}' || cast({c} as varchar) "
+                f"|| {sql_literal(float_range_where(column))}) end"
             )
         elif t is LogicalType.DECIMAL:
             expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as varchar)"

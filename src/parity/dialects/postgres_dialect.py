@@ -15,6 +15,7 @@ from parity.dialects.base import (
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
     Dialect,
+    float_range_where,
     sql_literal,
 )
 from parity.types import Column, LogicalType
@@ -90,9 +91,24 @@ class PostgresDialect(Dialect):
         self._conn.close()
 
     def query(self, sql: str) -> list[tuple[Any, ...]]:
-        """Run `sql` and return every row. psycopg hands back tuples already."""
+        """Run `sql` and return every row. psycopg hands back tuples already.
+
+        The FLOAT refusal past 2^116 (`normalize`) surfaces as "invalid input
+        syntax for type double precision" quoting its own text; re-raise that
+        text naming the side, rather than a cast error naming nothing.
+        """
+        import psycopg
+
         with self._conn.cursor() as cur:
-            cur.execute(sql)
+            try:
+                cur.execute(sql)
+            except psycopg.Error as exc:
+                text = str(exc)
+                at = text.find(FLOAT_OUT_OF_RANGE_MESSAGE)
+                if at < 0:
+                    raise
+                line = text[at:].splitlines()[0]
+                raise self._err(line[:-1] if line.endswith('"') else line) from exc
             return cur.fetchall()
 
     def _exists_but_unreadable(self, schema: str, name: str) -> bool:
@@ -185,7 +201,7 @@ class PostgresDialect(Dialect):
                 f"then cast(round(cast({hi} as bigint)::numeric * {FLOAT_EXACT_INT_FROM} "
                 f"+ cast({c} - {hi} * {two53} as bigint), {s}) as text) "
                 f"when {c} is not null then cast(cast('{FLOAT_OUT_OF_RANGE_MESSAGE}' || cast({c} as text) "
-                f"as float8) as text) end"
+                f"|| {sql_literal(float_range_where(column))} as float8) as text) end"
             )
         elif t is LogicalType.DECIMAL:
             expr = f"cast(round(({c})::numeric, {self.float_scale}) as text)"

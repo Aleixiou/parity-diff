@@ -75,6 +75,7 @@ from parity.dialects.base import (
     HASH_HEX_CHARS,
     NULL_SENTINEL,
     Dialect,
+    float_range_where,
     float_tiny_sql,
     float_zero_text,
 )
@@ -112,7 +113,13 @@ _URL_PARAMS = {
 }
 
 #: Leads the text a FLOAT past 2^116 raises with, so `query` can find it.
-_FLOAT_RANGE = re.compile(r"'(" + re.escape(FLOAT_OUT_OF_RANGE_MESSAGE) + r"[^']*)'")
+_FLOAT_RANGE = re.compile(
+    r"'(" + re.escape(FLOAT_OUT_OF_RANGE_MESSAGE) + r".*)' to data type"
+)
+
+#: Leads the canonical text of an nvarchar value that is not valid UTF-16 (an
+#: unpaired surrogate), followed by its UTF-16LE bytes in hex. See `_utf16_safe`.
+INVALID_UTF16_MARKER = "parity: invalid UTF-16 "
 
 
 def _odbc_value(value: str) -> str:
@@ -451,7 +458,7 @@ class SQLServerDialect(Dialect):
                 )
             expr = f"convert({text}, cast({c} as decimal(38,{self.float_scale})))"
         elif t is LogicalType.FLOAT:
-            expr = self._float_text(c, self.float_scale_for(column))
+            expr = self._float_text(c, self.float_scale_for(column), column)
         elif t is LogicalType.BOOLEAN:
             # `when ... = 0`, never `else`: an `else` sends NULL to 'false' and
             # NULL-versus-FALSE would compare equal (CLAUDE.md section 4.3).
@@ -467,11 +474,15 @@ class SQLServerDialect(Dialect):
             # DuckDB has none, so without rtrim every migrated char row
             # differs. Nothing is lost: char(n) cannot tell 'abc' from 'abc '.
             expr = f"rtrim(cast({c} as {text}))"
+            if raw == "nchar":
+                expr = self._utf16_safe(expr)
         elif raw == "uniqueidentifier":
             # SQL Server prints GUIDs upper-case; PostgreSQL and DuckDB lower.
             expr = f"lower(convert({text}, {c}))"
         elif t is LogicalType.STRING:
             expr = f"cast({c} as {text})"
+            if raw in ("nvarchar", "ntext", "sysname"):
+                expr = self._utf16_safe(expr)
         elif raw in ("binary", "varbinary", "image", "timestamp", "rowversion"):
             # Bytes as 0x-hex (style 1); a cast to nvarchar would read them as
             # UTF-16. `timestamp` is rowversion, not a point in time.
@@ -507,7 +518,7 @@ class SQLServerDialect(Dialect):
             c = f"switchoffset({c}, '+00:00')"
         return f"left(convert(nvarchar(max), cast({c} as datetime2(7)), 121), 26)"
 
-    def _float_text(self, c: str, s: int) -> str:
+    def _float_text(self, c: str, s: int, column: Column | None = None) -> str:
         """The canonical text of a double (`canonical_float_text`, base.py).
 
         Below 2^53 that is the shortest round-trip decimal, rounded half away
@@ -540,6 +551,9 @@ class SQLServerDialect(Dialect):
         """
         x = f"cast({c} as float)"
         two = "cast(2 as float)"
+        # The column, in the refusal past 2^116 (RT-E10); quotes doubled for
+        # the N'...' literal.
+        where = float_range_where(column).replace("'", "''") if column else ""
 
         def shortest(q: int, exponent: str) -> str:
             """The shortest repr, from the exact value to q places; `exponent`
@@ -584,7 +598,48 @@ class SQLServerDialect(Dialect):
             f"then convert(nvarchar(max), cast({x} as decimal(38,0))) + N'{frac}' "
             f"when {x} is not null then convert(nvarchar(max), cast("
             f"N'{FLOAT_OUT_OF_RANGE_MESSAGE}' + convert(nvarchar(30), {x}, 3) "
-            f"as int)) end"
+            f"+ N'{where}' as int)) end"
+        )
+
+    def _utf16_safe(self, v: str) -> str:
+        """`v` (nvarchar(max)) as itself, or a marker if it is not valid UTF-16.
+
+        nvarchar stores UTF-16 code units and accepts an unpaired surrogate
+        (`nchar(0xD800)`), which no other engine can hold. `hash_expr` hashes
+        UTF-8, and the conversion to UTF-8 turns every unpaired surrogate into
+        U+FFFD - so `nchar(0xD800)`, `nchar(0xD801)` and a real U+FFFD all
+        hashed alike, a false match (RT-E9), and downloading such a row raised
+        UnicodeDecodeError in the driver (RT-E9b).
+
+        A value is valid exactly when the round trip through UTF-8 gives back
+        the same UTF-16 bytes - compared with their lengths, since SQL Server
+        pads the shorter binary with zeros when comparing. One that is not renders as the marker plus its
+        own UTF-16LE bytes in hex: distinct for distinct values, plain ASCII
+        for the driver, and different from any text the other engines can
+        store unless that text spells the marker itself. Valid text - every
+        value any other engine can hold - takes the first branch and renders
+        exactly as before, so no checksum moves.
+
+        It is not free. Measured on SQL Server 2022, 300,000 rows with three
+        nvarchar columns, one planted difference: 3.2s without the guard,
+        about 4.0s with it, and about 5.6s when every row holds an emoji (a
+        surrogate pair takes the round trip; text without one stops at the
+        LIKE). Only SQL Server's N-types pay it, and a false match is the one
+        outcome this tool cannot afford.
+        """
+        bytes16 = f"convert(varbinary(max), {v})"
+        back = f"convert(varbinary(max), cast({self._utf8(v)} as nvarchar(max)))"
+        # Almost all text holds no surrogate code unit at all, and is valid
+        # without the round trip. A binary, non-supplementary collation sees a
+        # surrogate pair as two code units, so this range catches every
+        # surrogate, paired or not; only those values pay for the round trip.
+        surrogate = "N'%[' + nchar(55296) + N'-' + nchar(57343) + N']%'"
+        return (
+            f"case when {v} collate Latin1_General_BIN2 not like {surrogate} then {v} "
+            f"when {back} = {bytes16} "
+            f"and datalength({back}) = datalength({bytes16}) then {v} "
+            f"when {v} is not null then N'{INVALID_UTF16_MARKER}' "
+            f"+ convert(nvarchar(max), {bytes16}, 1) end"
         )
 
     def _utf8(self, text_expr: str) -> str:

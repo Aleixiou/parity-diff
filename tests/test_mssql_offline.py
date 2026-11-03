@@ -23,6 +23,7 @@ from parity.dialects.base import Dialect, get_dialect
 from parity.dialects.bigquery_dialect import BigQueryDialect
 from parity.dialects.duckdb_dialect import DuckDBDialect
 from parity.dialects.mssql_dialect import (
+    INVALID_UTF16_MARKER,
     MSSQL_FLOAT_MAX_SCALE,
     SQLServerDialect,
     _column,
@@ -96,6 +97,12 @@ def _d(answer=lambda sql: [], error=None, scale=6) -> SQLServerDialect:
 def _col(name: str, raw: str, precision=None) -> Column:
     """A column as `columns()` would build it from INFORMATION_SCHEMA."""
     return _column(name, raw, precision)
+
+
+def _utf16_safe(expr: str) -> str:
+    """`expr` wrapped in the invalid-UTF-16 guard, whose own SQL is pinned by
+    `test_n_types_render_invalid_utf16_as_a_marker_and_valid_text_unchanged`."""
+    return _d()._utf16_safe(expr)
 
 
 # ---------------------------------------------------------- connection string
@@ -410,9 +417,10 @@ def test_arithmetic_never_uses_a_rounding_division():
             ),
         ),
         (_col("c", "char"), "rtrim(cast([c] as nvarchar(max)))"),
-        (_col("c", "nchar"), "rtrim(cast([c] as nvarchar(max)))"),
+        # N-types guard against unpaired surrogates (RT-E9); see the test below.
+        (_col("c", "nchar"), _utf16_safe("rtrim(cast([c] as nvarchar(max)))")),
         (_col("c", "uniqueidentifier"), "lower(convert(nvarchar(max), [c]))"),
-        (_col("c", "nvarchar"), "cast([c] as nvarchar(max))"),
+        (_col("c", "nvarchar"), _utf16_safe("cast([c] as nvarchar(max))")),
         (_col("c", "varchar"), "cast([c] as nvarchar(max))"),
         (
             _col("c", "timestamp"),
@@ -432,6 +440,20 @@ def test_every_type_renders_as_nvarchar_max_inside_the_coalesce(column, expr):
     assert _d().normalize(column) == f"coalesce({expr}, {SENTINEL})"
 
 
+def test_n_types_render_invalid_utf16_as_a_marker_and_valid_text_unchanged():
+    """RT-E9: an unpaired surrogate became U+FFFD on the way to UTF-8, so two
+    different values hashed alike. The guard returns valid text untouched (no
+    checksum moves) and anything else as the marker plus its own bytes;
+    `varchar`, which cannot hold a surrogate, is not guarded at all."""
+    sql = _d().normalize(_col("c", "nvarchar"))
+    v = "cast([c] as nvarchar(max))"
+    assert f"case when {v} collate Latin1_General_BIN2 not like " in sql
+    assert "nchar(55296)" in sql and "nchar(57343)" in sql
+    assert f"datalength(convert(varbinary(max), {v})) then {v} " in sql
+    assert f"N'{INVALID_UTF16_MARKER}' + convert(nvarchar(max), " in sql
+    assert "varbinary" not in _d().normalize(_col("c", "varchar"))
+
+
 def test_float_is_the_two_band_shortest_repr_construction():
     """The pieces the live sample run depends on: the short-circuit to zero,
     the exact-decimal bands, the round-trip test, ties to even, the exact
@@ -443,8 +465,8 @@ def test_float_is_the_two_band_shortest_repr_construction():
     assert f"when abs({x}) < power(cast(2 as float), 53)" in sql
     assert f"then convert(nvarchar(max), cast({x} as decimal(38,0))) + N'.000000'" in sql
     assert (
-        "refusing to round it: ' + convert(nvarchar(30), cast([x] as float), 3) as int)"
-        in sql
+        "refusing to round it: ' + convert(nvarchar(30), cast([x] as float), 3) "
+        "+ N' in column ''x''' as int)" in sql
     )
     # Ties to even at 16 and 17 digits, in both bands; the 16-digit candidate
     # is written twice (tested, then returned), the 17-digit one once.
@@ -519,6 +541,13 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     """`group by 1`, `count(*)`, `count(distinct identity)` and no caveats -
     exactly the text the shared queries always had, so no checksum moves."""
     d: Dialect = dialect(side="A")
+    if isinstance(d, MySQLDialect):
+        # MySQL counts hashed keys by their bytes since RT-E5 / RT-E8: its
+        # default collation merged 'a'/'A' and ignored the chr(31) separator.
+        # Only the uniqueness count changed - no checksum or row text did.
+        assert d.count_distinct_key(TEXT_KEY, "x") == "count(distinct cast(x as binary))"
+        assert d.count_distinct_key(INT_KEY, "x") == "count(distinct x)"
+        return
     if isinstance(d, BigQueryDialect):
         d.project, d.default_schema = "p", "d"
     seen: list[str] = []

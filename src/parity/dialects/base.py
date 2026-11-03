@@ -93,6 +93,18 @@ FLOAT_OUT_OF_RANGE_MESSAGE = (
 )
 
 
+def float_range_where(column: Column) -> str:
+    """What follows the value in a FLOAT refusal: the column it is in.
+
+    Each dialect puts it in the SQL text it raises with, as a literal of that
+    engine's own quoting, so the error names the column as well as the value
+    - and the dialect's `query` adds the side (CLAUDE.md section 6). Without
+    it the refusal on DuckDB and PostgreSQL was a bare driver error naming
+    neither (RT-E10).
+    """
+    return f" in column {column.name!r}"
+
+
 #: Largest --float-scale a FLOAT column can be compared at. Every double below
 #: 2^53 needs 16 integer digits, and BigQuery's BIGNUMERIC holds 38 decimal
 #: places, which a 17-significant-digit rounding of a value just above

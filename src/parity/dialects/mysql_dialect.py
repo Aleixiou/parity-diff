@@ -28,11 +28,13 @@ from urllib.parse import unquote, urlparse
 from parity.dialects.base import (
     FLOAT_EXACT_INT_FROM,
     FLOAT_MAX_MAGNITUDE_SQL,
+    FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
     Dialect,
+    float_range_where,
     sql_literal,
 )
-from parity.types import Column, LogicalType
+from parity.types import Column, KeySpec, LogicalType
 
 #: MySQL's widest DECIMAL: 65 significant digits, at most 30 after the point.
 #: A DECIMAL column can never hold more, which is what makes the out-of-range
@@ -43,6 +45,12 @@ MYSQL_MAX_DECIMAL_SCALE = 30
 #: Leads the text a too-wide DECIMAL raises with, so `query` can recognise it.
 DECIMAL_RANGE_MARKER = "parity: DECIMAL value "
 _DECIMAL_RANGE_ERROR = re.compile(r"'(" + re.escape(DECIMAL_RANGE_MARKER) + r".*)' for")
+
+#: Leads the text a FLOAT past 2^116 raises with. Short, because MySQL cuts
+#: the quoted UUID_TO_BIN argument at 128 characters and the value and column
+#: must survive; `query` expands it to `FLOAT_OUT_OF_RANGE_MESSAGE`.
+FLOAT_RANGE_MARKER = "parity: FLOAT value "
+_FLOAT_RANGE_ERROR = re.compile(r"'" + re.escape(FLOAT_RANGE_MARKER) + r"(.*)' for")
 
 
 class MySQLDialect(Dialect):
@@ -127,6 +135,9 @@ class MySQLDialect(Dialect):
             cur.execute(sql)
             return list(cur.fetchall())
         except mysql.connector.Error as exc:
+            huge = _FLOAT_RANGE_ERROR.search(str(exc))
+            if huge is not None:
+                raise self._err(FLOAT_OUT_OF_RANGE_MESSAGE + huge.group(1)) from exc
             # The out-of-range DECIMAL guard (`_decimal_text`) raises through
             # UUID_TO_BIN; say what actually happened, and on which side.
             found = _DECIMAL_RANGE_ERROR.search(str(exc))
@@ -217,8 +228,11 @@ class MySQLDialect(Dialect):
             # Past 2^116 the high half overflows BIGINT, and MySQL's CAST would
             # *clamp* it silently - two different huge values comparing equal.
             # MySQL has no error() and a SELECT turns most errors into
-            # warnings, but exp() overflow is a hard error (1690), so that
-            # branch raises "DOUBLE value is out of range in 'exp(...)'".
+            # warnings, so that branch raises through UUID_TO_BIN, exactly as
+            # the DECIMAL guard does (see `_decimal_text`), and `query` names
+            # the side, the column and the value. It used to be exp() overflow
+            # (1690), which said only "DOUBLE value is out of range in
+            # 'exp(...)'" - nothing a user could act on (RT-E10).
             # MySQL DOUBLE cannot hold Infinity or NaN, so no tokens here.
             s = self.float_scale_for(column)
             hi = f"truncate({c} / {FLOAT_EXACT_INT_FROM}, 0)"
@@ -230,7 +244,10 @@ class MySQLDialect(Dialect):
                 f"* {FLOAT_EXACT_INT_FROM} "
                 f"+ cast({c} - {hi} * {FLOAT_EXACT_INT_FROM} as signed) "
                 f"as decimal(65,{s})) "
-                f"when {c} is not null then cast(exp(abs({c})) as char) end"
+                f"when {c} is not null then cast(uuid_to_bin(concat("
+                f"'{FLOAT_RANGE_MARKER}', cast({c} as char), "
+                f"convert(0x{float_range_where(column).encode().hex()} using utf8mb4)"
+                f")) as char) end"
             )
         elif t is LogicalType.BOOLEAN:
             # MySQL BOOLEAN is an alias for TINYINT(1): 0 or 1, never a real
@@ -294,6 +311,23 @@ class MySQLDialect(Dialect):
             f"else cast(cast({c} as decimal({MYSQL_MAX_DECIMAL_DIGITS},{s})) "
             f"as char) end"
         )
+
+    def count_distinct_key(self, key: KeySpec, identity: str) -> str:
+        """Count distinct keys by their bytes, never under a collation.
+
+        A hashed key's identity is `concat_ws(char(31), ...)` text in the
+        connection collation, utf8mb4_0900_ai_ci by default. That collation is
+        case- and accent-blind ('a' = 'A', 'e' = 'é') and treats control
+        characters as ignorable, so the separator vanishes and the integer keys
+        (5, 944) and (59, 44) both compare as '5944'. Counted under it, unique
+        keys were refused as duplicates (RT-E5, RT-E8). The rows themselves are
+        matched in Python by exact text, so the count is the only place that
+        equality leaked in. A binary string compares byte for byte, with no
+        padding. A single integer key is not text and stays as it is.
+        """
+        if not key.hashed:
+            return super().count_distinct_key(key, identity)
+        return f"count(distinct cast({identity} as binary))"
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.
