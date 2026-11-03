@@ -206,6 +206,7 @@ class _Writer:
     """
 
     def __init__(self, out: TextIO) -> None:
+        """Wrap `out`, remembering its encoding (None for a StringIO)."""
         self.out = out
         self.encoding = getattr(out, "encoding", None)
 
@@ -396,8 +397,11 @@ def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
     name_w = max((len(c) for c in cols.values()), default=0)
 
     def show(values: dict[str, str], col: str) -> str:
-        # A column absent from a side's values is a bug upstream, not an empty
-        # string; say so rather than print something that looks like data.
+        """One side's value of `col`, printed so it cannot pass for another.
+
+        A column absent from a side's values is a bug upstream, not an empty
+        string; say so rather than print something that looks like data.
+        """
         if col not in values:
             return "<missing>"
         return _display(values[col], quoted.get(col, True))
