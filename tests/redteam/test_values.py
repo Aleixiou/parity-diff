@@ -497,11 +497,6 @@ def test_rt_a9_mssql_trailing_nul_dropped_on_fetch(engines, other):
     assert found(r) == [(1, "different")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A10: when checksums disagree but the downloaded rows compare "
-    "equal, the engine reports 'identical' instead of flagging the contradiction",
-)
 def test_rt_a10_checksum_mismatch_with_equal_rows_reads_identical():
     """The engine-level root of RT-A9. Any lossy step between the server's hash
     and Python's `!=` - a driver dropping bytes, a decode replacing them - turns
@@ -621,11 +616,6 @@ def test_rt_a13_mysql_collation_refuses_unique_text_key(engines, pair):
         (("postgres", "id int, x int"), ("duckdb", "id decimal(10,0), x int")),
         (("mysql", "id int, x int"), ("mssql", "id float, x int")),
     ],
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A14: int key vs numeric(10,0)/float key: '1' vs '1.000000', every "
-    "row reported only_in_a + only_in_b with no key-type warning",
 )
 def test_rt_a14_integer_key_vs_decimal_key(engines, a, b):
     """Oracle NUMBER, `numeric(10,0)` and float ids are ordinary migration
@@ -1132,9 +1122,13 @@ def test_rt_a19_duckdb_hugeint_key_span_overflows(engines):
             ("duckdb", ddl, (), [f"insert into {{t}} values ({-big}, 1), ({big}, 2)"]),
             ("duckdb", ddl, (), [f"insert into {{t}} values ({-big}, 1), ({big}, 3)"]),
         )
-    except duckdb.OutOfRangeException as exc:
-        # Only the stated overflow counts as reproducing; anything else errors.
-        assert "INT128" in str(exc), exc
+    except ValueError as exc:
+        # The engine re-raises dialect errors naming side and table (RT-D12),
+        # chained to the driver's own exception. Only the stated overflow
+        # counts as reproducing; anything else errors.
+        if not isinstance(exc.__cause__, duckdb.OutOfRangeException):
+            raise
+        assert "INT128" in str(exc) and "side A" in str(exc), exc
         raise AssertionError(f"RT-A19 reproduced: {exc}") from exc
     assert found(r) == [(big, "different")]
 

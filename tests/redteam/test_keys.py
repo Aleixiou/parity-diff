@@ -287,7 +287,10 @@ def _wagner_values(keys, orig: str = "orig", bits: int = 16) -> list[str] | None
     for k in keys:
         base = row_hash(f"{k}\x1f{orig}")
         lists.append(
-            [((row_hash(f"{k}\x1ft{j}") - base) % m, (f"t{j}",)) for j in range(1 << bits)]
+            [
+                ((row_hash(f"{k}\x1ft{j}") - base) % m, (f"t{j}",))
+                for j in range(1 << bits)
+            ]
         )
     level = 1
     while len(lists) > 1:
@@ -298,7 +301,11 @@ def _wagner_values(keys, orig: str = "orig", bits: int = 16) -> list[str] | None
             for y, q in right:
                 by_low.setdefault((-y) & mask, []).append((y, q))
             merged.append(
-                [((x + y) % m, p + q) for x, p in left for y, q in by_low.get(x & mask, ())]
+                [
+                    ((x + y) % m, p + q)
+                    for x, p in left
+                    for y, q in by_low.get(x & mask, ())
+                ]
             )
         lists = merged
         level += 1
@@ -492,10 +499,6 @@ def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B8: int key vs decimal(18,0) key - every row only_in_a/only_in_b, no warning",
-)
 def test_rt_b8_key_whose_type_differs_between_sides_is_named(tmp_path):
     """A bigint key migrated to `decimal(18,0)` (Oracle NUMBER, Snowflake NUMBER
     with a scale, a CSV round-trip). Both sides hash, rendering `42` against
@@ -1064,7 +1067,6 @@ def test_live_mssql_ci_keys_against_postgres(pg_rt, mssql_rt):
     assert _found(result) == [("abc ", "different")]
 
 
-
 # ===========================================================================
 # Wave 2: findings and controls added after the resume
 # ===========================================================================
@@ -1074,10 +1076,6 @@ def test_live_mssql_ci_keys_against_postgres(pg_rt, mssql_rt):
 
 @pytest.mark.postgres
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B8: timestamptz key vs naive local-time key - all rows misreported, no warning",
-)
 def test_rt_b8_timezone_aware_key_against_naive_key_is_named(pg_rt, tmp_path):
     """`timestamptz` -> `timestamp` holding local wall-clock is one of the
     commonest migration changes. For a *column* the engine warns
@@ -1277,9 +1275,7 @@ def test_rt_b12_control_postgres_bytea_keys_are_exact(pg_rt):
 @pytest.mark.duckdb
 def test_rt_b12_control_duckdb_blob_keys_are_exact(tmp_path):
     """Control: DuckDB renders every byte of a blob key (escaped)."""
-    result = _duck_diff(
-        tmp_path, "k blob, v varchar", BINARY_ROWS_A, BINARY_ROWS_B, "k"
-    )
+    result = _duck_diff(tmp_path, "k blob, v varchar", BINARY_ROWS_A, BINARY_ROWS_B, "k")
     assert sorted(kind for _, kind in _found(result)) == [
         "different",
         "only_in_a",
@@ -1316,8 +1312,11 @@ def test_rt_b13_hugeint_key_range_does_not_crash(tmp_path, keys):
     rows_b = [(keys[0], "x"), (keys[1], "y")]
     try:
         result = _duck_diff(tmp_path, "k hugeint, v varchar", rows_a, rows_b, "k")
-    except duckdb.OutOfRangeException as exc:
-        # The xfail is for *this* crash only; any other error fails the test.
+    except ValueError as exc:
+        # Since RT-D12 the engine re-raises it naming side and table, chained
+        # to the driver's exception; the xfail is for *this* crash only.
+        if not isinstance(exc.__cause__, duckdb.OutOfRangeException):
+            raise
         if "Overflow" not in str(exc):
             raise
         raise OverflowError(str(exc)) from exc
@@ -1378,9 +1377,7 @@ def test_live_mssql_bucket_expression_matches_bucket_bounds(mssql_rt):
     cases = [(I64_MIN, I64_MAX + 1, 32), (0, 10**8 + 1, 32)]
     for _ in range(25):
         lo = rnd.randint(I64_MIN, I64_MAX - 2)
-        hi = rnd.randint(
-            lo + 2, min(I64_MAX + 1, lo + rnd.choice([10**3, 10**9, 2**64]))
-        )
+        hi = rnd.randint(lo + 2, min(I64_MAX + 1, lo + rnd.choice([10**3, 10**9, 2**64])))
         cases.append((lo, hi, rnd.choice([2, 3, 7, 32, 97])))
     keys: set[int] = set()
     for lo, hi, n in cases:

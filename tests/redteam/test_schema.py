@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlparse
 import pytest
 from conftest import MSSQL_URL, PG_URL, duckdb_write
 
-from parity.cli import EXIT_IDENTICAL, main
+from parity.cli import EXIT_DIFFERENCES, main
 from parity.dialects.base import MAX_CONCAT_ARGS, get_dialect
 from parity.engine import _is_tz_aware, diff
 from parity.types import Column
@@ -386,13 +386,13 @@ def test_snowflake_nanosecond_timestamps_carry_a_caveat():
 
 
 # ============================================================ one-sided columns
-# Not a code bug - it is documented and pinned in test_engine.py - but this is
-# exactly what a user sees when a column is renamed during the migration and
-# its values also changed: a green verdict and exit 0.
+# A column renamed during the migration whose values also changed. This used
+# to be a green verdict and exit 0 with only a warning; since RT-F1 an
+# uncompared column is a schema difference: not identical, exit 1.
 
 
-def test_a_renamed_column_with_changed_values_exits_zero_with_only_a_warning(tmp_path):
-    """Pin the exact user-visible behaviour: green headline, exit 0, warning."""
+def test_a_renamed_column_with_changed_values_is_not_identical(tmp_path):
+    """Pin the user-visible behaviour: no all-clear headline, exit 1, named."""
     a = _duck(
         tmp_path,
         "a",
@@ -409,22 +409,22 @@ def test_a_renamed_column_with_changed_values_exits_zero_with_only_a_warning(tmp
     base += ["--b", f"duckdb:///{b}", "--b-table", "t", "--key", "id"]
 
     out = io.StringIO()
-    assert main(base, out=out) == EXIT_IDENTICAL
+    assert main(base, out=out) == EXIT_DIFFERENCES
     text = out.getvalue()
-    assert "no differences in 2 rows" in text.splitlines()[0]
+    assert "schemas differ" in text.splitlines()[0]
     assert "not compared, present only on side A: ['amount']" in text
     assert "not compared, present only on side B: ['amount_usd']" in text
     assert "no comparable columns" in text
 
     out = io.StringIO()
-    assert main([*base, "--json"], out=out) == EXIT_IDENTICAL
+    assert main([*base, "--json"], out=out) == EXIT_DIFFERENCES
     doc = json.loads(out.getvalue())
-    assert doc["identical"] is True and doc["columns_compared"] == []
-    assert any("amount_usd" in w for w in doc["warnings"])
+    assert doc["identical"] is False and doc["columns_compared"] == []
+    assert any("amount_usd" in w for w in doc["schema_differences"])
 
     out = io.StringIO()
-    assert main([*base, "--quiet"], out=out) == EXIT_IDENTICAL
-    assert out.getvalue() == "", "--quiet: a CI log shows nothing at all"
+    assert main([*base, "--quiet"], out=out) == EXIT_DIFFERENCES
+    assert out.getvalue() == "", "--quiet prints nothing; the exit code carries it"
 
 
 def test_postgres_63_byte_truncation_splits_one_column_into_two_one_sided(pg, tmp_path):
@@ -439,9 +439,10 @@ def test_postgres_63_byte_truncation_splits_one_column_into_two_one_sided(pg, tm
         "insert into lng values (1, 2)",
     )
     result = _run(PG_URL, f"duckdb:///{b}", f"{PG_SCHEMA}.lng", "lng", "id")
-    assert result.identical  # the planted 1-vs-2 is not seen ...
+    assert not result.identical  # the planted 1-vs-2 is not seen, but ...
     assert result.columns == []
-    joined = "\n".join(result.warnings)  # ... but every reason is printed
+    # ... the split column is a schema difference, and every reason printed.
+    joined = "\n".join(result.schema_differences + result.warnings)
     assert "c" * 63 + "'" in joined and long in joined
     assert "no comparable columns" in joined
 
@@ -960,10 +961,6 @@ def test_mysql_datetime_against_postgres_timestamptz_warns(my, mysql_url, pg):
 
 
 @pytest.mark.parametrize("enum_side", ["duck", "pg"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C13: enum vs text warns 'will very likely all differ' though it matches",
-)
 def test_enum_against_text_does_not_predict_every_row_differs(pg, tmp_path, enum_side):
     """Labels equal on row 1, a planted difference on row 2."""
     if enum_side == "pg":

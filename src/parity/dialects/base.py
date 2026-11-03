@@ -20,9 +20,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeVar
 
 from parity.types import Column, KeySpec, KeyStats, LogicalType
+
+_D = TypeVar("_D", bound="Dialect")
 
 # Field separator inside a row's canonical text. Unit Separator (0x1f) is
 # chosen because it effectively never appears in warehouse string data;
@@ -204,6 +206,20 @@ class Dialect(ABC):
     @abstractmethod
     def close(self) -> None:
         """Close the connection."""
+
+    def __enter__(self: _D) -> _D:
+        """`with get_dialect(...) as a:` closes the connection however it ends.
+
+        `diff` never closes the dialects it is handed - the caller owns them.
+        A PostgreSQL side left open after a diff raises sits idle in its
+        REPEATABLE READ snapshot, holding back vacuum, so library callers
+        should close in a `finally` or use this.
+        """
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Close the connection on leaving the `with` block."""
+        self.close()
 
     @abstractmethod
     def query(self, sql: str) -> list[tuple[Any, ...]]:

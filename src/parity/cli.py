@@ -21,7 +21,7 @@ from typing import Any, TextIO
 from parity import __version__
 from parity.dialects.base import NULL_SENTINEL
 from parity.engine import DEFAULT_MAX_DIFFS
-from parity.types import DiffResult, RowDiff
+from parity.types import DiffResult, LogicalType, RowDiff
 
 #: Exit codes. `1` means "differences found", not "crashed" - a CI job can tell
 #: an honest disagreement from a broken connection string.
@@ -49,7 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
             "data - without moving the data out of either engine."
         ),
         epilog=(
-            "exit codes: 0 identical, 1 differences found, 2 error. "
+            "exit codes: 0 identical, 1 not identical (row differences, a "
+            "column only one side has, or a checksum mismatch the rows could "
+            "not explain), 2 error. "
             "Connection strings look like postgres://user:pw@host/db or "
             "duckdb:///path/to.duckdb"
         ),
@@ -106,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.add_argument(
         "--max-diffs",
-        type=int,
+        type=_non_negative_int,
         default=DEFAULT_MAX_DIFFS,
         metavar="N",
         help=f"stop after N differences (default: {DEFAULT_MAX_DIFFS:,}; 0 for "
@@ -122,6 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="print nothing; rely on the exit code",
     )
     return parser
+
+
+def _non_negative_int(value: str) -> int:
+    """An integer of at least zero, for `--max-diffs`.
+
+    A negative limit counts as "already reached" before the first bucket, so
+    `--max-diffs -1` turned two identical tables into "at least 0 differences",
+    exit 1 - a verdict about data never looked at. argparse refuses it, exit 2.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be 0 (no limit) or a positive number, got {n}"
+        )
+    return n
 
 
 def _split(value: str | None) -> list[str]:
@@ -171,41 +191,115 @@ def _symbols(out: TextIO) -> dict[str, str]:
     return {"bad": "✗", "ok": "✓", "dot": "·", "partial": "!"}
 
 
+class _Writer:
+    """Write lines that the stream can always encode.
+
+    The glyphs fall back to ASCII via `_symbols`, but data values cannot: a
+    changed value holding CJK or an emoji, written to a cp1252 stream (the
+    Windows default for redirected or piped stdout before Python 3.15), raised
+    UnicodeEncodeError half-way through the report - after the headline was
+    printed - and the run exited 2, "the tool broke", instead of 1 with the
+    evidence. Each line is therefore encoded with `backslashreplace` first,
+    so an unencodable character prints as its `\\u` escape: still exact, and
+    still distinct from any other value. A stream without an encoding (a
+    StringIO) takes text as it is.
+    """
+
+    def __init__(self, out: TextIO) -> None:
+        self.out = out
+        self.encoding = getattr(out, "encoding", None)
+
+    def line(self, text: str = "") -> None:
+        """Write one line, made encodable for this stream."""
+        if self.encoding:
+            try:
+                text.encode(self.encoding)
+            except UnicodeEncodeError:
+                text = text.encode(self.encoding, "backslashreplace").decode(
+                    self.encoding
+                )
+            except LookupError:
+                text = text.encode("ascii", "backslashreplace").decode("ascii")
+        print(text, file=self.out)
+
+
+def _escape(text: str) -> str:
+    """Neutralise characters that would act on the terminal instead of printing.
+
+    Column names, keys and warnings come from the databases, and a newline or
+    an ANSI escape in one can forge a whole line of the report - a fake
+    "no differences" headline, or a cursor move that overwrites the real one.
+    Every non-printable character is written as its escape instead.
+    """
+    if text.isprintable():
+        return text
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
+#: Logical types whose canonical text is a fixed, engine-produced format -
+#: digits, dates, `true`/`false`, `Infinity` - and so can be printed bare.
+#: Anything else holds arbitrary text, and is quoted so it cannot be confused
+#: with NULL, with an empty string, or with the report's own layout.
+_BARE_TYPES = frozenset(
+    {
+        LogicalType.INTEGER,
+        LogicalType.DECIMAL,
+        LogicalType.FLOAT,
+        LogicalType.BOOLEAN,
+        LogicalType.DATE,
+        LogicalType.TIMESTAMP,
+    }
+)
+
+
+def _display(value: str, quoted: bool = True) -> str:
+    """Render one canonical value for a human, unambiguously.
+
+    A real SQL NULL prints as a bare `NULL`. Text prints quoted, Python-repr
+    style, so the four letters `'NULL'`, an empty `''`, the two characters
+    `"''"` and a value with a trailing space all look different from each
+    other and from a NULL - a difference whose two sides print alike is a
+    report nobody can act on. Quoting also escapes newlines and terminal
+    control sequences (see `_escape`).
+
+    The value is the canonical text the engines compared, and `NULL_SENTINEL`
+    is how that text spells NULL. JSON output keeps the raw canonical text.
+    """
+    if value == NULL_SENTINEL:
+        return "NULL"
+    if quoted:
+        return repr(value)
+    return _escape(value)
+
+
 def _display_key(key: int | str) -> str:
     """Render a row key for a human.
 
     A composite key's canonical text is joined by ASCII Unit Separator, which
     is exactly right for hashing and unreadable on a terminal. Show the parts
-    separated visibly instead. JSON keeps the raw text, so a machine still sees
-    what was actually compared.
+    separated visibly instead, each quoted like any other text so that a
+    hostile key cannot carry a newline or an escape sequence into the report.
+    JSON keeps the raw text, so a machine still sees what was actually compared.
     """
-    if isinstance(key, str) and "" in key:
-        return " | ".join(_display(part) for part in key.split(""))
-    return _display(key) if isinstance(key, str) else str(key)
-
-
-def _display(value: str) -> str:
-    """Make canonical text readable without misrepresenting it.
-
-    `\\N` is the NULL sentinel and `''` is a genuinely empty string - the
-    distinction is the whole point of the NULL-versus-empty-string trap, and
-    printing the empty one as nothing at all makes the report look broken.
-    JSON output keeps the raw canonical text for machines.
-    """
-    if value == NULL_SENTINEL:
-        return "NULL"
-    if value == "":
-        return "''"
-    return value
+    if isinstance(key, str):
+        return " | ".join(_display(part) for part in key.split("\x1f"))
+    return str(key)
 
 
 def render_human(result: DiffResult, out: TextIO) -> None:
     """Write the report a person reads: verdict first, then the evidence.
 
+    Anything that qualifies the verdict - a schema difference, an unexplained
+    checksum mismatch, the float scale, every warning - comes straight after
+    the headline, before the row listing. Printed at the bottom, under a
+    hundred listed rows, the one line explaining that every row is "missing"
+    because the key changed type is the line nobody reads.
+
     The rows-downloaded percentage is always printed - it is the proof that
     the tool pushed the work into the engines, and a figure that suddenly
     reads 100% is how someone finds out their key column is wrong.
     """
+    w = _Writer(out)
     sym = _symbols(out)
     stats = result.stats
     total = max(stats.rows_compared_a, stats.rows_compared_b)
@@ -225,16 +319,28 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         headline = (
             f"{sym['bad']} {_plural(len(result.diffs), 'difference')} in {total:,} rows"
         )
+    elif result.unexplained:
+        headline = (
+            f"{sym['bad']} not verified: checksums differ in "
+            f"{_plural(len(result.unexplained), 'key range')} that the downloaded "
+            f"rows cannot explain"
+        )
+    elif result.schema_differences:
+        # The shared columns matched, but not every column was compared, so
+        # this must not read as the all-clear (RT-F1).
+        headline = (
+            f"{sym['bad']} schemas differ: no row differences in {total:,} rows, "
+            f"but not every column could be compared"
+        )
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
-    print(headline, file=out)
+    w.line(headline)
 
     dot = f" {sym['dot']} "
     queries = f"{stats.queries:,} quer{'y' if stats.queries == 1 else 'ies'}"
-    print(
+    w.line(
         f"  {queries}{dot}{stats.rows_downloaded:,} rows downloaded "
-        f"({pct:.2f}% of both tables){dot}{stats.seconds:.1f}s",
-        file=out,
+        f"({pct:.2f}% of both tables){dot}{stats.seconds:.1f}s"
     )
 
     if result.diffs:
@@ -244,33 +350,35 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             if result.by_kind(k)
         ]
         if len(counts) > 1:
-            print(f"  {dot.join(counts).strip()}", file=out)
+            w.line(f"  {dot.join(counts).strip()}")
 
-        print(file=out)
+    w.line()
+    for schema in result.schema_differences:
+        w.line(f"  {sym['bad']} schema: {_escape(schema)}")
+    for note in result.unexplained:
+        w.line(f"  {sym['bad']} unverified {_escape(note)}")
+    w.line(f"  comparing floats and decimals at {result.float_scale} decimal places")
+    for warning in result.warnings:
+        w.line(f"  ! {_escape(warning)}")
+
+    if result.diffs:
+        w.line()
+        quoted = {c.name: c.logical_type not in _BARE_TYPES for c in result.columns}
         shown = 0
         for kind in ("only_in_a", "only_in_b", "different"):
             for d in result.by_kind(kind):
                 if shown >= DISPLAY_LIMIT:
                     break
-                _render_diff(d, out)
+                _render_diff(d, w, quoted)
                 shown += 1
         if len(result.diffs) > DISPLAY_LIMIT:
-            print(
+            w.line(
                 f"  ... {len(result.diffs) - DISPLAY_LIMIT:,} more difference(s) "
-                f"found but not shown here; use --json for the full list",
-                file=out,
+                f"found but not shown here; use --json for the full list"
             )
 
-    print(file=out)
-    print(
-        f"  comparing floats and decimals at {result.float_scale} decimal places",
-        file=out,
-    )
-    for warning in result.warnings:
-        print(f"  ! {warning}", file=out)
 
-
-def _render_diff(d: RowDiff, out: TextIO) -> None:
+def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
     """Write one difference.
 
     A changed row shows both values side by side, which is far easier to scan
@@ -278,29 +386,37 @@ def _render_diff(d: RowDiff, out: TextIO) -> None:
     line, at which point they stack.
     """
     label = KIND_LABELS[d.kind]
+    shown_key = _display_key(d.key)
     if d.kind != "different":
-        print(f"  {label:<11} key {_display_key(d.key)}", file=out)
+        w.line(f"  {label:<11} key {shown_key}")
         return
 
-    shown_key = _display_key(d.key)
-    print(f"  {label:<11} key {shown_key:<14} columns: {', '.join(d.columns)}", file=out)
-    name_w = max((len(c) for c in d.columns), default=0)
-    a_vals = {c: _display(d.values_a.get(c, "")) for c in d.columns}
-    b_vals = {c: _display(d.values_b.get(c, "")) for c in d.columns}
+    cols = {c: _escape(c) for c in d.columns}
+    w.line(f"  {label:<11} key {shown_key:<14} columns: {', '.join(cols.values())}")
+    name_w = max((len(c) for c in cols.values()), default=0)
+
+    def show(values: dict[str, str], col: str) -> str:
+        # A column absent from a side's values is a bug upstream, not an empty
+        # string; say so rather than print something that looks like data.
+        if col not in values:
+            return "<missing>"
+        return _display(values[col], quoted.get(col, True))
+
+    a_vals = {c: show(d.values_a, c) for c in d.columns}
+    b_vals = {c: show(d.values_b, c) for c in d.columns}
 
     # Side by side is far easier to scan for the character that moved, but only
     # while the values are short enough to stay on one line.
     a_w = max((len(v) for v in a_vals.values()), default=0)
     if a_w <= _SIDE_BY_SIDE_MAX:
         for col in d.columns:
-            print(
-                f"      {col:<{name_w}}   A {a_vals[col]:<{a_w}}   B {b_vals[col]}",
-                file=out,
+            w.line(
+                f"      {cols[col]:<{name_w}}   A {a_vals[col]:<{a_w}}   B {b_vals[col]}"
             )
     else:
         for col in d.columns:
-            print(f"      {col:<{name_w}}   A {a_vals[col]}", file=out)
-            print(f"      {'':<{name_w}}   B {b_vals[col]}", file=out)
+            w.line(f"      {cols[col]:<{name_w}}   A {a_vals[col]}")
+            w.line(f"      {'':<{name_w}}   B {b_vals[col]}")
 
 
 def to_dict(result: DiffResult) -> dict[str, Any]:
@@ -308,8 +424,9 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
 
     Carries the raw canonical text rather than the human-friendly rendering,
     so a machine sees exactly what was compared. `identical` is false whenever
-    the walk was cut short, so a consumer reading only that field cannot be
-    misled by a partial run.
+    the walk was cut short, a column was left uncompared, or a checksum
+    mismatch went unexplained, so a consumer reading only that field cannot
+    be misled by any of them.
     """
     stats = result.stats
     moveable = stats.rows_compared_a + stats.rows_compared_b
@@ -318,6 +435,12 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
         # that reads only this field can never be misled by a partial run.
         "identical": result.identical,
         "truncated": result.truncated,
+        # Columns one side lacks that were not set aside with --exclude or
+        # --columns. Non-empty means not identical: they were never compared.
+        "schema_differences": result.schema_differences,
+        # Key ranges whose checksums differ but whose downloaded rows could
+        # not account for it. Non-empty means not identical.
+        "unexplained": result.unexplained,
         "difference_count": len(result.diffs),
         "float_scale": result.float_scale,
         "columns_compared": [c.name for c in result.columns],
@@ -433,7 +556,9 @@ def main(
     except Exception as exc:  # noqa: BLE001 - the exit-2 contract, see below
         # Anything that is not a clean verdict is exit 2, never exit 1: a CI
         # job must be able to tell "the tables differ" from "the tool broke".
-        print(f"parity: {exc}", file=err)
+        # Escaped and made encodable like the report: an error can quote a
+        # value or a key straight from the data.
+        _Writer(err).line(f"parity: {_escape(str(exc))}")
         return EXIT_ERROR
 
 

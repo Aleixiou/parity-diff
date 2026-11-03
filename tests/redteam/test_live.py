@@ -404,11 +404,6 @@ def test_pg_mid_walk_writes_stay_invisible_to_the_whole_diff(pg_url, pgw, tmp_pa
     assert {d.key for d in fresh.diffs} == {11, 30, 150, 200, 100000, 230230}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D8: client_encoding=SQL_ASCII makes psycopg return bytes and the "
-    "walk dies with a bare TypeError that names neither side nor table",
-)
 def test_pg_sql_ascii_client_encoding_fails_naming_the_side(pg_url, pgw, tmp_path):
     """PGCLIENTENCODING / a role default of SQL_ASCII. Failing is fine - the
     error must say which side broke (CLAUDE.md section 6)."""
@@ -448,28 +443,15 @@ CLI_ENVIRONMENTS: dict[str, dict[str, str | None]] = {
     "locale-de": {"LANG": "de_CH.UTF-8", "LC_ALL": "de_CH.UTF-8", "LANGUAGE": "de"},
 }
 
-RT_D9 = (
-    "RT-D9: human output to a stdout that cannot encode a differing value "
-    "(cp1252: the Windows default for a redirected stdout before Python 3.15) "
-    "crashes with exit 2 instead of reporting the difference"
-)
-
 
 def _cli_cases():
+    # RT-D9 (fixed): human output to a stdout that cannot encode a differing
+    # value (cp1252, the Windows default for a redirected stdout before Python
+    # 3.15) used to crash with exit 2; the python-cp1252 and
+    # python-default-pipe human cases pin that it now reports the difference.
     for env_name in CLI_ENVIRONMENTS:
         for fmt in ("--json", "human"):
-            marks = []
-            if fmt == "human" and env_name == "python-cp1252":
-                marks = [pytest.mark.xfail(strict=True, reason=RT_D9)]
-            if fmt == "human" and env_name == "python-default-pipe":
-                marks = [
-                    pytest.mark.xfail(
-                        sys.platform == "win32" and sys.version_info < (3, 15),
-                        strict=True,
-                        reason=RT_D9,
-                    )
-                ]
-            yield pytest.param(env_name, fmt, marks=marks, id=f"{env_name}-{fmt}")
+            yield pytest.param(env_name, fmt, id=f"{env_name}-{fmt}")
 
 
 @pytest.mark.parametrize("env_name, fmt", list(_cli_cases()))
@@ -1151,11 +1133,6 @@ def test_pg_nondeterministic_collation_text_key_is_not_called_duplicate(pgw, pg_
     assert found(result) == [("b", "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D12: an engine error raised mid-walk (here a role-default "
-    "statement_timeout) reaches the user without naming the side or table",
-)
 def test_pg_query_error_names_the_side(pg_url, pgw):
     """CLAUDE.md section 6: errors must name the side and the table. Only
     connect-time and a few dialect-specific errors do; any server error from a
