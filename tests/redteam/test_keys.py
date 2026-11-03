@@ -1204,13 +1204,6 @@ def test_rt_b11_control_duckdb_renders_infinity(tmp_path):
 
 
 @pytest.mark.mysql
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B12: MySQL varbinary key with non-UTF-8 bytes renders NULL "
-        "-> distinct keys match"
-    ),
-)
 def test_rt_b12_mysql_binary_keys_are_not_merged(mysql_rt):
     """`cast(k as char)` of bytes that are not valid utf8mb4 is SQL NULL (with
     only a warning), so it becomes the NULL sentinel: 0xFF01 on side A and
@@ -1232,10 +1225,6 @@ def test_rt_b12_mysql_binary_keys_are_not_merged(mysql_rt):
 
 
 @pytest.mark.mysql
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B12: MySQL binary(16) UUID keys all render '\\N' -> false 'not unique'",
-)
 def test_rt_b12_mysql_binary16_uuid_keys_are_unique(mysql_rt):
     """`binary(16)` is *the* MySQL idiom for UUID primary keys; random UUID
     bytes are almost never valid UTF-8, so the whole table collapses to a
@@ -1248,13 +1237,6 @@ def test_rt_b12_mysql_binary16_uuid_keys_are_unique(mysql_rt):
 
 
 @pytest.mark.mysql
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B12: MySQL varbinary value change between non-UTF-8 bytes "
-        "(or to NULL) is invisible"
-    ),
-)
 def test_rt_b12_mysql_binary_value_changes_are_found(mysql_rt):
     """Same mechanism on a compared column. The run does warn "unmapped types,
     compared as raw text (may differ ...)", which promises false alarms, not

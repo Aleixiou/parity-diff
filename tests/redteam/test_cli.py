@@ -33,6 +33,7 @@ import pytest
 from conftest import duckdb_write
 
 from parity.cli import EXIT_DIFFERENCES, EXIT_ERROR, EXIT_IDENTICAL, main
+from parity.dialects.mysql_dialect import SQL_MODE
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -690,11 +691,6 @@ def test_postgres_parse_errors_do_not_print_the_password(conn):
         f"mysql://parity:{SECRET}#x@127.0.0.1:3306/parity_test",
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F3: an unencoded / or # in a MySQL password leaks its first "
-    "part through urlparse's port error, which also omits the side",
-)
 def test_mysql_unencoded_password_does_not_leak(conn):
     """Offline: urlparse raises before the driver is reached."""
     pytest.importorskip("mysql.connector")
@@ -707,22 +703,12 @@ def test_mysql_unencoded_password_does_not_leak(conn):
     "conn",
     ["mysql://u:p@127.0.0.1:99999/db", "mysql://u:p@[::1/db"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F3: a MySQL URL urlparse rejects (port out of range, unclosed "
-    "IPv6 bracket) errors without naming the side",
-)
 def test_mysql_bad_url_names_the_side(conn):
     """Offline: `Port out of range 0-65535` / `Invalid IPv6 URL`, no [side A]."""
     pytest.importorskip("mysql.connector")
     assert "side A" in _connect_error(conn)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F18: the MySQL dialect drops the URL query string, so "
-    "?ssl_mode=REQUIRED&ssl_ca=... is silently ignored and TLS is not enforced",
-)
 def test_mysql_url_options_are_honoured_or_refused(monkeypatch):
     """Offline: what reaches `mysql.connector.connect` for a URL with options.
 
@@ -1086,17 +1072,13 @@ def test_mysql_receives_only_reads(mysql_url, mysql_orders, duck_orders, monkeyp
     print("mysql statements:", sorted({x.split()[0] for x in log}), len(log))
     assert log and _non_reads(log) == []
     assert _sets(log) == [
+        f"set session sql_mode = '{SQL_MODE}'",
         "set session time_zone = '+00:00'",
-        "set session transaction isolation level repeatable read",
+        "set session transaction isolation level repeatable read, read only",
     ]
 
 
 @pytest.mark.mysql
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F11: the MySQL session is not read-only - nothing but the SQL "
-    "the tool happens to build stops a write (CLAUDE.md section 6)",
-)
 def test_mysql_session_refuses_writes(mysql_url, mysql_orders):
     """PostgreSQL, DuckDB and BigQuery make the *server* refuse a write.
 
@@ -1119,12 +1101,6 @@ def test_mysql_session_refuses_writes(mysql_url, mysql_orders):
 @pytest.mark.parametrize(
     "suffix, needle",
     [("a\\b", "table not found"), ("z\\", "syntax")],
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F17: sql_literal doubles quotes but not backslashes, which "
-    "MySQL treats as escapes - a real table named with a backslash is 'not "
-    "found', and a trailing one escapes the literal (raw 1064, no side named)",
 )
 def test_mysql_table_name_with_a_backslash(mysql_url, suffix, needle):
     """A legal backtick-quoted MySQL name, diffed against itself, must be identical.
@@ -1383,9 +1359,8 @@ def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(
 def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
     """Every packet mysql-connector sends during a full diff, decoded off the wire.
 
-    No statement outside SELECT/SET/SHOW and no command beyond ping/quit. Note
-    what is *absent*: no `START TRANSACTION READ ONLY` and no
-    `transaction_read_only` - the wire confirms RT-F11 from the server's side.
+    No statement outside SELECT/SET/SHOW and no command beyond ping/quit, and
+    the session is made READ ONLY before the first read (RT-F11, fixed).
     """
     u = urlparse(mysql_url)
     tap = _WireTap((u.hostname or "127.0.0.1", u.port or 3306), _mysql_parser, _mysql_greeting)
@@ -1402,7 +1377,10 @@ def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
         assert tap.connections == 1
         assert {t for k, t in tap.log if k == "command"} <= {"ping", "quit"}
         assert [t for t in texts if not _READ.match(t)] == []
-        assert not any("read only" in t.lower() for t in texts)  # RT-F11, seen live
+        # RT-F11: the session is read-only before the diff reads anything.
+        ro = [i for i, t in enumerate(texts) if t.lower().endswith("read only")]
+        first_read = next(i for i, t in enumerate(texts) if "rt_cli_orders" in t)
+        assert ro and ro[0] < first_read, texts[:10]
     finally:
         tap.close()
 

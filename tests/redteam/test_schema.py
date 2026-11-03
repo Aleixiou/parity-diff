@@ -271,10 +271,6 @@ def test_postgres_materialized_view_is_diffable_or_named_honestly(pg, tmp_path):
     ],
     ids=["varbinary", "binary16-uuid", "blob", "bit64", "binary-vs-null", "geometry"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C4: MySQL non-UTF-8 binary renders NULL, so different bytes match",
-)
 def test_mysql_binary_values_that_differ_are_reported(my, mysql_url, ddl, a_val, b_val):
     """Two different byte strings in the same column must not compare equal."""
     for t, v in (("rt_sch_bin_a", a_val), ("rt_sch_bin_b", b_val)):
@@ -924,10 +920,6 @@ def test_snowflake_timestamp_tz_is_rendered_as_an_instant():
 # DATETIME, which *is* naive, warns rightly (control test below).
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C12: MySQL TIMESTAMP is classified tz-naive -> false tz warning",
-)
 def test_mysql_timestamp_against_postgres_timestamptz_raises_no_tz_warning(
     my, mysql_url, pg
 ):

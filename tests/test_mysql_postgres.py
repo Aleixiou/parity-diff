@@ -13,7 +13,7 @@ Skips unless both a MySQL and a PostgreSQL server are reachable.
 from __future__ import annotations
 
 import pytest
-from conftest import PG_SCHEMA, open_mysql, open_pg
+from conftest import PG_SCHEMA, mysql_rw_cursor, open_mysql, open_pg
 
 from parity.engine import diff
 
@@ -73,7 +73,7 @@ def pg(pg_url):
 def my(mysql_url):
     """Side B: MySQL, identical data, opened read-only."""
     d = open_mysql(mysql_url, side="B")
-    cur = d._conn.cursor()
+    cur = mysql_rw_cursor(d)
     try:
         cur.execute("set session cte_max_recursion_depth = 1000000")
         cur.execute("drop table if exists xeng")
@@ -104,3 +104,66 @@ def test_a_planted_change_between_mysql_and_postgres_is_found(pg, my):
     result = diff(pg, my, f"{SCHEMA}.xeng", "xeng_p", "id")
     assert [(d.key, d.kind) for d in result.diffs] == [(1234, "different")]
     assert result.diffs[0].columns == ["amount"]
+
+
+def test_binary_bit_and_timestamp_agree_with_postgres(pg_url, mysql_url):
+    r"""MySQL bytes, bits and TIMESTAMP against PostgreSQL bytea, bit, timestamptz.
+
+    MySQL renders binary strings as PostgreSQL's bytea text (`\x` + lower-case
+    hex) and BIT(n) as its n digits, and TIMESTAMP is an instant read in UTC,
+    so equal values read equal with no timezone warning. Bytes that are not
+    valid UTF-8 used to render NULL on MySQL (RT-A8, RT-C4). Planted: row 2's
+    bytes, row 3's bits, row 4's instant; row 5 is a NULL against bytes.
+    """
+    import psycopg
+
+    con = psycopg.connect(pg_url, autocommit=True)
+    try:
+        con.execute(f"create schema if not exists {SCHEMA}")
+        con.execute(f"drop table if exists {SCHEMA}.bin")
+        con.execute(
+            f"create table {SCHEMA}.bin (id int, b bytea, f bit(8), t timestamptz)"
+        )
+        con.execute(
+            f"insert into {SCHEMA}.bin values "
+            "(1, '\\xff00c0', B'00000101', '2024-06-15 12:00:00.5+00'), "
+            "(2, '\\xff01', B'10000000', '2024-01-01 00:00:00+00'), "
+            "(3, '\\x41', B'00000001', '2024-01-01 00:00:00+00'), "
+            "(4, '\\x', B'11111111', '2024-01-01 00:00:01+00'), "
+            "(5, '\\x5c4e', null, null)"
+        )
+    finally:
+        con.close()
+    a = open_pg(pg_url, side="A")
+    b = open_mysql(mysql_url, side="B")
+    cur = mysql_rw_cursor(b)
+    cur.execute("drop table if exists mypg_bin")
+    cur.execute(
+        "create table mypg_bin (id int primary key, b varbinary(8), f bit(8), "
+        "t timestamp(6) null)"
+    )
+    cur.execute("set session time_zone = '+05:00'")  # stored as UTC regardless
+    cur.execute(
+        "insert into mypg_bin values "
+        "(1, 0xff00c0, b'00000101', '2024-06-15 17:00:00.5'), "
+        "(2, 0xff02, b'10000000', '2024-01-01 05:00:00'), "
+        "(3, 0x41, b'00000011', '2024-01-01 05:00:00'), "
+        "(4, '', b'11111111', '2024-01-01 05:00:00'), "
+        "(5, null, null, null)"
+    )
+    cur.execute("set session time_zone = '+00:00'")
+    b._conn.commit()
+    cur.close()
+    try:
+        result = diff(a, b, f"{SCHEMA}.bin", "mypg_bin", "id")
+    finally:
+        a.close()
+        b.close()
+    assert [(d.key, d.columns) for d in result.diffs] == [
+        (2, ["b"]),
+        (3, ["f"]),
+        (4, ["t"]),
+        (5, ["b"]),
+    ]
+    assert result.diffs[0].values_b == {"b": "\\xff02"}
+    assert not [w for w in result.warnings if "timezone-aware" in w], result.warnings

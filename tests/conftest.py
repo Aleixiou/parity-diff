@@ -248,6 +248,19 @@ def open_mysql(url: str, side: str = "A", float_scale: int = 6):
     return get_dialect(url, side=side, float_scale=float_scale)
 
 
+def mysql_rw_cursor(dialect):
+    """A cursor that may write, on a MySQL dialect's own connection.
+
+    For building fixtures only. The dialect makes its session READ ONLY
+    (RT-F11), so a test that writes through it first ends the current
+    transaction and switches the *following* ones back to read-write.
+    """
+    dialect._conn.commit()
+    cur = dialect._conn.cursor()
+    cur.execute("set session transaction read write")
+    return cur
+
+
 def open_snowflake(url: str, side: str = "A", float_scale: int = 6):
     """Open a UTC-pinned Snowflake dialect (DRAFT - see snowflake_dialect.py)."""
     return get_dialect(url, side=side, float_scale=float_scale)

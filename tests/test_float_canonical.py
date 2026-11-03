@@ -22,7 +22,14 @@ from __future__ import annotations
 import math
 
 import pytest
-from conftest import PG_SCHEMA, duckdb_write, open_duckdb, open_mysql, open_pg
+from conftest import (
+    PG_SCHEMA,
+    duckdb_write,
+    mysql_rw_cursor,
+    open_duckdb,
+    open_mysql,
+    open_pg,
+)
 from float_sample import adversarial_doubles, render
 
 from parity.dialects.base import (
@@ -249,7 +256,7 @@ def duck_side(duck_float_path):
 def mysql_side(mysql_url):
     """Side B on MySQL: `float_canon_a` and `float_canon_b`."""
     d = open_mysql(mysql_url, side="B")
-    cur = d._conn.cursor()
+    cur = mysql_rw_cursor(d)
     try:
         for name, side in (("float_canon_a", 1), ("float_canon_b", 2)):
             cur.execute(f"drop table if exists {name}")

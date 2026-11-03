@@ -598,11 +598,6 @@ def test_mysql_innodb_mid_walk_writes_stay_invisible(mysql_url, myw, tmp_path):
     assert found(result) == [(10, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D3: a MyISAM/MEMORY table has no MVCC snapshot and no caveat is "
-    "printed; repairing one bucket and breaking another mid-walk reads identical",
-)
 @pytest.mark.parametrize("engine", ["MyISAM", "MEMORY"])
 def test_mysql_non_transactional_table_changed_mid_walk(mysql_url, myw, tmp_path, engine):
     """The MySQL dialect's single snapshot is InnoDB's. A legacy MyISAM (or
@@ -1089,15 +1084,8 @@ def test_snowflake_run_says_it_is_not_one_snapshot():
 @pytest.mark.parametrize(
     "statement",
     [
-        pytest.param(
-            "set session sql_mode = 'PAD_CHAR_TO_FULL_LENGTH'",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="RT-D10: sql_mode is not pinned; a server default of "
-                "PAD_CHAR_TO_FULL_LENGTH pads every CHAR value (false diff)",
-            ),
-            id="pad_char",
-        ),
+        # RT-D10 (fixed): the dialect pins its own session sql_mode.
+        pytest.param("set session sql_mode = 'PAD_CHAR_TO_FULL_LENGTH'", id="pad_char"),
         pytest.param("do 0", id="control"),
     ],
 )
