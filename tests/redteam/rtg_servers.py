@@ -24,6 +24,7 @@ Older DuckDB libraries run in their own virtualenvs, named by
 from __future__ import annotations
 
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -110,11 +111,36 @@ def short(url: str) -> str:
     return f"{u.hostname}:{u.port}"
 
 
+_LISTENING: dict[str, bool] = {}
+
+
+def require_listening(url: str, default_port: int) -> None:
+    """Skip at once when nothing listens on the URL's port.
+
+    A driver can take seconds to give up on a closed port (SQL Server's
+    several), and the suites ask many times; one TCP probe per endpoint,
+    remembered, keeps a run without the containers to a few seconds.
+    """
+    u = urlparse(url)
+    where = f"{u.hostname}:{u.port or default_port}"
+    if where not in _LISTENING:
+        try:
+            socket.create_connection(
+                (u.hostname, u.port or default_port), timeout=1
+            ).close()
+            _LISTENING[where] = True
+        except OSError:
+            _LISTENING[where] = False
+    if not _LISTENING[where]:
+        pytest.skip(f"nothing listening at {where}")
+
+
 # ------------------------------------------------------------------ PostgreSQL
 
 
 def pg_connect(url: str) -> Any:
     """An autocommit psycopg connection to `url`, or skip when none answers."""
+    require_listening(url, 5432)
     psycopg = pytest.importorskip("psycopg")
     try:
         return psycopg.connect(url, autocommit=True, connect_timeout=3)
@@ -132,6 +158,7 @@ def pg_with_db(url: str, database: str) -> str:
 
 def mysql_connect(url: str) -> Any:
     """An autocommit mysql-connector connection to `url`, or skip."""
+    require_listening(url, 3306)
     mysql_connector = pytest.importorskip("mysql.connector")
     u = urlparse(url)
     try:
@@ -171,6 +198,7 @@ def mssql_url(url: str, database: str) -> str:
 
 def mssql_exec(url: str, database: str, *statements: str) -> list[list[tuple[Any, ...]]]:
     """Run `statements` as the URL's login in `database`, or skip without a server."""
+    require_listening(url, 1433)
     mssql_python = pytest.importorskip("mssql_python")
 
     from parity.dialects.mssql_dialect import parse_mssql_url
