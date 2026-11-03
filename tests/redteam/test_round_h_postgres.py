@@ -206,7 +206,97 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HP6: a --where calling set_config() rewrites a session pin "
+    "(extra_float_digits) mid-walk, after connect, so floats render at 2 digits "
+    "and a planted FLOAT difference reads identical (FALSE MATCH)",
+)
+def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
+    for t in "ab":
+        _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
+    _exec(ADMIN, f"insert into {schema}.a values (1, 0.1), (2, 1e15 + 0.5)",
+          f"insert into {schema}.b values (1, 0.1), (2, 1e15)")
+    w = "set_config('extra_float_digits', '-15', false) is not null"
+    try:
+        r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", where_a=w, where_b=w)
+    except ValueError as exc:  # refusing such a filter is a fix too
+        assert "row filter" in str(exc)
+        return
+    assert [d.key for d in r.diffs] == [2]
+
+
+def test_where_and_map_postgres_quoting(schema):
+    """E'', U&'', doubled quotes and casts work; $$ and backslash-quote are refused;
+    a filter cannot close the parentheses it is wrapped in."""
+    for t in "ab":
+        _exec(ADMIN, f'create table {schema}.{t} (id int primary key, "Name" text, amt numeric)',
+              f"insert into {schema}.{t} select g, 'n'||g, g * 1.5 from generate_series(1, 1000) g")
+    _exec(ADMIN, f"update {schema}.b set amt = -1 where id in (10, 900)")
+    a, b = f"{schema}.a", f"{schema}.b"
+    for w, keys in [
+        ("id < 500", [10]),
+        ("E'a\\\\b' <> \"Name\"", [10, 900]),
+        ("U&'\\0061' <> \"Name\"", [10, 900]),
+        ("id = any('{10,900}'::int[])", [10, 900]),
+        ("'(' = '(' and id > 500", [900]),
+    ]:
+        r = _diff(ADMIN, a, ADMIN, b, where_a=w, where_b=w)
+        assert sorted(d.key for d in r.diffs) == keys, w
+    for w in ["\"Name\" <> $$x$$", "\"Name\" <> $t$x$t$", "true) or (true",
+              "id < 5 -- c", "E'\\'' <> \"Name\"", "id < 5; select 1"]:
+        with pytest.raises(ValueError, match="row filter"):
+            _diff(ADMIN, a, ADMIN, b, where_a=w, where_b=w)
+    _exec(ADMIN, f"create table {schema}.m (id int primary key, nm text, Amount numeric)",
+          f"insert into {schema}.m select * from {b}")
+    r = _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "AMOUNT"})
+    assert sorted(d.key for d in r.diffs) == [10, 900] and not r.schema_differences
+    with pytest.raises(ValueError, match="--map"):
+        _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "nm"})
+
+
 # ------------------------------------------------- held (regression tests)
+
+
+@pytest.mark.parametrize("encoding", ["EUC_JP", "SQL_ASCII", "EUC_KR"])
+def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
+    """Text stored in a non-UTF-8 database matches DuckDB's UTF-8 text, the
+    planted change (key 3) is found, and a value the encoding cannot hold is
+    missing on that side, never silently equal."""
+    import duckdb
+
+    vals = ["日本語", "ｶﾀｶﾅ", "①", "髙", "～", "∥", "−", "\\", "é", "abc"]
+    path = (tmp_path / "enc.duckdb").as_posix()
+    con = duckdb.connect(path)
+    con.execute("create table t (id int primary key, v varchar)")
+    for i, v in enumerate(vals, 1):
+        con.execute("insert into t values (?, ?)", [i, v + ("X" if i == 3 else "")])
+    con.close()
+    db = f"rth_postgres_{encoding.lower()}_{RUN}"
+    _exec(ADMIN, f"create database {db} encoding '{encoding}' lc_collate 'C' "
+          "lc_ctype 'C' template template0")
+    url = ADMIN.rsplit("/", 1)[0] + "/" + db
+    try:
+        _exec(url, "create table t (id int primary key, v text)")
+        stored = set()
+        conn = pg_connect(url)
+        try:
+            conn.execute("set client_encoding = 'UTF8'")
+            for i, v in enumerate(vals, 1):
+                try:
+                    conn.execute("insert into t values (%s, %s)", (i, v))
+                    stored.add(i)
+                except Exception:  # noqa: BLE001 - not representable here
+                    pass
+        finally:
+            conn.close()
+        assert 3 in stored
+        r = _diff(url, "public.t", f"duckdb:///{path}", "main.t")
+        expected = {(3, "different")} | {(i, "only_in_b") for i in range(1, 11) if i not in stored}
+        assert {(d.key, d.kind) for d in r.diffs} == expected
+        assert not r.unexplained
+    finally:
+        _exec(ADMIN, f"drop database if exists {db}")
 
 
 def test_pg95_is_refused_naming_the_version():
