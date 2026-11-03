@@ -14,14 +14,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from typing import Any, TextIO
 
 from parity import __version__
 from parity.dialects.base import decode_canonical_field
-from parity.engine import DEFAULT_MAX_DIFFS
-from parity.types import DiffResult, LogicalType, RowDiff
+from parity.engine import DEFAULT_MAX_DIFFS, DEFAULT_VERIFY_SAMPLE
+from parity.types import (
+    CHECKSUM_COLLISION_BOUND,
+    RISK_CONFIDENCE,
+    DiffResult,
+    LogicalType,
+    RowDiff,
+)
 
 #: Exit codes. `1` means "differences found", not "crashed" - a CI job can tell
 #: an honest disagreement from a broken connection string.
@@ -116,6 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
         f"does not mean the rest matched. The default exists because each "
         f"difference costs memory, so two tables that share nothing would "
         f"otherwise exhaust it rather than answering.",
+    )
+    d.add_argument(
+        "--verify-sample",
+        type=_non_negative_int,
+        default=DEFAULT_VERIFY_SAMPLE,
+        metavar="N",
+        help=f"after the comparison, re-compare about N rows (default: "
+        f"{DEFAULT_VERIFY_SAMPLE:,}; 0 to skip) from the raw values each "
+        f"driver returns, by the documented rules in Python - an independent "
+        f"check that a mistake in the tool's own SQL cannot fool. Tables of N "
+        f"rows or fewer are re-compared in full. Any contradiction means not "
+        f"identical.",
     )
     d.add_argument("--json", action="store_true", help="machine-readable output")
     d.add_argument(
@@ -324,6 +343,14 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         headline = (
             f"{sym['bad']} {_plural(len(result.diffs), 'difference')} in {total:,} rows"
         )
+    elif result.verification and result.verification.failures:
+        # The walk found nothing, but raw values contradict it: the tool's own
+        # rendering hid a difference for these data. Never the all-clear.
+        headline = (
+            f"{sym['bad']} not verified: the independent sample check found "
+            f"{_plural(len(result.verification.failures), 'row')} the checksum "
+            f"comparison called equal"
+        )
     elif result.unexplained:
         headline = (
             f"{sym['bad']} not verified: checksums differ in "
@@ -362,6 +389,7 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         w.line(f"  {sym['bad']} schema: {_escape(schema)}")
     for note in result.unexplained:
         w.line(f"  {sym['bad']} unverified {_escape(note)}")
+    _render_verification(result, w, sym)
     w.line(f"  comparing floats and decimals at {result.float_scale} decimal places")
     for warning in result.warnings:
         w.line(f"  ! {_escape(warning)}")
@@ -381,6 +409,90 @@ def render_human(result: DiffResult, out: TextIO) -> None:
                 f"  ... {len(result.diffs) - DISPLAY_LIMIT:,} more difference(s) "
                 f"found but not shown here; use --json for the full list"
             )
+
+
+def _risk_line(result: DiffResult) -> str:
+    """The run's two measurable risk figures, in words (see `risk_figures`)."""
+    r = risk_figures(result)
+    if r["max_hidden_fraction"] is None:
+        return "not computed"
+    conf = f"{r['confidence']:.0%}"
+    collision = "a checksum collision is below 1 in 10^18"
+    if r["max_hidden_fraction"] == 0.0:
+        return (
+            f"every row was compared by both methods, so no row can hide a "
+            f"rendering error; {collision}"
+        )
+    return (
+        f"with {conf} confidence fewer than {r['max_hidden_fraction']:.3%} of rows "
+        f"(at most {r['max_hidden_rows']:,} of {r['rows']:,}) could differ in a way "
+        f"the checksums missed; {collision}"
+    )
+
+
+def risk_figures(result: DiffResult) -> dict[str, Any]:
+    """What a run can state about its own residual risk, as numbers.
+
+    - `checksum_collision_bound`: the chance that a bucket holding a real
+      difference still matches, at most 2^-60 for data not crafted to collide.
+    - `max_hidden_fraction` / `max_hidden_rows`: from the independent sample,
+      the most rows that could carry a difference both the checksums *and*
+      the second method missed in the sample, at `confidence` (the exact
+      binomial bound; 0 when every row was compared). Valid for the columns
+      the check covers (`verification.checked`); `unchecked` ones carry no
+      such bound.
+    """
+    v = result.verification
+    rows = max(result.stats.rows_compared_a, result.stats.rows_compared_b)
+    frac = v.max_hidden_fraction() if v is not None else None
+    hidden = None
+    if frac is not None:
+        hidden = 0 if frac == 0.0 else max(1, math.ceil(frac * rows))
+    return {
+        "confidence": RISK_CONFIDENCE,
+        "checksum_collision_bound": CHECKSUM_COLLISION_BOUND,
+        "max_hidden_fraction": frac,
+        "max_hidden_rows": hidden,
+        "rows": rows,
+        "covered_columns": [] if v is None else v.checked,
+        "uncovered_columns": [] if v is None else v.unchecked,
+    }
+
+
+def _render_verification(result: DiffResult, w: _Writer, sym: dict[str, str]) -> None:
+    """The independent sample check, in a line or two - every failure listed."""
+    v = result.verification
+    if v is None:
+        return
+    if v.error:
+        w.line(f"  ! independent sample check could not run: {_escape(v.error)}")
+        return
+    rows = max(v.rows_a, v.rows_b)
+    scope = (
+        "every row" if v.modulus == 1 else f"{rows:,} sampled rows (1 in {v.modulus:,})"
+    )
+    if v.failures:
+        w.line(
+            f"  {sym['bad']} independent sample check: {scope} re-compared from raw values"
+        )
+        for failure in v.failures:
+            w.line(f"  {sym['bad']} sample {_escape(failure)}")
+        w.line(
+            "    the checksum comparison is not trustworthy for these data; "
+            "please report this"
+        )
+    else:
+        w.line(
+            f"  {sym['ok']} independent sample check: {scope} re-compared from raw "
+            f"values - all agree"
+        )
+        w.line(f"    risk: {_risk_line(result)}")
+    if v.unchecked:
+        w.line(
+            f"  ! not covered by the sample check (type outside its rules): {v.unchecked}"
+        )
+    for note in v.notes:
+        w.line(f"  ! sample: {_escape(note)}")
 
 
 def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
@@ -449,6 +561,23 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
         # Key ranges whose checksums differ but whose downloaded rows could
         # not account for it. Non-empty means not identical.
         "unexplained": result.unexplained,
+        # The independent sample check; null when skipped. Non-empty
+        # `failures` means not identical.
+        "verification": None
+        if result.verification is None
+        else {
+            "modulus": result.verification.modulus,
+            "residue": result.verification.residue,
+            "rows_a": result.verification.rows_a,
+            "rows_b": result.verification.rows_b,
+            "checked": result.verification.checked,
+            "unchecked": result.verification.unchecked,
+            "failures": result.verification.failures,
+            "notes": result.verification.notes,
+            "error": result.verification.error,
+        },
+        # The run's measurable residual risk; see `risk_figures`.
+        "risk": risk_figures(result),
         "difference_count": len(result.diffs),
         "float_scale": result.float_scale,
         "columns_compared": [c.name for c in result.columns],
@@ -465,6 +594,8 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
                 (100 * stats.rows_downloaded / moveable) if moveable else 0.0, 4
             ),
             "seconds": round(stats.seconds, 3),
+            "sample_queries": stats.sample_queries,
+            "rows_sampled": stats.rows_sampled,
         },
         "differences": [
             {
@@ -514,6 +645,7 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
             threshold=args.threshold,
             # 0 is the documented way to ask for no limit at all.
             max_diffs=args.max_diffs or None,
+            verify_sample=args.verify_sample,
         )
     finally:
         for side in (a, b):

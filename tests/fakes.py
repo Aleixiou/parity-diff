@@ -284,6 +284,35 @@ class FakeDialect(Dialect):
         self.rows_served += len(out)
         return out
 
+    def fetch_sample(
+        self,
+        table: str,
+        key: str,
+        columns: Sequence[Column],
+        modulus: int,
+        residue: int,
+    ) -> dict[int, tuple[Any, ...]]:
+        """The independent sample: rows whose key hash is `residue` mod
+        `modulus`, as raw values. Counted apart (`samples`, `rows_sampled`),
+        so the walk's own query and download counts stay what they assert."""
+        self.samples = getattr(self, "samples", 0) + 1
+        index = {c.name: i for i, c in enumerate(self.table.columns)}
+        out: dict[int, tuple[Any, ...]] = {}
+        for k in self.table.all_keys():
+            if modulus > 1 and row_hash(str(k)) % modulus != residue:
+                continue
+            values = self.raw_row(k)
+            out[k] = tuple(values[index[c.name]] for c in columns)
+        self.rows_sampled = getattr(self, "rows_sampled", 0) + len(out)
+        return out
+
+    def raw_row(self, key: int) -> tuple[Any, ...]:
+        """A row's raw values for the sample check: its stored values, which
+        in this fake are already the text the reference rules read. A test
+        overrides this to make the raw values and the rendered text disagree,
+        which is what a dialect bug looks like."""
+        return self.table.row(key)
+
 
 __all__ = [
     "NULL_SENTINEL",

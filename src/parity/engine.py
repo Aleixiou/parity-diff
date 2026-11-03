@@ -12,6 +12,8 @@ differ, and only once those ranges are small.
 
 from __future__ import annotations
 
+import dataclasses
+import random
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -20,6 +22,7 @@ from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from parity.dialects.base import Dialect, require_matching_scales
+from parity.reference import UNCHECKED, canonical_text, describe, reference_token
 from parity.types import (
     Column,
     DiffResult,
@@ -27,6 +30,7 @@ from parity.types import (
     KeySpec,
     LogicalType,
     RowDiff,
+    Verification,
 )
 
 #: What a bucket looks like when a side returned no group for it at all.
@@ -46,6 +50,14 @@ _NUMERIC_EQUIVALENT = frozenset({LogicalType.DECIMAL, LogicalType.FLOAT})
 #: wrong table or the wrong environment is exactly the situation a parity
 #: check exists to catch, so it must survive it. Pass `None` for no limit.
 DEFAULT_MAX_DIFFS = 10_000
+
+#: Rows the independent sample check re-compares from raw values, about. A
+#: table this size or smaller is compared in full. The cost is one scan per
+#: side that hashes the key only, plus this many rows downloaded.
+DEFAULT_VERIFY_SAMPLE = 1_000
+
+#: Failures listed in full before the rest are only counted.
+_MAX_LISTED = 20
 
 #: Pairs of logical types whose canonical text can coincide even though the
 #: types differ, so a column of one type against a column of the other is not
@@ -482,8 +494,14 @@ def diff(
     bisection_factor: int = 32,
     threshold: int = 10_000,
     max_diffs: int | None = DEFAULT_MAX_DIFFS,
+    verify_sample: int = DEFAULT_VERIFY_SAMPLE,
 ) -> DiffResult:
     """Compare ``a_table`` on side ``a`` with ``b_table`` on side ``b``.
+
+    After the checksum walk, about ``verify_sample`` rows are re-compared from
+    the raw values the drivers return, by the documented rules in Python
+    (`parity.reference`) - an independent second opinion that a mistake in a
+    dialect's SQL cannot fool. ``verify_sample=0`` switches it off.
 
     The caller owns both dialects and must close them, whether this returns
     or raises: `diff` never closes what it was handed, so a dialect can be
@@ -507,6 +525,8 @@ def diff(
         # A negative limit is "already reached" before the first bucket, so
         # identical tables would come back "partial". `None` means no limit.
         raise ValueError(f"max_diffs must be >= 0 or None, got {max_diffs}")
+    if verify_sample < 0:
+        raise ValueError(f"verify_sample must be >= 0, got {verify_sample}")
     # Checked before any query: two sides rounding floats differently would
     # report every float row as changed.
     require_matching_scales(a, b)
@@ -558,6 +578,14 @@ def diff(
         )
         a_cols = [cols_a[f] for f in shared]
         b_cols = [cols_b[f] for f in shared]
+        # Sub-microsecond digits are compared exactly when both sides hold
+        # them, and truncated - with a caveat from the dialect - when either
+        # side holds microseconds only (COV-2: DuckDB kept them, SQL Server
+        # and Snowflake truncated, so one stored instant read as two).
+        for i, (ca, cb) in enumerate(zip(a_cols, b_cols, strict=True)):
+            if a.holds_sub_micro(ca) and b.holds_sub_micro(cb):
+                a_cols[i] = dataclasses.replace(ca, sub_micro=True)
+                b_cols[i] = dataclasses.replace(cb, sub_micro=True)
         # A dialect whose FLOAT rendering is not verified against the shared
         # canonical form says so, and the caveat reaches the output rather
         # than only the docs (CLAUDE.md section 8).
@@ -730,6 +758,33 @@ def diff(
                     else:
                         queue.append((b_lo_i, b_hi_i))
 
+        verification: Verification | None = None
+        complete = not unchecked and (max_diffs is None or len(diffs) <= max_diffs)
+        if verify_sample and complete and (ks_a.rows or ks_b.rows):
+            rows = max(ks_a.rows, ks_b.rows)
+            modulus = max(1, rows // verify_sample)
+            # Fresh randomness each run, reported in the result: the sample
+            # is not predictable from the data, and a run can be reproduced.
+            residue = random.SystemRandom().randrange(modulus)
+            verification = Verification(modulus, residue, 0, 0)
+            try:
+                sample_a, sample_b = both(
+                    "fetch_sample",
+                    key_a,
+                    a_cols,
+                    modulus,
+                    residue,
+                    _args_b=(key_b, b_cols, modulus, residue),
+                )
+            except ValueError as exc:
+                verification.error = str(exc)
+            else:
+                stats.rows_sampled = len(sample_a) + len(sample_b)
+                _verify(verification, a, b, a_cols, b_cols, sample_a, sample_b, diffs)
+            finally:
+                stats.queries -= 2
+                stats.sample_queries += 2
+
     diffs.sort(key=lambda d: _key_order(d.key))
     if max_diffs is not None and len(diffs) > max_diffs:
         # A single bucket download can overshoot the limit by a lot. Report the
@@ -756,7 +811,113 @@ def diff(
         float_scale=a.float_scale,
         schema_differences=schema_differences,
         unexplained=unexplained,
+        verification=verification,
     )
+
+
+def _verify(
+    v: Verification,
+    a: Dialect,
+    b: Dialect,
+    a_cols: list[Column],
+    b_cols: list[Column],
+    sample_a: dict[int | str, tuple[Any, ...]],
+    sample_b: dict[int | str, tuple[Any, ...]],
+    diffs: list[RowDiff],
+) -> None:
+    """Re-compare the sampled rows by value and record any contradiction.
+
+    The walk's verdict on each sampled key - equal, `different` in some
+    columns, or present on one side only - must match what the raw values
+    say. A row the walk called equal whose values differ, a column it missed,
+    or a key it never reported is a failure: the checksum path rendered two
+    different values alike, which is how every false match this tool has had
+    worked. A difference the walk reports that the values do not show is only
+    a note - a false alarm, or something the reference rules cannot see.
+    """
+    v.rows_a, v.rows_b = len(sample_a), len(sample_b)
+    names = [c.name for c in a_cols]
+    reported = {d.key: d for d in diffs}
+    pairs = list(zip(a_cols, b_cols, strict=True))
+    checkable = [
+        i
+        for i, (ca, cb) in enumerate(pairs)
+        if LogicalType.UNKNOWN not in (ca.logical_type, cb.logical_type)
+    ]
+    v.checked = [names[i] for i in checkable]
+    v.unchecked = [names[i] for i in range(len(names)) if i not in checkable]
+    skipped: dict[str, int] = {}
+
+    def token(dialect: Dialect, column: Column, value: Any) -> Any:
+        """One raw value, reduced by the reference rules for its side."""
+        return reference_token(
+            column.logical_type,
+            value,
+            dialect.float_scale,
+            padded=dialect.padded_char(column),
+            single_precision=dialect.single_precision(column),
+            sub_micro=column.sub_micro,
+        )
+
+    failures: list[str] = []
+    for k in sorted(set(sample_a) | set(sample_b), key=_key_order):
+        ra, rb, rd = sample_a.get(k), sample_b.get(k), reported.get(k)
+        if ra is None or rb is None:
+            kind = "only_in_b" if ra is None else "only_in_a"
+            if rd is None or rd.kind != kind:
+                walk = "nothing" if rd is None else rd.kind
+                side = "B" if ra is None else "A"
+                failures.append(
+                    f"key {k!r}: in the sample of side {side} only, but the "
+                    f"checksum walk reported {walk} for it"
+                )
+            continue
+        differ: dict[str, tuple[Any, Any]] = {}
+        for i in checkable:
+            ta = token(a, pairs[i][0], ra[i])
+            tb = token(b, pairs[i][1], rb[i])
+            if ta is UNCHECKED or tb is UNCHECKED:
+                skipped[names[i]] = skipped.get(names[i], 0) + 1
+            elif canonical_text(ta) != canonical_text(tb):
+                # By canonical text, not by token: the rules call two rows
+                # equal iff their text is (CLAUDE.md 4.2), so a STRING '1.5'
+                # against a DECIMAL that renders `1.5` must not count here
+                # when it does not count in the walk.
+                differ[names[i]] = (ta, tb)
+        if rd is not None and rd.kind != "different":
+            failures.append(
+                f"key {k!r}: present on both sides in the sample, but the "
+                f"checksum walk reported {rd.kind}"
+            )
+            continue
+        walk_cols = set(rd.columns) if rd is not None else set()
+        missed = [n for n in differ if n not in walk_cols]
+        if missed:
+            detail = "; ".join(
+                f"{n}: A={describe(differ[n][0])} B={describe(differ[n][1])}"
+                for n in missed
+            )
+            said = "equal" if rd is None else f"different only in {sorted(walk_cols)}"
+            failures.append(
+                f"key {k!r}: the checksum walk found it {said}, but the raw "
+                f"values differ - {detail}"
+            )
+        extra = sorted(n for n in walk_cols if n in v.checked and n not in differ)
+        if extra and len(v.notes) < _MAX_LISTED:
+            v.notes.append(
+                f"key {k!r}: reported different in {extra}, which the raw "
+                f"values do not show (a false alarm, or a difference outside "
+                f"the reference rules)"
+            )
+    if len(failures) > _MAX_LISTED:
+        rest = len(failures) - _MAX_LISTED
+        failures = [*failures[:_MAX_LISTED], f"... and {rest} more"]
+    v.failures = failures
+    for name, count in sorted(skipped.items()):
+        v.notes.append(
+            f"{count} value(s) of column {name!r} are outside the reference "
+            f"rules and were not independently checked"
+        )
 
 
 def _compare_rows(

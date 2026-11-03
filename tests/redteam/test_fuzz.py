@@ -126,6 +126,9 @@ def test_live_diff_agrees_with_the_brute_force_oracle(engines, a, b):
         )
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 def test_the_harness_catches_a_planted_false_match(monkeypatch):
     """The oracle is independent: with a known trigger enabled it must fail.
 

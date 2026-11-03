@@ -5,6 +5,45 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Every run states its own residual risk** (README "Risk figures"): the
+  checksum-collision bound (2^-60 per differing range) and, from the sample
+  check, the most rows that could hide a difference at 99% confidence - the
+  exact binomial bound, 0 when every row was compared. In the report and in
+  JSON `risk`.
+- **Coverage map** (`docs/coverage.md`, `tests/conformance/`): about 500 hard
+  values per type on all six engines, each rendered by the engine and checked
+  against the rules in Python and across engines - 3,187 of 3,213 cells at
+  scale 6 exact, the rest required refusals. It found and these fixes close:
+  - **Snowflake TIME was a false match** (COV-6): its varchar cast dropped
+    fractional seconds, so 12:34:56.5 equalled 12:34:56. **Checksums of
+    Snowflake TIME columns change.**
+  - DuckDB TIMESTAMP_S / TIMESTAMP_MS outside 1677-2262 crashed the diff
+    (COV-1).
+  - Sub-microsecond digits follow one rule (COV-2): compared when *both*
+    sides hold them (DuckDB TIMESTAMP_NS, SQL Server datetime2(7), Snowflake
+    TIMESTAMP(7-9)), truncated with a caveat otherwise. DuckDB used to keep
+    them against every engine, so the same instant on DuckDB and SQL Server
+    read as different. **Checksums move for those columns.**
+  - The sample check read DuckDB's infinite, BC and nanosecond values wrongly
+    (COV-3..5).
+
+- **The tool now checks itself.** After the checksum walk, about 1,000 rows
+  (every row of a smaller table) are fetched again from both sides as the
+  drivers return them and compared in Python by the documented rules
+  (`parity.reference`), with none of the per-engine SQL the checksums depend
+  on. A false match needs that SQL to render two different values alike; the
+  second method cannot be fooled the same way, so any row on which the two
+  disagree makes the result **not identical** (exit 1) and is named in the
+  report. `--verify-sample N` sets the size, `0` skips it; `diff(...,
+  verify_sample=)` in the library. New `DiffResult.verification`, JSON
+  `verification`, and `stats.sample_queries` / `stats.rows_sampled` (the
+  walk's `queries` and `rows_downloaded` are unchanged). Columns of types
+  outside the rules (JSON, binary, ...) are listed as not covered. Each
+  driver's lossy spots are worked around and verified live: MySQL sends
+  FLOAT with six digits, SQL Server drops trailing NULs and rounds
+  datetime2(7), psycopg cannot load infinite or BC dates, DuckDB needs pytz
+  for TIMESTAMPTZ.
+
 - **Snowflake FLOAT now follows the canonical float form** every other engine
   shares (the shortest round-trip decimal, rounded half away from zero). It
   used to round the double's exact binary value, which disagreed with the

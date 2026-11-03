@@ -46,6 +46,16 @@ ranges already proven to differ.
 On identical tables it downloads **zero rows** and issues **four queries**,
 whether the table has ten thousand rows or ten million.
 
+Then it **checks itself**. The checksums are only as right as the SQL that
+renders each value to text inside each engine, and a mistake there can make
+two different values look alike on both sides — the way every false match
+this tool has ever had worked. So after the walk, about 1,000 rows (all of
+them, for a table that small) are fetched again from both sides as the
+database drivers return them, and compared in plain Python by the documented
+rules, without any of that SQL. If the two methods disagree about a single
+row, the result is **not identical** and the report names the row. Cost: one
+extra pass per side that hashes the key only, plus the sample.
+
 ## Measured
 
 10,000,000 rows per side, PostgreSQL 18.4 ↔ DuckDB 1.5.5, median of five runs
@@ -105,7 +115,7 @@ imported lazily, so a DuckDB-only user is never made to install `psycopg`.
 parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
             [--columns a,b,c] [--exclude x,y]
             [--bisection-factor 32] [--threshold 10000] [--float-scale 6]
-            [--max-diffs 10000] [--json] [--quiet]
+            [--max-diffs 10000] [--verify-sample 1000] [--json] [--quiet]
 ```
 
 **Exit codes** — this is what makes it a CI check:
@@ -113,7 +123,7 @@ parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
 | Code | Meaning |
 |---|---|
 | `0` | identical |
-| `1` | not proven identical: rows differ, a column exists on one side only, or the checksums disagreed in a way the downloaded rows could not explain |
+| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, or the independent sample check contradicted the checksums |
 | `2` | error (bad connection string, missing table, unusable key) |
 
 An error is never `1`. A CI job can always tell "the tables differ" from "the
@@ -179,8 +189,16 @@ reaches the server, and never commits — but **use a login that holds only
 `db_datareader`** (or `GRANT SELECT` on the tables), which makes the server
 itself refuse a write.
 
+`--verify-sample N` sets the size of the independent sample check (default
+1,000 rows; `0` skips it). The rows are chosen by a hash of the key, fresh at
+every run, so both sides pick the same rows and the sample spreads over the
+whole table; the result records the choice (`modulus`, `residue`) so a run can
+be repeated. Types outside the check's rules (JSON, binary, arrays and other
+types the tool compares as plain text) are listed as not covered rather than
+passed.
+
 `--json` emits the same content as a machine-readable object, including
-`identical`, `truncated`, `schema_differences`, `unexplained`, per-difference
+`identical`, `truncated`, `schema_differences`, `unexplained`, `verification`, per-difference
 values, and the full stats block. Values in JSON are the exact canonical text
 the engines compared, in which a backslash is doubled and an ASCII Unit
 Separator (chr 31) is written `\s`; the human report shows them decoded, with
@@ -241,11 +259,12 @@ the comparison is refused before it runs.
 | `truncated` | The walk stopped early, so this is a partial answer. Never read a truncated result as "the rest matched". |
 | `schema_differences` | Columns one side has and the other lacks, that you did not set aside with `columns` / `exclude`. Any entry makes the result not identical. |
 | `unexplained` | Key ranges whose checksums differed although the rows downloaded from them compared equal (or a side returned a different row count than its checksum counted). The engines proved a difference the tool could not show you, so the result is not identical. |
+| `verification` | The independent sample check: `modulus`/`residue` (which rows), `rows_a`/`rows_b`, `checked` and `unchecked` columns, `failures`, `notes`, `error`. Any failure makes the result not identical. `None` with `verify_sample=0`, or when the walk stopped early. |
 | `diffs` | `RowDiff` objects in key order, each with `key`, `kind` (`only_in_a`, `only_in_b`, `different`), the `columns` that moved, and `values_a` / `values_b` as raw canonical text. |
 | `columns` | The columns actually compared, after `columns` and `exclude`. |
 | `warnings` | Everything the comparison decided on your behalf: columns set aside, types that differ between sides (key types included), timezone-awareness mismatches, engine caveats such as a missing snapshot. Worth surfacing. |
 | `float_scale` | The rounding in force, so a caller can state it alongside the verdict. |
-| `stats` | `queries`, `rows_downloaded`, `rows_compared_a`, `rows_compared_b`, `segments_checked`, `seconds`. |
+| `stats` | `queries`, `rows_downloaded`, `rows_compared_a`, `rows_compared_b`, `segments_checked`, `seconds`, and the sample check's own `sample_queries` and `rows_sampled` (kept apart, so the walk's figures are unchanged). |
 
 `diff` raises `ValueError` for anything it refuses — a FLOAT key, a non-unique
 or NULL key, a missing table, mismatched float scales — and for any database
@@ -254,6 +273,36 @@ table, with the driver's own exception as its `__cause__`. The message always
 names which side. The caller owns the two dialects: close them (or use `with`,
 as above) even when `diff` raises, or a PostgreSQL side keeps its snapshot
 transaction open.
+
+## Risk figures — what a run can state about itself
+
+Every report ends its sample-check line with two numbers. They are computed,
+not estimated, under the assumptions stated with each:
+
+| Figure | What it bounds | Value | Assumption |
+|---|---|---|---|
+| Checksum collision | The chance that a key range holding a real difference still sums to the other side's checksum | at most 2⁻⁶⁰ ≈ 8.7 × 10⁻¹⁹ per differing range | the data was not crafted to collide (see the tamper note below) |
+| Hidden rows | With *n* sampled rows and no disagreement, the share of rows that could still carry a difference both the checksums and the sample missed | below 1 − 0.01^(1/n) at 99% confidence; **0** when every row was compared | rows enter the sample at random (fresh residue each run, keys spread evenly by MD5) |
+
+The hidden-row bound by sample size, at 99% confidence:
+
+| `--verify-sample` | Share of rows that could hide an error | On 10M rows, at most |
+|---|---|---|
+| 1,000 (default) | 0.46% | 46,000 |
+| 10,000 | 0.046% | 4,600 |
+| 100,000 | 0.0046% | 460 |
+| 1,000,000 | 0.00046% | 46 |
+| ≥ table size | 0 (every row compared twice) | 0 |
+
+A larger sample costs one more pass over the key and the download of the
+sampled rows: on 1M rows PostgreSQL ↔ DuckDB, 3.5 s at 1,000 and 5.2 s at
+100,000. `--json` carries the same figures under `risk`. They cover the
+columns listed as `covered_columns`; a column of a type outside the rules
+(`uncovered_columns`) carries no bound. Nothing here bounds what neither
+method can see: a table changing during a run on an engine without a single
+snapshot (the run's caveats say which), or a difference the documented rules
+ignore by design - digits past `--float-scale`, sub-microsecond digits against
+an engine that holds microseconds, CHAR padding - which both methods follow.
 
 ## Limitations — read these before trusting a result
 

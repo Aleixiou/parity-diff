@@ -584,7 +584,7 @@ def test_table_not_found_names_the_side_and_schema(duck):
     assert "side B" in msg and "no_such_table" in msg
 
 
-def _render_all(ddl: str, values: list[str]) -> list[tuple]:
+def _render_all(ddl: str, values: list[str], sub_micro: bool = False) -> list[tuple]:
     """Canonical text of column `v` for each value, through the dialect.
 
     In memory, the one DuckDB database the dialect opens writable - and the
@@ -596,6 +596,10 @@ def _render_all(ddl: str, values: list[str]) -> list[tuple]:
         for i, v in enumerate(values):
             d.query(f"insert into t values ({i}, {v})")
         (col,) = [c for c in d.columns("t") if c.name == "v"]
+        if sub_micro:
+            import dataclasses
+
+            col = dataclasses.replace(col, sub_micro=True)
         return d.query(f"select {d.normalize(col)} from t order by id")
     finally:
         d.close()
@@ -605,7 +609,9 @@ def _render_all(ddl: str, values: list[str]) -> list[tuple]:
 def test_timestamp_ns_renders_nanoseconds_only_when_it_has_them():
     """RT-A7: a whole-microsecond TIMESTAMP_NS renders exactly as a TIMESTAMP
     always did - so no checksum moves and it still matches a microsecond
-    column on any engine - and anything finer carries all nine digits."""
+    column on any engine - and anything finer carries all nine digits, when
+    the other side holds nanoseconds too (`sub_micro`, COV-2). Against a
+    microsecond engine it is truncated, as SQL Server and Snowflake are."""
     values = [
         "'2024-01-01 00:00:00.123456'",
         "'2024-01-01 00:00:00.000000001'",
@@ -614,7 +620,13 @@ def test_timestamp_ns_renders_nanoseconds_only_when_it_has_them():
         "'1900-01-01 00:00:00'",
         "null",
     ]
-    ns = [r[0] for r in _render_all("timestamp_ns", values)]
+    truncated = [r[0] for r in _render_all("timestamp_ns", values)]
+    assert truncated[1:4] == [
+        "2024-01-01 00:00:00.000000",
+        "2024-01-01 00:00:00.000000",
+        "1969-12-31 23:59:59.999999",
+    ]
+    ns = [r[0] for r in _render_all("timestamp_ns", values, sub_micro=True)]
     assert ns == [
         "2024-01-01 00:00:00.123456",
         "2024-01-01 00:00:00.000000001",

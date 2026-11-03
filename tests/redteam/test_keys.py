@@ -499,6 +499,9 @@ def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
     assert _found(result) == [(k_bad, "different")]
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 def test_rt_b7_the_old_snowflake_division_missed_the_change():
     """Control: the same walk under the old rounding division loses the row,
     so the model above is not passing vacuously."""

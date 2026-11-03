@@ -428,6 +428,22 @@ class MySQLDialect(Dialect):
         """
         return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
+    def single_precision(self, column: Column) -> bool:
+        """MySQL spells float4 `float` (and `real` is a double here only
+        under REAL_AS_FLOAT, which the pinned sql_mode does not set)."""
+        return column.raw_type.lower().split("(")[0].strip() == "float"
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; a float4 widened to double first.
+
+        The text protocol sends a FLOAT with six significant digits -
+        16777217 arrived as 16777200.0 - so the raw value is lossy; widening
+        in the server is exact and the double travels in full. Verified live.
+        """
+        if column.logical_type is LogicalType.FLOAT and self.single_precision(column):
+            return f"cast({self.quote(column.name)} as double)"
+        return super().sample_select(column)
+
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """A table on a non-transactional engine is not read at one snapshot.
 

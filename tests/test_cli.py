@@ -756,3 +756,67 @@ def test_human_report_decodes_escaped_text_and_never_shows_backslash_n_as_null()
     part = f"a{chr(31)}b"
     key = chr(31).join([escape_canonical_text(part), escape_canonical_text("c")])
     assert _display_key(key) == f"{part!r} | 'c'"
+
+
+# ---------------------------------------------------------------------------
+# The independent sample check in the report
+# ---------------------------------------------------------------------------
+
+
+def test_a_passing_sample_check_is_one_line_after_the_headline():
+    """The check's result is part of the verdict, so it is printed with it."""
+    from parity.types import Verification
+
+    v = Verification(5, 2, 200, 200, checked=["note", "amount"])
+    lines = _human(_result(verification=v))
+    assert lines[0].endswith("no differences in 10 rows")
+    assert any(
+        "independent sample check: 200 sampled rows (1 in 5) re-compared from raw "
+        "values - all agree" in line
+        for line in lines
+    )
+
+
+def test_a_failing_sample_check_owns_the_headline_and_the_exit_code():
+    """The walk found nothing, the check contradicts it: never the all-clear,
+    and every failure is listed."""
+    from parity.cli import to_dict
+    from parity.types import Verification
+
+    v = Verification(1, 0, 10, 10, checked=["amount"], failures=["key 3: walk equal"])
+    result = _result(verification=v)
+    lines = _human(result)
+    assert "not verified: the independent sample check found 1 row" in lines[0]
+    assert any("sample key 3: walk equal" in line for line in lines)
+    assert not result.identical
+    payload = to_dict(result)
+    assert payload["identical"] is False
+    assert payload["verification"]["failures"] == ["key 3: walk equal"]
+    assert payload["verification"]["modulus"] == 1
+
+
+def test_a_sample_check_that_could_not_run_is_printed_not_hidden():
+    """No silent skip: an error reads as a warning line."""
+    from parity.types import Verification
+
+    v = Verification(1, 0, 0, 0, error="side B: permission denied")
+    lines = _human(_result(verification=v))
+    assert any("independent sample check could not run" in line for line in lines)
+
+
+def test_verify_sample_flag_reaches_the_engine(tmp_path):
+    """`--verify-sample 0` skips the check; the default runs it, in full on a
+    small table."""
+    path = tmp_path / "t.duckdb"
+    con = duckdb_write(str(path))
+    con.execute(
+        "create table t as select i::bigint as id, i * 2 as v from range(50) r(i)"
+    )
+    con.close()
+    url = f"duckdb:///{path}"
+    base = ["diff", "--a", url, "--a-table", "t", "--b", url, "--b-table", "t"]
+    for extra, expect in (([], 50), (["--verify-sample", "0"], None)):
+        out = io.StringIO()
+        assert main([*base, "--key", "id", "--json", *extra], out=out) == EXIT_IDENTICAL
+        v = json.loads(out.getvalue())["verification"]
+        assert (v and v["rows_a"]) == expect

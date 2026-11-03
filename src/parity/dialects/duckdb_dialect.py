@@ -7,6 +7,7 @@ The other half of a comparison, and the shortest complete example of the
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from parity.dialects.base import (
@@ -204,8 +205,14 @@ class DuckDBDialect(Dialect):
         elif t is LogicalType.DATE:
             expr = f"strftime({c}, '%Y-%m-%d')"
         elif t is LogicalType.TIMESTAMP:
-            expr = f"strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"
-            if column.raw_type.upper().startswith("TIMESTAMP_NS"):
+            src = c
+            if column.raw_type.upper() in ("TIMESTAMP_S", "TIMESTAMP_MS"):
+                # strftime binds its TIMESTAMP_NS overload for these, which
+                # raises outside ~1677-2262 and killed the diff (COV-1). A
+                # cast to TIMESTAMP (microseconds) is exact for both.
+                src = f"cast({c} as timestamp)"
+            expr = f"strftime({src}, '%Y-%m-%d %H:%M:%S.%f')"
+            if column.raw_type.upper().startswith("TIMESTAMP_NS") and column.sub_micro:
                 # `%f` is microseconds, so .000000001 and .000000999 rendered
                 # alike, silently (RT-A7/C1/E7). A whole-microsecond value
                 # still renders exactly as before - the six digits every other
@@ -243,6 +250,48 @@ class DuckDBDialect(Dialect):
             # escaped.
             expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def holds_sub_micro(self, column: Column) -> bool:
+        """TIMESTAMP_NS holds nanoseconds."""
+        return column.logical_type is LogicalType.TIMESTAMP and (
+            column.raw_type.upper().startswith("TIMESTAMP_NS")
+        )
+
+    def caveats(self, columns: Sequence[Column]) -> list[str]:
+        """A TIMESTAMP_NS compared against a microsecond engine is truncated."""
+        fine = sorted(
+            c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
+        )
+        if not fine:
+            return []
+        note = (
+            f"columns {fine} hold nanoseconds and the other side microseconds "
+            "only; they are compared at microseconds (the digits past the sixth "
+            "are dropped), so a difference below one microsecond is not seen"
+        )
+        return [note]
+
+    def single_precision(self, column: Column) -> bool:
+        """DuckDB's FLOAT is float4 (REAL and FLOAT4 are its aliases)."""
+        return column.raw_type.lower().split("(")[0].strip() in (
+            "float",
+            "float4",
+            "real",
+        )
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; dates and timestamps as text.
+
+        The driver is lossy on every temporal edge (COV-3..5): it returns
+        `infinity` as 9999-12-31, BC values as strings, rounds TIMESTAMP_NS to
+        the microsecond where the rules truncate, and returns TIMESTAMPTZ only
+        with pytz installed. DuckDB's varchar cast prints the stored value
+        whole - `infinity`, `0044-03-15 (BC)`, nine digits, `+00` under the
+        pinned UTC - and `parity.reference` reads all of it.
+        """
+        if column.logical_type in (LogicalType.DATE, LogicalType.TIMESTAMP):
+            return f"cast({self.quote(column.name)} as varchar)"
+        return super().sample_select(column)
 
     def normalize_key(self, column: Column) -> str:
         """Exact key text; a TIMESTAMP_NS key keeps its nanoseconds.

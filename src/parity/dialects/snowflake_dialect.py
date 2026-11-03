@@ -220,9 +220,7 @@ class SnowflakeDialect(Dialect):
             )
         ]
         fine = sorted(
-            c.name
-            for c in columns
-            if c.logical_type is LogicalType.TIMESTAMP and _sub_micro(c.raw_type)
+            c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
         )
         if fine:
             out.append(
@@ -273,6 +271,22 @@ class SnowflakeDialect(Dialect):
                 # form converts an instant. Verified live against DuckDB.
                 c = f"convert_timezone('UTC', {c})"
             expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
+            if column.sub_micro:
+                # Both sides hold sub-microsecond digits (COV-2): nine digits
+                # when there are any, as DuckDB TIMESTAMP_NS prints them.
+                raw_c = self.quote(column.name)
+                nine = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF9')"
+                expr = (
+                    f"case when date_part(nanosecond, {raw_c}) % 1000 = 0 "
+                    f"then {expr} else {nine} end"
+                )
+        elif _base(column.raw_type) == "TIME":
+            # TIME is unmapped, and its varchar cast follows TIME_OUTPUT_FORMAT
+            # (HH24:MI:SS by default), which drops the fraction: 12:34:56.5 and
+            # 12:34:56 printed alike - a false match (COV-6). The fraction
+            # without trailing zeros, as PostgreSQL and DuckDB print a time.
+            nine = f"to_char({c}, 'HH24:MI:SS.FF9')"
+            expr = f"rtrim(rtrim({nine}, '0'), '.')"
         elif _base(column.raw_type) in ("VARIANT", "OBJECT", "ARRAY"):
             # A plain varchar cast of a VARIANT prints a string without its
             # JSON quotes, so the number 1 and the string "1" render alike - a
@@ -349,6 +363,27 @@ class SnowflakeDialect(Dialect):
             f"when {x} is not null then cast(cast('{FLOAT_OUT_OF_RANGE_MESSAGE}' "
             f"|| cast({x} as varchar) || '{where}' as number) as varchar) end"
         )
+
+    def holds_sub_micro(self, column: Column) -> bool:
+        """A Snowflake timestamp of precision above 6 (the default is 9)."""
+        return column.logical_type is LogicalType.TIMESTAMP and _sub_micro(
+            column.raw_type
+        )
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; a nanosecond timestamp as text.
+
+        The connector returns a Python datetime, which holds microseconds
+        only, so a timestamp compared past them is read as ISO text with all
+        nine digits and its offset instead.
+        """
+        if column.sub_micro:
+            c = self.quote(column.name)
+            if _base(column.raw_type) in ("TIMESTAMP_TZ", "TIMESTAMP_LTZ"):
+                c = f"convert_timezone('UTC', {c})"
+                return f"to_char({c}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9TZH:TZM')"
+            return f"to_char({c}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9')"
+        return super().sample_select(column)
 
     def decimal_key_text(self, c: str, column: Column) -> str:
         """NUMBER's varchar cast is exact at the declared scale; drop the

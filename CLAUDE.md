@@ -727,6 +727,28 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   metadata at login unless `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` is set (the
   dialect sets it), and still flushes a session-telemetry batch to the
   connected account at logout, which no switch in 5.1.0 was found to stop.
+- **The walk is checked by a second method** (`engine._verify`,
+  `parity/reference.py`). About `verify_sample` rows, chosen by a hash of the
+  key text (`fetch_sample`), are fetched as raw driver values and compared in
+  Python by the rules - no `normalize` SQL - and must agree with the walk on
+  every sampled key; a disagreement is a failure and the result is not
+  identical. It compares by canonical text (`canonical_text`), not by typed
+  value, because that is the walk's equality. Driver workarounds live in
+  `sample_select`/`sample_value` per dialect, never in the reference. The
+  test suite's autouse fixture `_sample_check_never_disagrees` fails any test
+  whose comparison the check contradicts, so every comparison in the suite
+  also tests the check; tests that plant a walk defect opt out with
+  `@pytest.mark.sample_check_may_disagree`.
+- **The coverage map is the evidence, not a claim** (`tests/conformance/`,
+  `docs/coverage.md`, regenerate with `tests/conformance/report.py`): every
+  logical type on every engine against `parity.reference`, at scales 6 and 2.
+  A new disagreement fails the sweep; a confirmed one is a COV-<n> strict
+  xfail until fixed. Saved runs (`tests/conformance/results/`) are not
+  committed: they can carry account identifiers.
+- **Sub-microsecond rule (COV-2):** `Column.sub_micro` is set by the engine
+  only when both sides' `holds_sub_micro` is true; then a value with digits
+  past microseconds renders nine digits on every engine, otherwise they are
+  truncated and the dialect's caveat says so.
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,

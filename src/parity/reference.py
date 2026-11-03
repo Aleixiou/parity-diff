@@ -1,0 +1,233 @@
+"""The comparison rules in plain Python, for the independent sample check.
+
+The checksum walk decides through SQL that every dialect writes for its own
+engine: each value rendered to canonical text inside the database. A mistake
+in one of those expressions - a rounding mode, a timezone, an escape - can
+make two different values render alike, and then the walk reports a false
+match that no checksum can see, because both sides agreed on the wrong text.
+Every false match the red-team campaign found was of that kind.
+
+This module is the second opinion. It takes the *raw values* the database
+drivers return and reduces each to what the documented rules say the
+comparison sees (CLAUDE.md sections 4.2 and 4.3), without calling a line of
+dialect SQL:
+
+- NULL is equal only to NULL;
+- integers compare as integers;
+- DECIMAL and FLOAT compare as decimal text rounded half away from zero to
+  the float scale - a FLOAT through `canonical_float_text`, the executable
+  spec every engine is tested against;
+- booleans as booleans;
+- text exactly, except that fixed-width CHAR loses its trailing spaces;
+- dates as calendar dates, with PostgreSQL's infinities and BC years;
+- timestamps to the microsecond, instants converted to UTC.
+
+Two values the rules call equal reduce to equal tokens, whichever engine and
+driver they came from. A type the rules do not cover (JSON, binary, arrays,
+...) is `UNCHECKED`, and the engine reports that the column was not
+independently verified rather than pretend it was.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import math
+import re
+import struct
+from decimal import ROUND_HALF_UP, Context, Decimal
+from typing import Any
+
+from parity.dialects.base import (
+    NULL_SENTINEL,
+    canonical_float_text,
+    escape_canonical_text,
+)
+from parity.types import LogicalType
+
+#: Returned for a value the rules do not cover; never equal to a real token.
+UNCHECKED = object()
+
+#: Wide enough for any DECIMAL(38) or BIGNUMERIC value at any float scale.
+_WIDE = Context(prec=200)
+
+_UTC = dt.timezone.utc
+
+#: `[-]YYYY-MM-DD[ (BC)][( |T)HH:MM:SS[.f...]][offset][ BC]`, as engines print
+#: temporal values as text: PostgreSQL's JSON output (which ignores DateStyle)
+#: puts the era last, DuckDB's varchar cast puts it after the date.
+_TEMPORAL = re.compile(
+    r"^(?P<neg>-)?(?P<y>\d{1,6})-(?P<mo>\d\d)-(?P<d>\d\d)(?P<bc1> \(BC\))?"
+    r"(?:[ T](?P<h>\d\d):(?P<mi>\d\d):(?P<s>\d\d)(?:\.(?P<f>\d{1,9}))?)?"
+    r"(?P<tz>Z|[+-]\d\d(?::?\d\d)?(?::?\d\d)?)?"
+    r"(?P<bc> BC| \(BC\))?$"
+)
+
+
+def reference_token(
+    logical_type: LogicalType,
+    value: Any,
+    float_scale: int,
+    *,
+    padded: bool = False,
+    single_precision: bool = False,
+    sub_micro: bool = False,
+) -> Any:
+    """Reduce one raw driver value to what the comparison rules see.
+
+    `padded` marks a fixed-width CHAR column, whose trailing spaces carry no
+    meaning; `single_precision` a float4 column, whose value the drivers may
+    hand back as the shortest repr of the float rather than the float itself.
+    `sub_micro` keeps a timestamp's digits past microseconds (both sides of
+    the comparison hold them), as nine digits when there are any.
+    """
+    if value is None:
+        return None
+    try:
+        if logical_type is LogicalType.INTEGER:
+            if isinstance(value, Decimal) and value != value.to_integral_value():
+                return UNCHECKED  # not an integer after all; do not guess
+            return ("int", int(value))
+        if logical_type is LogicalType.DECIMAL:
+            return ("num", _decimal_text(value, float_scale))
+        if logical_type is LogicalType.FLOAT:
+            return ("num", _float_text(value, float_scale, single_precision))
+        if logical_type is LogicalType.BOOLEAN:
+            if isinstance(value, (bool, int)):
+                return ("bool", bool(value))
+            return UNCHECKED
+        if logical_type is LogicalType.STRING:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return UNCHECKED
+            text = str(value)
+            return ("str", text.rstrip(" ") if padded else text)
+        if logical_type is LogicalType.DATE:
+            return ("date", _date_text(value))
+        if logical_type is LogicalType.TIMESTAMP:
+            return ("ts", _timestamp_text(value, sub_micro))
+    except (ValueError, TypeError, ArithmeticError, OverflowError):
+        return UNCHECKED
+    return UNCHECKED
+
+
+def describe(token: Any) -> str:
+    """A token as a reader would want it in a message."""
+    if token is None:
+        return "NULL"
+    if token is UNCHECKED:
+        return "(not checked)"
+    return repr(token[1])
+
+
+def _decimal_text(value: Any, scale: int) -> str:
+    """Half away from zero at `scale` places, unsigned zero - CLAUDE.md 4.2."""
+    if isinstance(value, float):
+        return _float_text(value, scale, False)
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    if d.is_nan():
+        return "NaN"
+    if d.is_infinite():
+        return "Infinity" if d > 0 else "-Infinity"
+    q = d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP, context=_WIDE)
+    if q == 0:
+        q = abs(q)
+    return format(q, "f")
+
+
+def _float_text(value: Any, scale: int, single: bool) -> str:
+    """The canonical float form; non-finite values as the shared tokens."""
+    x = float(value)
+    if single and math.isfinite(x):
+        # Widen exactly as the engines do: the nearest float4, as a double.
+        x = struct.unpack("<f", struct.pack("<f", x))[0]
+    if math.isnan(x):
+        return "NaN"
+    if math.isinf(x):
+        return "Infinity" if x > 0 else "-Infinity"
+    return canonical_float_text(x, scale)
+
+
+def _date_text(value: Any) -> str:
+    """YYYY-MM-DD, or a PostgreSQL infinity, or an astronomical BC year."""
+    if isinstance(value, dt.datetime):
+        value = value.date()
+    if isinstance(value, dt.date):
+        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+    return _parse_temporal(str(value), with_time=False)
+
+
+def _timestamp_text(value: Any, sub_micro: bool = False) -> str:
+    """YYYY-MM-DD HH:MM:SS.ffffff; an instant in UTC. With `sub_micro`, a
+    value with digits past microseconds keeps all nine."""
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(_UTC).replace(tzinfo=None)
+        return (
+            f"{value.year:04d}-{value.month:02d}-{value.day:02d} "
+            f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}."
+            f"{value.microsecond:06d}"
+        )
+    return _parse_temporal(str(value), with_time=True, sub_micro=sub_micro)
+
+
+def _parse_temporal(text: str, *, with_time: bool, sub_micro: bool = False) -> str:
+    """Reduce an engine's text form of a date or timestamp to the token text.
+
+    Only for values a driver cannot carry as a Python object: infinities, BC
+    or year-0 dates, and engines whose sample select reads text on purpose.
+    Fractions past microseconds are truncated, as the canonical form does.
+    """
+    t = text.strip()
+    if t in ("infinity", "-infinity"):
+        return t
+    m = _TEMPORAL.match(t)
+    if not m:
+        raise ValueError(f"unrecognised temporal text {text!r}")
+    year = int(m["y"])
+    if m["bc"] or m["bc1"]:
+        year = 1 - year  # 1 BC is astronomical year 0
+    if m["neg"]:
+        year = -year
+    ys = f"{year:04d}" if year >= 0 else f"-{-year:02d}"
+    day = f"{ys}-{m['mo']}-{m['d']}"
+    if not with_time:
+        return day
+    if m["h"] is None:
+        return f"{day} 00:00:00.000000"
+    digits = (m["f"] or "").ljust(9, "0")
+    frac = digits[:9] if sub_micro and digits[6:9] != "000" else digits[:6]
+    clock = f"{m['h']}:{m['mi']}:{m['s']}.{frac}"
+    tz = m["tz"]
+    if tz and tz not in ("Z", "+00", "+00:00", "-00", "+0000"):
+        if not (0 < year <= 9999):
+            raise ValueError("offset on a year Python cannot represent")
+        stamp = dt.datetime.fromisoformat(f"{day} {m['h']}:{m['mi']}:{m['s']}")
+        sign = -1 if tz[0] == "-" else 1
+        digits = tz[1:].replace(":", "")
+        hours, minutes = int(digits[:2]), int(digits[2:4] or 0)
+        seconds = int(digits[4:6] or 0)
+        offset = dt.timedelta(hours=hours, minutes=minutes, seconds=seconds)
+        utc = stamp - sign * offset
+        return f"{utc:%Y-%m-%d %H:%M:%S}.{frac}"
+    return f"{day} {clock}"
+
+
+def canonical_text(token: Any) -> str:
+    """The canonical text a dialect's `normalize` must produce for a value
+    whose reference token is `token` - the spec of CLAUDE.md 4.2/4.3 in one
+    function, so an engine's SQL can be tested against the rules directly:
+    NULL as the sentinel, text escaped, every other type as its token text."""
+    if token is None:
+        return NULL_SENTINEL
+    if token is UNCHECKED:
+        raise ValueError("an unchecked value has no canonical text in the rules")
+    kind, value = token
+    if kind == "int":
+        return str(value)
+    if kind == "bool":
+        return "true" if value else "false"
+    if kind == "str":
+        return escape_canonical_text(value)
+    return str(value)  # num, date, ts: the token is already the text
+
+
+__all__ = ["UNCHECKED", "canonical_text", "describe", "reference_token"]

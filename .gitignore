@@ -21,3 +21,6 @@ htmlcov/
 
 # Local working notes, never published
 0_Brain_0/
+
+# Conformance sweep results: per-machine runs, may carry account identifiers
+tests/conformance/results/

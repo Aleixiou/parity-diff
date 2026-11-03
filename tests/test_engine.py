@@ -542,6 +542,9 @@ def test_no_shared_columns_still_checks_key_presence():
     assert any("no comparable columns" in w for w in result.warnings)
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_type_mismatch_between_sides_is_called_out():
     """A schema difference that would report every row as changed is named as one."""
     a_cols = [Column("amount", LogicalType.DECIMAL, "decimal(12,2)")]
@@ -984,6 +987,9 @@ def test_two_columns_differing_only_in_case_are_refused():
 # ---------------------------------------------------------------------------
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
     """RT-A10, count variant: a side whose fetch drops a row its own checksum
     counted. The surviving rows compare equal, so without the count check the
@@ -1006,6 +1012,9 @@ def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
     assert "side B (b.t) counted" in note and "returned" in note
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_lossy_fetch_is_named_with_both_tables_and_the_range():
     """RT-A10: rows compare equal after a mismatched checksum - the result
     names both tables and the key range, and is not identical. A real planted

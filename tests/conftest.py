@@ -274,3 +274,33 @@ def open_bigquery(url: str, side: str = "A", float_scale: int = 6):
 def open_mssql(url: str, side: str = "A", float_scale: int = 6):
     """Open a SQL Server dialect (SNAPSHOT where the database allows it)."""
     return get_dialect(url, side=side, float_scale=float_scale)
+
+
+@pytest.fixture(autouse=True)
+def _sample_check_never_disagrees(request, monkeypatch):
+    """Every comparison in the suite doubles as a test of the sample check.
+
+    The independent sample check (`engine._verify`) runs in every `diff` by
+    default. Where the checksum walk is right - which is every test here that
+    does not plant a check failure on purpose - a disagreement from the check
+    is a false alarm in the check itself, or a real bug in the walk the test
+    did not know about. Either must fail the test, and so must a sample that
+    could not run. Tests that plant a disagreement opt out with the
+    `sample_check_may_disagree` marker.
+    """
+    if request.node.get_closest_marker("sample_check_may_disagree"):
+        yield
+        return
+    import parity.engine as engine
+
+    seen: list[str] = []
+    original = engine._verify
+
+    def checked(v, *args, **kwargs):
+        """Run the real check, then remember anything it objected to."""
+        original(v, *args, **kwargs)
+        seen.extend(f"sample check failure: {f}" for f in v.failures)
+
+    monkeypatch.setattr(engine, "_verify", checked)
+    yield
+    assert not seen, "\n".join(seen)

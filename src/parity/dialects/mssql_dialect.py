@@ -444,9 +444,7 @@ class SQLServerDialect(Dialect):
                 "replica or snapshot, for a single-snapshot result"
             )
         seven = sorted(
-            c.name
-            for c in columns
-            if c.raw_type.lower() in ("datetime2(7)", "datetimeoffset(7)")
+            c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
         )
         if seven:
             out.append(
@@ -563,6 +561,37 @@ class SQLServerDialect(Dialect):
 
     # ----------------------------------------------------------- rendering
 
+    def holds_sub_micro(self, column: Column) -> bool:
+        """datetime2(7) and datetimeoffset(7) hold 100 ns ticks."""
+        return column.raw_type.lower() in ("datetime2(7)", "datetimeoffset(7)")
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check, past three driver limits.
+
+        Text travels as its UTF-8 bytes, because mssql-python drops trailing
+        NUL characters from nvarchar results (the reason for `fetch_text`).
+        Timestamps travel as ODBC-canonical text (style 121; 127 for
+        datetimeoffset, offset included): the driver rounds datetime2(7) to
+        microseconds where the rules truncate, and `datetime`'s tick only
+        has its documented display as text. The reference reads both forms.
+        """
+        c = self.quote(column.name)
+        if column.logical_type is LogicalType.STRING:
+            return f"convert(varbinary(max), {self._utf8(f'cast({c} as nvarchar(max))')})"
+        if column.logical_type is LogicalType.TIMESTAMP:
+            style = 127 if _base_type(column.raw_type) == "datetimeoffset" else 121
+            return f"convert(nvarchar(40), {c}, {style})"
+        return super().sample_select(column)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """Decode the text bytes; a uniqueidentifier in lower case, as the
+        rules render it (SQL Server prints it upper case)."""
+        if isinstance(value, (bytes, bytearray)):
+            value = bytes(value).decode("utf-8", errors="replace")
+        if isinstance(value, str) and _base_type(column.raw_type) == "uniqueidentifier":
+            return value.lower()
+        return value
+
     def separator_sql(self) -> str:
         """`nchar(31)`: `char(31)` would be varchar in the database code page,
         and the text stays nvarchar until the one UTF-8 conversion."""
@@ -632,6 +661,15 @@ class SQLServerDialect(Dialect):
             expr = f"convert({text}, {c}, 23)"
         elif t is LogicalType.TIMESTAMP:
             expr = self._timestamp_text(c, raw)
+            if column.sub_micro:
+                # Both sides hold sub-microsecond digits (COV-2): a seventh
+                # digit is kept, as nine digits - what DuckDB TIMESTAMP_NS and
+                # Snowflake print for the same instant.
+                v = f"switchoffset({c}, '+00:00')" if raw == "datetimeoffset" else c
+                s27 = f"convert(nvarchar(max), cast({v} as datetime2(7)), 121)"
+                expr = (
+                    f"case when right({s27}, 1) = N'0' then {expr} else {s27} + N'00' end"
+                )
         elif raw in ("char", "nchar"):
             # A fixed-width column stores 'abc' as 'abc       '. PostgreSQL's
             # bpchar -> text and MySQL's CHAR both strip that padding, and
@@ -1012,3 +1050,8 @@ def map_type_mssql(raw: str) -> LogicalType:
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN
+
+
+def _base_type(raw: str) -> str:
+    """The type name without parameters, lower case: `datetime2(7)` -> `datetime2`."""
+    return raw.lower().split("(")[0].strip()

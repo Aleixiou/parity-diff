@@ -505,6 +505,20 @@ class PostgresDialect(Dialect):
             f"else to_char({c}, 'YYYY{after_year}') end"
         )
 
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; dates and timestamps as JSON text.
+
+        psycopg cannot load `infinity` or a BC date into a Python date (it
+        raises, which would end the whole sample), and the text output of
+        `::text` follows the session DateStyle. JSON output is ISO 8601
+        whatever DateStyle says and spells infinities and BC years plainly
+        (`infinity`, `0044-03-15 BC`, `2024-06-15T06:15:00+00:00` under the
+        pinned UTC), which `parity.reference` reads. Verified live.
+        """
+        if column.logical_type in (LogicalType.DATE, LogicalType.TIMESTAMP):
+            return f"to_json({self.quote(column.name)}) #>> '{{}}'"
+        return super().sample_select(column)
+
     def escape_text(self, expr: str) -> str:
         """Escape under the C collation, whatever the column's own.
 

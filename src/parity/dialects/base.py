@@ -972,6 +972,80 @@ class Dialect(ABC):
             out[rk] = tuple(row[1:])
         return out
 
+    # ------------------------------------------------ the independent sample
+
+    def sample_select(self, column: Column) -> str:
+        """How the sample check selects one column: its raw value.
+
+        Deliberately *not* `normalize` - the point of the check is to compare
+        what the driver hands back, reduced by `parity.reference`, so that a
+        mistake in this dialect's canonical-text SQL cannot hide itself. A
+        dialect overrides this only where its driver cannot carry a value
+        faithfully (PostgreSQL's infinite dates, DuckDB's tz-aware stamps).
+        """
+        return self.quote(column.name)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """Turn one value `sample_select` returned into what
+        `reference_token` reads. Identity by default."""
+        return value
+
+    def holds_sub_micro(self, column: Column) -> bool:
+        """Whether a TIMESTAMP column can hold digits past microseconds.
+        False by default; the engines that can override it."""
+        return False
+
+    def single_precision(self, column: Column) -> bool:
+        """Whether a FLOAT column is float4, which the reference widens the
+        way the engines do. `real`/`float4` everywhere; MySQL and DuckDB
+        spell float4 `float` too and override this."""
+        return column.raw_type.lower().split("(")[0].strip() in ("real", "float4")
+
+    def padded_char(self, column: Column) -> bool:
+        """Whether a STRING column is fixed-width CHAR, whose trailing
+        spaces every engine's canonical text drops (CLAUDE.md 4.2)."""
+        t = column.raw_type.lower().split("(")[0].strip()
+        return t in ("char", "nchar", "character", "bpchar")
+
+    def fetch_sample(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        modulus: int,
+        residue: int,
+    ) -> dict[int | str, tuple[Any, ...]]:
+        """Raw values of the rows whose key hash is `residue` modulo `modulus`.
+
+        The selection is a hash of the key's exact text, so both sides pick the
+        same keys and the sample spreads over the whole table rather than one
+        key range; `modulus` 1 takes every row. The hash is of the key only,
+        never the row, so it costs a fraction of a checksum pass. Rows are
+        matched by the same identity `fetch_range` uses.
+        """
+        identity = self.key_identity(key)
+        if key.hashed:
+            identity = self.fetch_text(identity)
+        exprs = "".join(", " + self.sample_select(c) for c in columns)
+        where = ""
+        if modulus > 1:
+            h = self.hash_expr(self._concat(self._key_parts(key)))
+            rem = f"(({h}) - {self.int_div(h, str(modulus))} * {modulus})"
+            where = f" where {rem} = {residue}"
+        sql = f"select {identity}{exprs} from {self.qualify(table)}{where}"
+        out: dict[int | str, tuple[Any, ...]] = {}
+        for row in self.query(sql):
+            rk: int | str = self.fetched(row[0]) if key.hashed else int(row[0])
+            if rk in out:
+                raise self._err(
+                    f"duplicate key {rk!r} in {table}: key {key.label} is not "
+                    f"unique, so rows cannot be compared one-to-one"
+                )
+            out[rk] = tuple(
+                self.sample_value(c, v) for c, v in zip(columns, row[1:], strict=True)
+            )
+        return out
+
 
 def get_dialect(
     connection_string: str,
