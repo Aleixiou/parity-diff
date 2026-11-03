@@ -210,6 +210,7 @@ decision: it adds row versioning in tempdb).
 
 ```
 snowflake://user:password@account/database/schema?warehouse=WH&role=ROLE
+snowflake://user@account/database/schema?warehouse=WH&private_key_file=C:/keys/parity.p8
 ```
 
 `pip install "parity-diff[snowflake]"`, which installs
@@ -219,10 +220,25 @@ and the tool sends no telemetry. With 4.x it switches the connector's
 telemetry and its cloud-metadata probes (`SNOWFLAKE_DISABLE_PLATFORM_DETECTION`)
 off.
 
-**Authentication.** User and password only. The URL's query string is read
-for `warehouse` and `role` and nothing else (other parameters are ignored, not
-refused). SSO (`externalbrowser`), key-pair, OAuth and MFA prompts are not
-supported yet, so a user whose account policy requires them cannot log in.
+**Authentication.** User and password, or **key-pair** (Snowflake is phasing
+out password-only sign-in). For key-pair, leave the password out of the URL
+and add `private_key_file=<path>` to a PEM RSA private key (PKCS#8, as
+`openssl genrsa` + `openssl pkcs8` write it; `~` is expanded). If the key is
+encrypted, its passphrase is read from the environment variable
+`PARITY_SNOWFLAKE_KEY_PASSPHRASE` (or `PARITY_SNOWFLAKE_KEY_PASSPHRASE_A` /
+`_B` for one side), **never from the URL**. The key is loaded by parity and
+handed to the connector as bytes with `authenticator=SNOWFLAKE_JWT` and no
+password; the telemetry switches apply to this login as to any other.
+A URL with both a password and a key file, or neither, is refused; so is a
+passphrase set for a key that is not encrypted (the key on disk is not
+protected the way you think, or the path names another file). Errors print
+the key's path, never the key or the passphrase.
+
+The query string accepts `warehouse`, `role` and `private_key_file` and
+nothing else: an unknown, repeated or empty parameter is refused with the
+list of accepted ones. SSO (`externalbrowser`), OAuth and MFA prompts are not
+supported (`authenticator=` is refused): each needs a browser or a token in
+the URL, so a user whose account policy requires them cannot log in.
 
 **Tables.** Unqualified names mean the URL's schema, else `PUBLIC`; tables are
 always schema-qualified in queries. Snowflake stores unquoted names in UPPER
@@ -337,8 +353,9 @@ the README's CI example); GitHub Actions masks secret values in logs.
 
 What the tool prints: the report names tables, columns, keys and values,
 never a connection string. Connection errors are written so they do not
-contain the password (tested for PostgreSQL, MySQL and SQL Server); BigQuery
-takes no secret in its URL at all. What it cannot hide: the expanded
+contain the password (tested for PostgreSQL, MySQL, SQL Server and
+Snowflake); BigQuery takes no secret in its URL at all, and a Snowflake key's
+passphrase is read from the environment, never the URL. What it cannot hide: the expanded
 arguments are visible in the process list to other users of the same machine
 while it runs, so use a dedicated read-only login. On PostgreSQL you can leave
 the password out of the URL entirely and let libpq read `PGPASSWORD` or

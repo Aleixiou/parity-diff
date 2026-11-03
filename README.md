@@ -147,7 +147,7 @@ parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
 | `--columns` / `--exclude` | compare only these columns / skip these. Default: every column both sides share |
 | `--float-scale` | decimal places at which floats and decimals are compared (default 6), always the same on both sides |
 | `--max-diffs` | stop after N differences (default 10,000; `0` for no limit). The result is then marked partial |
-| `--verify-sample` | rows for the independent sample check (default 10,000; `0` skips it) |
+| `--verify-sample` | rows for the independent sample check (default 10,000; `0` skips it, and the report says so). A check that cannot run makes the result not identical |
 | `--bisection-factor`, `--threshold` | buckets per level (32), and the range size at which rows are downloaded instead of bisected further (10,000) |
 | `--json` / `--quiet` | machine-readable output / print nothing and rely on the exit code |
 
@@ -160,6 +160,7 @@ duckdb:///relative/path.duckdb                  (three slashes = relative)
 duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 snowflake://user:password@account/database/schema?warehouse=wh&role=r
+snowflake://user@account/database/schema?private_key_file=/path/key.p8   (key pair)
 bigquery://project/dataset                      (optional ?location=EU)
 mssql://user:password@host:port/database        (also sqlserver://; port 1433)
 ```
@@ -175,7 +176,7 @@ environment variable — `--a "$LEGACY_URL"` — as described
 | Code | Meaning |
 |---|---|
 | `0` | identical |
-| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, the independent sample check contradicted the checksums, or the run stopped at `--max-diffs` |
+| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, the independent sample check contradicted the checksums or could not run, or the run stopped at `--max-diffs` |
 | `2` | error (bad connection string, missing table, unusable key, a refused value) |
 
 An error is never `1`. A CI job can always tell "the tables differ" from "the
@@ -195,9 +196,10 @@ qualifies the verdict, then the rows:
   `NULL`, text is quoted, so `NULL` and `''` never look alike.
 - `! at least N differences … stopped early` — the `--max-diffs` limit was hit;
   the rest of the table was **not** checked.
-- `✗ schemas differ …`, `✗ not verified …` — a column exists on one side only,
-  or the tool could not account for a checksum difference or was contradicted
-  by its own sample check. Never identical.
+- `✗ schemas differ …`, `✗ not verified …`, `✗ not proven …` — a column
+  exists on one side only, or the tool could not account for a checksum
+  difference, was contradicted by its own sample check, or could not run that
+  check. Never identical.
 - `! …` lines — caveats: no single snapshot on this side, row-level security,
   sub-microsecond truncation, columns of a type outside the rules, a type
   that differs between the sides.
@@ -267,11 +269,12 @@ takes the same options as the CLI; pass `max_diffs=None` to lift the limit,
 runs. Values are the raw canonical text the engines compared (`\N` is NULL).
 
 `DiffResult` carries `identical`, `truncated`, `schema_differences`,
-`unexplained`, `verification` (the sample check), `diffs` (`RowDiff` with
+`unexplained`, `verification` (the sample check), `verify_sample`, `diffs` (`RowDiff` with
 `key`, `kind`, `columns`, `values_a`, `values_b`), `columns`, `warnings`,
 `float_scale` and `stats`. `identical` is `True` only if no row differed, no
 column exists on one side only, every checksum mismatch was explained, the
-sample check found no contradiction, **and** the whole key space was walked.
+sample check (unless `verify_sample=0`) ran and found no contradiction, **and**
+the whole key space was walked.
 The fields are described with their JSON counterparts in
 [docs/output.md][output-json].
 
@@ -353,7 +356,7 @@ column on one side only is a schema difference (exit 1).
 | PostgreSQL | supported: 9.6 or newer (12 or newer for FLOAT columns); every version 12-18 verified identical; the database must be UTF-8 or its text is hashed as UTF-8 |
 | DuckDB | supported: 1.3 or newer (1.3-2.0 verified identical; older versions are refused, as they render some values ambiguously) |
 | MySQL | supported: 8.0, 8.4 LTS and 9.x verified identical; 9.7+ needs `INSTALL COMPONENT 'file://component_classic_hashing'` (MD5) |
-| Snowflake | supported (verified live on AWS); connector 4.x, user/password login |
+| Snowflake | supported (verified live on AWS); connector 4.x, password or key-pair login |
 | BigQuery | supported (verified live in the EU region); Application Default Credentials |
 | SQL Server / Azure SQL | supported (SQL Server 2019+; 2019 and 2022 verified identical; FLOAT columns need database compatibility level 130 or more); SQL authentication |
 | Redshift, Databricks, Fabric | not yet — a new engine is one dialect file, see `CONTRIBUTING.md` |
@@ -415,7 +418,9 @@ Tests that need PostgreSQL read `PARITY_TEST_PG` (default
 server is reachable — the DuckDB and pure-Python suites still run. Snowflake
 and BigQuery have no local or CI instance, so their live suites run only when
 `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY`
-(`bigquery://<project>/<dataset>`) point at a real account; the BigQuery tests
+(`bigquery://<project>/<dataset>`) point at a real account (Snowflake's
+key-pair test additionally needs `PARITY_TEST_SNOWFLAKE_KEYPAIR`, a key-pair
+URL); the BigQuery tests
 create and drop their own tables in that dataset. SQL Server's live suite runs
 when `PARITY_TEST_MSSQL` names a login that may create databases — the
 Developer-edition container works; see the top of `tests/test_mssql.py` — and

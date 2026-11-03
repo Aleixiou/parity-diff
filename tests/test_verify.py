@@ -161,19 +161,62 @@ def test_a_partial_walk_is_not_verified():
     assert result.truncated and result.verification is None
 
 
-def test_a_check_that_cannot_run_is_reported_not_fatal():
-    """A sample query that fails is printed; the walk's verdict stands."""
+class BrokenSample(FakeDialect):
+    """A side whose sample query fails, as a database error would."""
 
-    class Broken(FakeDialect):
-        def fetch_sample(self, *args):
-            """Fail as a database error would."""
-            raise self._err("sample query failed")
+    def fetch_sample(self, *args):
+        """Fail as a database error would."""
+        raise self._err("sample query failed")
+
+
+def test_a_check_that_cannot_run_leaves_the_result_unproven():
+    """The run asked for a second method and did not get one: the checksums
+    found nothing, but that is not the proof requested - never identical."""
+    a = FakeDialect(SyntheticTable(100, columns=COLS), side="A")
+    b = BrokenSample(SyntheticTable(100, columns=COLS), side="B")
+    result = diff(a, b, "t", "t", "id")
+    assert result.diffs == [] and not result.truncated
+    assert "sample query failed" in result.verification.error
+    assert not result.identical
+
+
+def test_a_check_that_cannot_run_does_not_hide_a_planted_difference():
+    """The errored check changes the verdict only towards 'not identical': a
+    real difference is still found and listed."""
+    a = FakeDialect(SyntheticTable(100, columns=COLS), side="A")
+    b = BrokenSample(
+        SyntheticTable(100, columns=COLS, changed={7: ("7.08", "status-0")}),
+        side="B",
+    )
+    result = diff(a, b, "t", "t", "id")
+    assert [(d.key, d.columns) for d in result.diffs] == [(7, ["amount"])]
+    assert result.verification.error and not result.identical
+
+
+def test_switched_off_the_walk_alone_decides_and_says_so():
+    """`verify_sample=0` is a deliberate choice: identical tables stay
+    identical, the result records the choice, and the report says so; a
+    planted difference is still found."""
+    import io
+
+    from parity.cli import render_human, to_dict
 
     a = FakeDialect(SyntheticTable(100, columns=COLS), side="A")
-    b = Broken(SyntheticTable(100, columns=COLS), side="B")
-    result = diff(a, b, "t", "t", "id")
-    assert result.identical
-    assert "sample query failed" in result.verification.error
+    b = BrokenSample(SyntheticTable(100, columns=COLS), side="B")
+    result = diff(a, b, "t", "t", "id", verify_sample=0)
+    assert result.identical and result.verification is None
+    assert result.verify_sample == 0
+    out = io.StringIO()
+    render_human(result, out)
+    assert "independent sample check off (--verify-sample 0)" in out.getvalue()
+    assert to_dict(result)["verify_sample"] == 0
+
+    b2 = FakeDialect(
+        SyntheticTable(100, columns=COLS, changed={3: ("3.04", "status-3")}),
+        side="B",
+    )
+    planted = diff(a, b2, "t", "t", "id", verify_sample=0)
+    assert [d.key for d in planted.diffs] == [3] and not planted.identical
 
 
 def test_unknown_types_are_listed_as_unchecked():

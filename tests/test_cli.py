@@ -795,13 +795,62 @@ def test_a_failing_sample_check_owns_the_headline_and_the_exit_code():
     assert payload["verification"]["modulus"] == 1
 
 
-def test_a_sample_check_that_could_not_run_is_printed_not_hidden():
-    """No silent skip: an error reads as a warning line."""
+def test_a_sample_check_that_could_not_run_owns_the_headline_and_exit_code():
+    """No silent skip and no all-clear: the run asked for a second method and
+    did not get one, so it is not proven - in the headline, the JSON and the
+    exit code."""
+    from parity.cli import EXIT_DIFFERENCES, to_dict
     from parity.types import Verification
 
     v = Verification(1, 0, 0, 0, error="side B: permission denied")
-    lines = _human(_result(verification=v))
-    assert any("independent sample check could not run" in line for line in lines)
+    result = _result(verification=v)
+    lines = _human(result)
+    assert (
+        "not proven: the independent sample check could not run: "
+        "side B: permission denied" in lines[0]
+    )
+    assert not any(line.endswith("no differences in 10 rows") for line in lines)
+    assert any("risk: not computed" in line for line in lines)
+    assert not result.identical
+    payload = to_dict(result)
+    assert payload["identical"] is False
+    assert payload["verification"]["error"] == "side B: permission denied"
+    assert payload["risk"]["max_hidden_fraction"] is None
+    assert EXIT_DIFFERENCES == 1
+
+
+def test_a_sample_check_that_could_not_run_exits_1_end_to_end(tmp_path, monkeypatch):
+    """Through the real CLI: a sample fetch that fails turns identical tables
+    into exit 1, and `--verify-sample 0` keeps exit 0 and says the check was
+    off."""
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+
+    path = tmp_path / "t.duckdb"
+    con = duckdb_write(str(path))
+    con.execute(
+        "create table t as select i::bigint as id, i * 2 as v from range(50) r(i)"
+    )
+    con.close()
+
+    def broken(self, *args, **kwargs):
+        """Fail as a permission error on the sample query would."""
+        raise RuntimeError("permission denied for the sample query")
+
+    monkeypatch.setattr(DuckDBDialect, "fetch_sample", broken)
+    url = f"duckdb:///{path}"
+    base = ["diff", "--a", url, "--a-table", "t", "--b", url, "--b-table", "t"]
+    base += ["--key", "id"]
+    out = io.StringIO()
+    assert main(base, out=out) == 1
+    assert "not proven: the independent sample check could not run" in out.getvalue()
+    out = io.StringIO()
+    assert main([*base, "--json"], out=out) == 1
+    assert json.loads(out.getvalue())["identical"] is False
+    out = io.StringIO()
+    assert main([*base, "--verify-sample", "0"], out=out) == 0
+    text = out.getvalue()
+    assert "no differences in 50 rows" in text
+    assert "independent sample check off (--verify-sample 0)" in text
 
 
 def test_verify_sample_flag_reaches_the_engine(tmp_path):

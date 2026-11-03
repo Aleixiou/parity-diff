@@ -232,7 +232,10 @@ class Verification:
     #: Differences the walk reported that the raw values do not show - a false
     #: alarm in the walk or a limit of the reference; reported, not blocking.
     notes: list[str] = field(default_factory=list)
-    #: Why the check could not run, if it could not. Printed; not blocking.
+    #: Why the check could not run, if it could not. Blocking: the run asked
+    #: for a second method and did not get one, so the result is not proven
+    #: and never identical (switch the check off with ``verify_sample=0`` to
+    #: rest the verdict on the checksums alone, deliberately).
     error: str | None = None
 
     def max_hidden_fraction(self, confidence: float = RISK_CONFIDENCE) -> float | None:
@@ -288,18 +291,25 @@ class DiffResult:
     #: The independent sample check, or None when it was switched off
     #: (``verify_sample=0``) or the walk stopped early.
     verification: Verification | None = None
+    #: The sample size the run asked for (``verify_sample``); 0 means the
+    #: check was deliberately switched off, which the output says. None when
+    #: the result was not built by ``diff``.
+    verify_sample: int | None = None
 
     @property
     def identical(self) -> bool:
         """Proven to match: no differences, the whole key space walked, every
         column on both sides compared, every checksum mismatch explained, and
-        no row of the independent sample contradicting the walk."""
+        the independent sample check - when it ran - neither contradicting the
+        walk nor failing to run. A check that was asked for and could not run
+        leaves the result unproven, not identical."""
         return (
             not self.diffs
             and not self.truncated
             and not self.schema_differences
             and not self.unexplained
             and not (self.verification and self.verification.failures)
+            and not (self.verification and self.verification.error)
         )
 
     def by_kind(self, kind: str) -> list[RowDiff]:
