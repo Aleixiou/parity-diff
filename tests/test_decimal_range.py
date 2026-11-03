@@ -20,7 +20,14 @@ from __future__ import annotations
 from decimal import ROUND_HALF_UP, Context, Decimal
 
 import pytest
-from conftest import PG_SCHEMA, duckdb_write, open_duckdb, open_mysql, open_pg
+from conftest import (
+    PG_SCHEMA,
+    duckdb_write,
+    mysql_rw_cursor,
+    open_duckdb,
+    open_mysql,
+    open_pg,
+)
 
 from parity.dialects.mysql_dialect import MySQLDialect
 from parity.engine import diff
@@ -46,7 +53,7 @@ def _expected(value: str, scale: int) -> str:
 def _mysql_table(mysql_url: str, name: str, ddl_type: str, rows: dict[int, str]) -> None:
     """(Re)create a MySQL table `name(id, v ddl_type)` holding `rows`, committed."""
     d = open_mysql(mysql_url, side="A")
-    cur = d._conn.cursor()
+    cur = mysql_rw_cursor(d)
     try:
         cur.execute(f"drop table if exists {name}")
         cur.execute(f"create table {name} (id int primary key, v {ddl_type})")

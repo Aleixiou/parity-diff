@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import pytest
-from conftest import BIGQUERY_URL, MSSQL_URL, MYSQL_URL, PG_URL
+from conftest import BIGQUERY_URL, MSSQL_URL, MYSQL_URL, PG_URL, mysql_rw_cursor
 
 from parity.dialects.base import Dialect, get_dialect
 
@@ -131,6 +131,8 @@ class MySQLEngine(Engine):
             self.d = get_dialect(MYSQL_URL, side="W")
         except Exception as exc:
             pytest.skip(f"no MySQL: {type(exc).__name__}")
+        # The dialect's session is READ ONLY; this one only builds fixtures.
+        mysql_rw_cursor(self.d).close()
         self.tables: list[str] = []
 
     def _run(self, sql, params=None):

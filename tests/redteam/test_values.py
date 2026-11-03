@@ -446,11 +446,6 @@ def test_rt_a7_duckdb_nanoseconds_vanish_silently(engines, other):
         ("bit(8)", "b'10000000'", "b'11111111'"),
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A8: MySQL cast(binary as char) yields NULL for non-UTF-8 bytes, "
-    "so every such value equals every other and NULL",
-)
 def test_rt_a8_mysql_binary_not_utf8_is_null(engines, typ, va, vb):
     """The 'unmapped types' warning says raw-text comparison "may differ across
     engines" - it does not say two *different* values on the *same* engine will
@@ -1015,12 +1010,6 @@ def test_rt_a16_mssql_sql_variant_type_is_lost(engines, va, vb):
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A17: MySQL concat_ws() returns NULL (warning 1301) once the row "
-    "text passes max_allowed_packet, so md5 is NULL, sum() skips the row and two "
-    "different wide rows checksum equal - a false match",
-)
 def test_rt_a17_mysql_row_over_max_allowed_packet_is_invisible(engines):
     """Each value (34 MB) is well under MySQL 8's 64 MiB default packet; only
     the joined row is over it. The count still matches, so the bucket reads
@@ -1155,12 +1144,6 @@ def test_rt_a19_duckdb_hugeint_key_span_overflows(engines):
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A20: MySQL TIMESTAMP is stored as UTC and converted per session "
-    "(an instant), but is not marked tz_aware, so MySQL TIMESTAMP vs PostgreSQL "
-    "timestamptz gets a spurious 'timezone-aware on one side only' warning",
-)
 def test_rt_a20_mysql_timestamp_is_not_flagged_naive(engines):
     """Cosmetic: the comparison itself is right (the session is pinned to UTC),
     but the warning points a reader at a schema problem that is not there -

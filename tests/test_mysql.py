@@ -19,7 +19,7 @@ Skips cleanly when no MySQL is reachable.
 from __future__ import annotations
 
 import pytest
-from conftest import duckdb_write, open_duckdb, open_mysql
+from conftest import duckdb_write, mysql_rw_cursor, open_duckdb, open_mysql
 
 from parity.engine import diff
 
@@ -93,7 +93,7 @@ def _build_mysql(mysql_url: str, plant: str | None) -> str:
     read-only dialect opened later must see committed data.
     """
     dialect = open_mysql(mysql_url, side="A")
-    cur = dialect._conn.cursor()
+    cur = mysql_rw_cursor(dialect)
     # The row generator recurses N times; MySQL caps that at 1001 by default.
     cur.execute("set session cte_max_recursion_depth = 1000000")
     cur.execute("drop table if exists orders")
@@ -206,7 +206,7 @@ def test_a_boolean_against_a_tinyint_is_flagged_not_hidden(mysql_url, tmp_path):
     con.close()
 
     a = open_mysql(mysql_url, side="A")
-    cur = a._conn.cursor()
+    cur = mysql_rw_cursor(a)
     cur.execute("drop table if exists flags")
     cur.execute("create table flags (id bigint primary key, flag tinyint(1))")
     cur.execute(
@@ -224,3 +224,22 @@ def test_a_boolean_against_a_tinyint_is_flagged_not_hidden(mysql_url, tmp_path):
     finally:
         a.close()
         b.close()
+
+
+def test_ssl_mode_required_is_enforced_or_refused(mysql_url):
+    """RT-F18: `?ssl_mode=REQUIRED` either yields an encrypted session or
+    refuses - it used to be dropped silently. An unknown option is refused."""
+    sep = "&" if "?" in mysql_url else "?"
+    try:
+        a = open_mysql(f"{mysql_url}{sep}ssl_mode=REQUIRED", side="A")
+    except ValueError as exc:
+        assert "not encrypted" in str(exc) or "SSL" in str(exc), exc
+    else:
+        try:
+            ((_, cipher),) = a.query("show session status like 'Ssl_cipher'")
+            assert cipher
+            assert a.query("select @@session.transaction_read_only") == [(1,)]
+        finally:
+            a.close()
+    with pytest.raises(ValueError, match=r"side A.*'sslmode' is not supported"):
+        open_mysql(f"{mysql_url}{sep}sslmode=require", side="A")
