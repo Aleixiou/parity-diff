@@ -700,7 +700,7 @@ def test_normalize_is_null_safe_for_every_logical_type():
         for lt in LogicalType:
             expr = dialect.normalize(Column("c", lt, ""))
             assert expr.startswith("coalesce("), f"{dialect.name}/{lt}: {expr}"
-            assert "'\\N'" in expr, f"{dialect.name}/{lt}: {expr}"
+            assert dialect.null_sentinel_sql() in expr, f"{dialect.name}/{lt}: {expr}"
 
 
 def test_row_text_uses_the_unit_separator():

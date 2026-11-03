@@ -411,15 +411,38 @@ class BigQueryDialect(Dialect):
                 # session timezone to pin (CLAUDE.md section 4.8).
                 expr = f"format_timestamp('%E4Y-%m-%d %H:%M:%E6S', {c}, 'UTC')"
         elif t is LogicalType.STRING:
-            expr = f"cast({c} as string)"
+            expr = self.escape_text(f"cast({c} as string)")
         else:
             # Anything else (TIME, BYTES, JSON, ARRAY, STRUCT, ...) through
             # FORMAT('%t'), which renders every type - CAST to STRING raises on
             # ARRAY/STRUCT and would kill the diff. But '%t' renders NULL as the
             # *string* 'NULL', which would slip past the coalesce and compare
             # equal to a real 'NULL' on the other side; hence the explicit guard.
-            expr = f"if({c} is null, null, format('%t', {c}))"
+            # Arbitrary text (strings inside arrays and structs, JSON), so
+            # escaped like STRING.
+            expr = self.escape_text(f"if({c} is null, null, format('%t', {c}))")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def concat_sql(self, left: str, right: str) -> str:
+        """`concat()`, the spelling the sentinel has always used here."""
+        return f"concat({left}, {right})"
+
+    def escape_text(self, expr: str) -> str:
+        """Escape with the collation stripped first.
+
+        REPLACE honours a column's collation, and under `und:ci` chr(31) is
+        ignorable: verified live, `replace(collate(x, 'und:ci'), chr(31), ..)`
+        left the chr(31) in place while the backslash was doubled - the
+        separator collision again, on exactly the columns a migration marks
+        case-insensitive. `collate(x, '')` removes the collation and changes
+        no character.
+        """
+        return super().escape_text(f"collate({expr}, '')")
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """NUMERIC/BIGNUMERIC's string cast is already the minimal exact text:
+        plain notation, no trailing zeros, whatever the declared scale."""
+        return f"cast({c} as string)"
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.

@@ -217,8 +217,29 @@ class PostgresDialect(Dialect):
         elif t is LogicalType.TIMESTAMP:
             expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.US')"
         else:
-            expr = f"({c})::text"
+            # STRING, and every unmapped type (json, arrays, intervals, ...)
+            # through its text output: arbitrary text, so escaped.
+            expr = self.escape_text(f"({c})::text")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def escape_text(self, expr: str) -> str:
+        """Escape under the C collation, whatever the column's own.
+
+        `replace()` raises "nondeterministic collations are not supported for
+        substring searches" on a column with a case-insensitive ICU collation;
+        under "C" it compares code points and the bytes are unchanged.
+        """
+        return super().escape_text(f'(({expr}) collate "C")')
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """numeric's own text is exact and plain (never exponent notation);
+        drop the trailing fractional zeros its scale adds."""
+        t = f"({c})::text"
+        return (
+            f"case when ({c}) = 0 then '0' "
+            f"when strpos({t}, '.') > 0 then rtrim(rtrim({t}, '0'), '.') "
+            f"else {t} end"
+        )
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.

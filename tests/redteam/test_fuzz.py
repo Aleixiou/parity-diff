@@ -126,13 +126,20 @@ def test_live_diff_agrees_with_the_brute_force_oracle(engines, a, b):
         )
 
 
-def test_the_harness_catches_a_planted_false_match():
+def test_the_harness_catches_a_planted_false_match(monkeypatch):
     """The oracle is independent: with a known trigger enabled it must fail.
 
     Guards the fuzzer itself. If this ever passes cleanly, the oracle has
     started agreeing with the tool rather than with the data. DuckDB on both
     sides, so it runs with no server at all.
+
+    The trigger, RT-E1, is fixed - text is escaped, so `\\N` is no longer
+    NULL - so the fix is switched off here: with `escape_text` an identity,
+    the tool has the old bug again and the oracle must catch it.
     """
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+
+    monkeypatch.setattr(DuckDBDialect, "escape_text", lambda self, expr: expr)
     pair = {"duckdb": fh.Duck(), "duckdb2": fh.Duck()}
     verdicts = []
     for i in range(60):
@@ -179,11 +186,6 @@ def _found(result) -> list[tuple]:
     return [(d.key, d.kind, d.columns) for d in result.diffs]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E1: text exactly '\\N' is indistinguishable from NULL - "
-    "fuzz seed 100000 (--known sentinel_text) shrank to one row, NULL vs '\\N'",
-)
 def test_rt_e1_the_text_backslash_n_is_not_null(tmp_path):
     """RT-E1: NULL and the two characters backslash-N must differ."""
     a = _duck(tmp_path, "a", "id int, note varchar", "(1, NULL)", side="A")
@@ -191,24 +193,15 @@ def test_rt_e1_the_text_backslash_n_is_not_null(tmp_path):
     assert _found(_run(a, b)) == [(1, "different", ["note"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E1 (key): composite keys (1, NULL) and (1, '\\N') are taken for "
-    "one row, and a NULL key part is never refused as a NULL key is",
-)
 def test_rt_e1_a_null_key_part_is_not_the_text_backslash_n(tmp_path):
     """RT-E1 in a key: (1, NULL) and (1, backslash-N) are two different rows."""
     a = _duck(tmp_path, "a", "id int, k2 varchar, v int", "(1, NULL, 7)", side="A")
     b = _duck(tmp_path, "b", "id int, k2 varchar, v int", "(1, '\\N', 7)")
-    result = _run(a, b, key=["id", "k2"])
-    assert sorted(d.kind for d in result.diffs) == ["only_in_a", "only_in_b"]
+    # Fixed by refusing the NULL key part (RT-B2): it can match nothing.
+    with pytest.raises(ValueError, match="NULL"):
+        _run(a, b, key=["id", "k2"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E2: chr(31) inside text moves a field boundary undetected - "
-    "('p' || chr(31), 'q') and ('p', chr(31) || 'q') hash identically",
-)
 def test_rt_e2_the_field_separator_inside_text_is_not_a_boundary(tmp_path):
     """RT-E2: moving chr(31) across a column boundary must be seen."""
     ddl = "id int, c1 varchar, c2 varchar"
@@ -217,12 +210,6 @@ def test_rt_e2_the_field_separator_inside_text_is_not_a_boundary(tmp_path):
     assert _found(_run(a, b)) == [(1, "different", ["c1", "c2"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E6: a DECIMAL(10,0) key against a BIGINT key holding the same "
-    "integers matches no row - every row is only_in_a and only_in_b ('1.000000' "
-    "vs '1') - and no warning says the key types differ",
-)
 def test_rt_e6_an_integral_decimal_key_matches_an_integer_key(tmp_path):
     """RT-E6: DECIMAL(10,0) and BIGINT keys holding the same integers match,
     or a warning says the key types differ."""

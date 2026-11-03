@@ -106,11 +106,6 @@ SAME_ENGINE = ["duckdb", "postgres", "mysql", "mssql"]
     ("ea", "eb"),
     [(e, e) for e in SAME_ENGINE] + [("postgres", "mssql"), ("mysql", "duckdb")],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A1: chr(31) inside a string is not escaped, so ('a\\x1fb','c') "
-    "and ('a','b\\x1fc') render the same row text - a false match",
-)
 def test_rt_a1_separator_inside_a_value_is_a_false_match(engines, ea, eb):
     r"""Row text is `concat_ws(chr(31), ...)` with no escaping, so moving a
     chr(31) from one column to the next leaves the joined bytes - and the hash
@@ -128,7 +123,6 @@ def test_rt_a1_separator_inside_a_value_is_a_false_match(engines, ea, eb):
 
 
 @pytest.mark.bigquery
-@pytest.mark.xfail(strict=True, reason="RT-A1: separator collision, BigQuery <-> DuckDB")
 def test_rt_a1_separator_collision_on_bigquery(engines):
     r = run_pair(
         engines,
@@ -153,11 +147,6 @@ def test_rt_a1_separator_collision_on_bigquery(engines):
     ("ea", "eb"),
     [(e, e) for e in SAME_ENGINE] + [("mysql", "mssql"), ("duckdb", "mssql")],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A2: the two-character string '\\N' renders exactly like SQL NULL "
-    "- a NULL-to-'\\N' change is a false match",
-)
 def test_rt_a2_backslash_n_string_equals_null(engines, ea, eb):
     r"""NULL renders as the literal `\N` and string data is not escaped, so a
     real two-character value `\N` (a common NULL spelling in MySQL dumps and
@@ -176,7 +165,6 @@ def test_rt_a2_backslash_n_string_equals_null(engines, ea, eb):
 
 
 @pytest.mark.bigquery
-@pytest.mark.xfail(strict=True, reason="RT-A2: '\\N' string vs NULL, BigQuery <-> DuckDB")
 def test_rt_a2_backslash_n_string_on_bigquery(engines):
     r = run_pair(
         engines,
@@ -193,35 +181,26 @@ def test_rt_a2_backslash_n_string_on_bigquery(engines):
 
 
 @pytest.mark.parametrize(("ea", "eb"), [("postgres", "duckdb"), ("mysql", "mssql")])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A3: a NULL in a hashed (text) key passes the NULL-key check and "
-    "matches a real '\\N' key on the other side",
-)
 def test_rt_a3_null_text_key_matches_backslash_n_key(engines, ea, eb):
     r"""For a hashed key the identity is coalesced text, so `count(identity)`
     never sees a NULL and the NULL-key refusal never fires. A row keyed NULL
     is then matched to a row keyed `'\N'` - two different rows reported as one.
 
-    Values: A = (k='\N', x=1), B = (k=NULL, x=1).
+    Values: A = (k='\N', x=1), B = (k=NULL, x=1). Fixed by refusing the NULL
+    key on side B (RT-B2), so it can never be matched to anything.
     """
-    r = run_pair(
-        engines,
-        f"a3_{ea}_{eb}",
-        (ea, f"k {TEXT[ea]}, x int", [(SENTINEL, 1)]),
-        (eb, f"k {TEXT[eb]}, x int", [(None, 1)]),
-        key="k",
-    )
-    assert not r.identical
+    with pytest.raises(ValueError, match=r"\[side B\].*1 NULL"):
+        run_pair(
+            engines,
+            f"a3_{ea}_{eb}",
+            (ea, f"k {TEXT[ea]}, x int", [(SENTINEL, 1)]),
+            (eb, f"k {TEXT[eb]}, x int", [(None, 1)]),
+            key="k",
+        )
 
 
 @pytest.mark.parametrize(
     ("ea", "eb"), [("postgres", "mysql"), ("duckdb", "mssql"), ("duckdb", "duckdb")]
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A4: composite key ('a\\x1fb','c') and ('a','b\\x1fc') have the same "
-    "identity text, so two different keys are matched as one row",
 )
 def test_rt_a4_composite_key_separator_collision(engines, ea, eb):
     r"""The engine's own warning promises "a hash collision cannot merge two
@@ -239,11 +218,6 @@ def test_rt_a4_composite_key_separator_collision(engines, ea, eb):
     assert len(r.diffs) == 2  # one only_in_a, one only_in_b
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A4: the same collision inside one table refuses a unique "
-    "composite key as 'not unique'",
-)
 def test_rt_a4_composite_key_collision_refused_as_duplicate(engines):
     rows = [(f"a{SEP}b", "c", 1), ("a", f"b{SEP}c", 2)]
     ddl = "k1 varchar, k2 varchar, x int"
@@ -257,19 +231,16 @@ def test_rt_a4_composite_key_collision_refused_as_duplicate(engines):
     assert len(r.diffs) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A3: composite key with a NULL component matches the literal '\\N'",
-)
 def test_rt_a3_composite_key_null_component(engines):
-    r = run_pair(
-        engines,
-        "a3_comp",
-        ("duckdb", "k1 varchar, k2 varchar, x int", [("a", None, 1)]),
-        ("postgres", "k1 varchar(9), k2 varchar(9), x int", [("a", SENTINEL, 1)]),
-        key=["k1", "k2"],
-    )
-    assert not r.identical
+    """A NULL key component is refused (RT-B2), not matched to a real `\\N`."""
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        run_pair(
+            engines,
+            "a3_comp",
+            ("duckdb", "k1 varchar, k2 varchar, x int", [("a", None, 1)]),
+            ("postgres", "k1 varchar(9), k2 varchar(9), x int", [("a", SENTINEL, 1)]),
+            key=["k1", "k2"],
+        )
 
 
 # =====================================================================
@@ -436,20 +407,25 @@ def test_rt_a7_duckdb_nanoseconds_vanish_silently(engines, other):
 # =====================================================================
 
 
-@pytest.mark.parametrize(
-    ("typ", "va", "vb"),
-    [
-        ("varbinary(8)", "0xff", "0xfe"),
-        ("varbinary(8)", "0xff", "null"),
-        ("blob", "0x8081", "0x5c4e"),  # 0x5c4e is the bytes of '\N'
-        ("binary(2)", "0xc0c1", "0xf5f6"),
-        ("bit(8)", "b'10000000'", "b'11111111'"),
-    ],
-)
-@pytest.mark.xfail(
+_RT_A8 = pytest.mark.xfail(
     strict=True,
     reason="RT-A8: MySQL cast(binary as char) yields NULL for non-UTF-8 bytes, "
     "so every such value equals every other and NULL",
+)
+
+
+@pytest.mark.parametrize(
+    ("typ", "va", "vb"),
+    [
+        pytest.param("varbinary(8)", "0xff", "0xfe", marks=_RT_A8),
+        pytest.param("varbinary(8)", "0xff", "null", marks=_RT_A8),
+        # 0x5c4e is the bytes of '\N'. The invalid 0x8081 still renders as the
+        # NULL sentinel (RT-A8 stands), but text is now escaped, so the real
+        # bytes `\N` render `\\N` and this pair is told apart (RT-A2's fix).
+        ("blob", "0x8081", "0x5c4e"),
+        pytest.param("binary(2)", "0xc0c1", "0xf5f6", marks=_RT_A8),
+        pytest.param("bit(8)", "b'10000000'", "b'11111111'", marks=_RT_A8),
+    ],
 )
 def test_rt_a8_mysql_binary_not_utf8_is_null(engines, typ, va, vb):
     """The 'unmapped types' warning says raw-text comparison "may differ across
@@ -627,11 +603,6 @@ def test_rt_a13_mysql_collation_refuses_unique_text_key(engines, pair):
         (("mysql", "id int, x int"), ("mssql", "id float, x int")),
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A14: int key vs numeric(10,0)/float key: '1' vs '1.000000', every "
-    "row reported only_in_a + only_in_b with no key-type warning",
-)
 def test_rt_a14_integer_key_vs_decimal_key(engines, a, b):
     """Oracle NUMBER, `numeric(10,0)` and float ids are ordinary migration
     outcomes. Non-key columns of mismatched type get an explicit warning; the
@@ -641,12 +612,21 @@ def test_rt_a14_integer_key_vs_decimal_key(engines, a, b):
     Values: A = id int {1, 2}, B = id decimal(10,0) / float {1, 2}, x equal
     except row 2.
     """
+    if "float" in b[1]:
+        # Fixed by refusing: a FLOAT key cannot be matched exactly.
+        with pytest.raises(ValueError, match="cannot be used as a key"):
+            run_pair(
+                engines, f"a14_{a[0]}", (*a, [(1, 1), (2, 2)]), (*b, [(1, 1), (2, 3)])
+            )
+        return
+    # Fixed by exact decimal keys: decimal(10,0) 1 renders `1`, as int 1 does.
     r = run_pair(
         engines,
         f"a14_{a[0]}",
         (*a, [(1, 1), (2, 2)]),
         (*b, [(1, 1), (2, 3)]),
     )
+    assert [(d.key, d.kind) for d in r.diffs] == [("2", "different")]
     sane = len(r.diffs) == 1 or any(
         "key" in w and ("differ" in w or "type" in w) and "hash" not in w
         for w in r.warnings
@@ -659,11 +639,6 @@ def test_rt_a14_integer_key_vs_decimal_key(engines, a, b):
 # =====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A15: the CLI renders the value '\\N' as NULL, so a '\\N' -> '' "
-    "change is reported as NULL -> ''",
-)
 def test_rt_a15_cli_prints_backslash_n_as_null(engines):
     r = run_pair(
         engines,
@@ -1080,12 +1055,6 @@ def test_rt_a17_mysql_row_over_max_allowed_packet_is_invisible(engines):
     ],
     ids=["decimal8", "double", "timestamp_ns"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A18: a hashed key is matched by its canonical text, which rounds "
-    "DECIMAL/FLOAT to 6 places and timestamps to microseconds, so two different "
-    "keys are matched as one row and the pair reads identical",
-)
 def test_rt_a18_rounded_key_identity_merges_distinct_keys(engines, a, b, request):
     """'Comparing floats and decimals at 6 decimal places' is printed, but it
     reads as a statement about *values*. Applied to the key it silently
@@ -1093,15 +1062,15 @@ def test_rt_a18_rounded_key_identity_merges_distinct_keys(engines, a, b, request
     TIMESTAMP_NS nothing at all is printed (compare RT-A7).
     """
     name = request.node.callspec.id
+    if name == "double":
+        # Fixed by refusing: no rendering of a double is exact everywhere.
+        with pytest.raises(ValueError, match="cannot be used as a key"):
+            run_pair(engines, f"a18_{name}", a, b, key="k")
+        return
     r = run_pair(engines, f"a18_{name}", a, b, key="k")
-    assert not r.identical
+    assert sorted(d.kind for d in r.diffs) == ["only_in_a", "only_in_b"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-A18: two distinct decimal(18,8) keys round to one identity, so a "
-    "unique key is refused as 'not unique'",
-)
 def test_rt_a18_unique_decimal_key_refused_as_duplicate(engines):
     """Loud, not silent - but the message tells the user something false about
     their own table. Values: keys 1.00000001 and 1.00000002, x differs on row 2.

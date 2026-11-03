@@ -158,6 +158,15 @@ def test_row_text_is_one_flat_array_join_however_wide():
     assert d.row_text([]) == "''"
 
 
+def _bq_escaped(expr: str) -> str:
+    """`expr` through BigQuery's text escape: collation stripped, backslash
+    doubled, chr(31) as backslash-s."""
+    return (
+        f"replace(replace(collate({expr}, ''), chr(92), concat(chr(92), chr(92))), "
+        "chr(31), concat(chr(92), 's'))"
+    )
+
+
 def test_normalize_renders_each_logical_type():
     """Every branch of the canonical-text encoding, null-safe."""
     d = _d()
@@ -182,8 +191,12 @@ def test_normalize_renders_each_logical_type():
             _col("c", LogicalType.TIMESTAMP),
             "format_timestamp('%E4Y-%m-%d %H:%M:%E6S', `c`, 'UTC')",
         ),
-        (_col("c", LogicalType.STRING), "cast(`c` as string)"),
-        (_col("c", LogicalType.UNKNOWN), "if(`c` is null, null, format('%t', `c`))"),
+        # Arbitrary text is escaped, collation stripped first.
+        (_col("c", LogicalType.STRING), _bq_escaped("cast(`c` as string)")),
+        (
+            _col("c", LogicalType.UNKNOWN),
+            _bq_escaped("if(`c` is null, null, format('%t', `c`))"),
+        ),
     ]
     for column, inner in cases:
         assert d.normalize(column) == f"coalesce({inner}, {SENTINEL})", column

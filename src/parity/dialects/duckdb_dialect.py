@@ -186,8 +186,42 @@ class DuckDBDialect(Dialect):
         elif t is LogicalType.TIMESTAMP:
             expr = f"strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"
         else:
-            expr = f"cast({c} as varchar)"
+            # STRING, and every unmapped type (lists, structs, json, blobs,
+            # intervals, ...) through its varchar cast: arbitrary text, so
+            # escaped.
+            expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def normalize_key(self, column: Column) -> str:
+        """Exact key text; a TIMESTAMP_NS key keeps its nanoseconds.
+
+        As a value TIMESTAMP_NS renders at microseconds like every other
+        timestamp, and as a key that merged distinct keys (RT-B6). A key with
+        a sub-microsecond part renders all nine digits instead; one without
+        renders exactly as before, so it still matches a microsecond key on
+        another engine. Six digits against nine, so no two keys collide.
+        """
+        if (
+            column.logical_type is LogicalType.TIMESTAMP
+            and column.raw_type.lower().startswith("timestamp_ns")
+        ):
+            c = self.quote(column.name)
+            return (
+                f"case when {c} is null or epoch_ns({c}) % 1000 = 0 "
+                f"then {self.normalize(column)} "
+                f"else strftime({c}, '%Y-%m-%d %H:%M:%S.%n') end"
+            )
+        return super().normalize_key(column)
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """DECIMAL's varchar cast is exact and plain, at the declared scale;
+        drop the trailing fractional zeros that scale adds."""
+        t = f"cast({c} as varchar)"
+        return (
+            f"case when {c} = 0 then '0' "
+            f"when contains({t}, '.') then rtrim(rtrim({t}, '0'), '.') "
+            f"else {t} end"
+        )
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.

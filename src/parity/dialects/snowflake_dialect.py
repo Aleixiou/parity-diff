@@ -185,8 +185,37 @@ class SnowflakeDialect(Dialect):
             # FF6 is microseconds, matching the other engines' six digits.
             expr = f"to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
         else:
-            expr = f"cast({c} as varchar)"
+            # STRING, and every unmapped type through its varchar cast:
+            # arbitrary text, so escaped. Not verified live (no account).
+            expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def decimal_key_text(self, c: str, column: Column) -> str:
+        """NUMBER's varchar cast is exact at the declared scale; drop the
+        trailing fractional zeros it adds. Not verified live (no account)."""
+        t = f"cast({c} as varchar)"
+        return (
+            f"case when {c} = 0 then '0' "
+            f"when contains({t}, '.') then rtrim(rtrim({t}, '0'), '.') "
+            f"else {t} end"
+        )
+
+    def normalize_key(self, column: Column) -> str:
+        """Exact key text; a TIMESTAMP key keeps any sub-microsecond digits.
+
+        Snowflake timestamps hold nanoseconds and render at FF6, which as a
+        key merges distinct keys. One with a sub-microsecond part renders FF9
+        instead (the nine digits DuckDB prints for a TIMESTAMP_NS); any other
+        renders exactly as before. Not verified live (no account).
+        """
+        if column.logical_type is LogicalType.TIMESTAMP:
+            c = self.quote(column.name)
+            return (
+                f"case when {c} is null or date_part(nanosecond, {c}) % 1000 = 0 "
+                f"then {self.normalize(column)} "
+                f"else to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF9') end"
+            )
+        return super().normalize_key(column)
 
     def hash_expr(self, text_expr: str) -> str:
         """Fold canonical text into a positive 60-bit integer.

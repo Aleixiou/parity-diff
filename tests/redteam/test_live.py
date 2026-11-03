@@ -129,11 +129,6 @@ def pgw(pg_url):
     conn.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D1: standard_conforming_strings=off turns the '\\N' sentinel into "
-    "'N', so a PostgreSQL NULL matches the string 'N' (false match)",
-)
 def test_pg_standard_conforming_strings_off_makes_null_equal_the_letter_n(
     pg_url, pgw, tmp_path
 ):
@@ -1141,11 +1136,6 @@ def test_mysql_case_sensitive_text_key_is_not_called_duplicate(mysql_url, myw):
     assert found(result) == [("b", "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D11: count(distinct) of a text key follows a nondeterministic "
-    "PostgreSQL collation, so 'a'/'A' are refused as a duplicate key",
-)
 def test_pg_nondeterministic_collation_text_key_is_not_called_duplicate(pgw, pg_url):
     """A case-insensitive ICU collation (deterministic = false) - the standard
     PostgreSQL answer to case-insensitive email/user-name columns. The values

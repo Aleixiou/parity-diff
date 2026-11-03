@@ -94,36 +94,32 @@ def _duck_diff(tmp_path, ddl, rows_a, rows_b, key, ddl_b=None, **kw):
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1: NULL text key and literal '\\N' key are the same identity -> false match",
-)
 def test_rt_b1_null_text_key_is_not_the_string_backslash_n(tmp_path):
     rows_a = [(None, 1), ("x", 2)]
     rows_b = [("\\N", 1), ("x", 2)]  # the NULL became the dump marker
-    result = _duck_diff(tmp_path, "k varchar, v int", rows_a, rows_b, "k")
-    assert not result.identical, "NULL key vs the text '\\N' reported identical"
+    # Fixed by refusing: a NULL in a hashed key is refused like a NULL integer
+    # key (RT-B2), so it can no longer be matched to a real `\N` key.
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _duck_diff(tmp_path, "k varchar, v int", rows_a, rows_b, "k")
+    # And the text key `\N` itself is an ordinary key, distinct from all else.
+    again = tmp_path / "again"
+    again.mkdir()
+    result = _duck_diff(again, "k varchar, v int", rows_b, rows_b[1:], "k")
+    assert [(d.key, d.kind) for d in result.diffs] == [("\\\\N", "only_in_a")]
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1: NULL composite-key part equals literal '\\N' part -> false match",
-)
 def test_rt_b1_null_composite_key_part_is_not_backslash_n(tmp_path):
     rows_a = [(None, "x", 1), ("a", "y", 2)]
     rows_b = [("\\N", "x", 1), ("a", "y", 2)]
-    result = _duck_diff(
-        tmp_path, "k1 varchar, k2 varchar, v int", rows_a, rows_b, ["k1", "k2"]
-    )
-    assert not result.identical
+    # Fixed by refusing the NULL key part (RT-B2).
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _duck_diff(
+            tmp_path, "k1 varchar, k2 varchar, v int", rows_a, rows_b, ["k1", "k2"]
+        )
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B2: a NULL in a hashed (text/composite/bool) key is not refused",
-)
 @pytest.mark.parametrize(
     ("ddl", "row", "key"),
     [
@@ -162,10 +158,6 @@ def test_control_null_integer_key_is_refused(tmp_path):
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B3: composite keys ('a\\x1fb','c') and ('a','b\\x1fc') share one identity",
-)
 def test_rt_b3_composite_keys_split_differently_are_different_rows(tmp_path):
     rows_a = [("a\x1fb", "c", 1)]
     rows_b = [("a", "b\x1fc", 1)]
@@ -192,10 +184,6 @@ def _same_bucket_probe() -> str:
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B3: a 0x1f in a single text key slides into the content -> false match",
-)
 def test_rt_b3_single_text_key_with_separator_is_not_confused_with_content(tmp_path):
     """Side A has key `s\\x1fz` with v=`w`; side B has key `s` with v=`z\\x1fw`.
     Different keys, different values - but the hashed row text is
@@ -352,10 +340,6 @@ def test_rt_b4_control_one_of_the_eight_changes_alone_is_found(tmp_path):
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B5: DECIMAL key rounded to 6dp - keys 0.1234567 and 0.1234568 match",
-)
 def test_rt_b5_decimal_keys_differing_past_the_scale_are_different_rows(tmp_path):
     result = _duck_diff(
         tmp_path,
@@ -370,24 +354,13 @@ def test_rt_b5_decimal_keys_differing_past_the_scale_are_different_rows(tmp_path
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B5: DOUBLE key rounded to 6dp - distinct float keys match",
-)
 def test_rt_b5_double_keys_differing_past_the_scale_are_different_rows(tmp_path):
-    result = _duck_diff(
-        tmp_path, "k double, v int", [(1.0000001, 1)], [(1.0000004, 1)], "k"
-    )
-    assert not result.identical or any(
-        "key" in w and "scale" in w for w in result.warnings
-    )
+    # Fixed by refusing: no rendering of a double is exact on every engine.
+    with pytest.raises(ValueError, match="FLOAT column 'k' cannot be used as a key"):
+        _duck_diff(tmp_path, "k double, v int", [(1.0000001, 1)], [(1.0000004, 1)], "k")
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B6: TIMESTAMP_NS key truncated to microseconds - distinct keys match",
-)
 def test_rt_b6_nanosecond_timestamp_keys_are_different_rows(tmp_path):
     for side, ns in (("a", 1), ("b", 2)):
         con = duckdb_write(str(tmp_path / f"{side}.duckdb"))
@@ -492,10 +465,6 @@ def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B8: int key vs decimal(18,0) key - every row only_in_a/only_in_b, no warning",
-)
 def test_rt_b8_key_whose_type_differs_between_sides_is_named(tmp_path):
     """A bigint key migrated to `decimal(18,0)` (Oracle NUMBER, Snowflake NUMBER
     with a scale, a CSV round-trip). Both sides hash, rendering `42` against
@@ -843,23 +812,16 @@ def _live_diff(url_a, t_a, url_b, t_b, key, **kw):
 
 @pytest.mark.postgres
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1: PostgreSQL NULL text key == DuckDB '\\N' key -> false match",
-)
 def test_rt_b1_live_postgres_null_key_vs_duckdb_backslash_n(pg_rt, tmp_path):
     t = _pg_table(pg_rt, "rt_key_nullk", "k text, v int", [(None, 1), ("x", 2)])
     p = _duck(tmp_path, "b", "k varchar, v int", [("\\N", 1), ("x", 2)])
-    result = _live_diff(PG_URL, t, f"duckdb:///{p}", "main.t", "k")
-    assert not result.identical
+    # Fixed by refusing the NULL key (RT-B2).
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _live_diff(PG_URL, t, f"duckdb:///{p}", "main.t", "k")
 
 
 @pytest.mark.postgres
 @pytest.mark.mysql
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1: MySQL NULL composite part == PostgreSQL '\\N' -> false match",
-)
 def test_rt_b1_live_mysql_null_part_vs_postgres_backslash_n(pg_rt, mysql_rt):
     tm = _mysql_table(
         mysql_rt,
@@ -870,22 +832,19 @@ def test_rt_b1_live_mysql_null_part_vs_postgres_backslash_n(pg_rt, mysql_rt):
     tp = _pg_table(
         pg_rt, "rt_key_nullc", "k1 text, k2 text, v int", [("\\N", "x", 1), ("a", "y", 2)]
     )
-    result = _live_diff(MYSQL_URL, tm, PG_URL, tp, ["k1", "k2"])
-    assert not result.identical
+    # Fixed by refusing the NULL key part (RT-B2).
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _live_diff(MYSQL_URL, tm, PG_URL, tp, ["k1", "k2"])
 
 
 @pytest.mark.mssql
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1/B3: SQL Server NULL key and 0x1f composite keys false-match",
-)
 def test_rt_b1_b3_live_mssql_against_postgres(pg_rt, mssql_rt):
     ms = _mssql_table(
         mssql_rt,
         "rt_key_mix",
         "k1 nvarchar(20), k2 nvarchar(20), v int",
-        [(None, "x", 1), ("a\x1fb", "c", 2), ("q", "r", 3)],
+        [("a\x1fb", "c", 2), ("q", "r", 3)],
     )
     tp = _pg_table(
         pg_rt,
@@ -893,8 +852,18 @@ def test_rt_b1_b3_live_mssql_against_postgres(pg_rt, mssql_rt):
         "k1 text, k2 text, v int",
         [("\\N", "x", 1), ("a", "b\x1fc", 2), ("q", "r", 3)],
     )
+    # The two 0x1f keys are two rows; the `\N` key is PostgreSQL's alone.
     result = _live_diff(MSSQL_URL, ms, PG_URL, tp, ["k1", "k2"])
-    assert len(result.diffs) == 4, _found(result)
+    assert len(result.diffs) == 3, _found(result)
+    # A NULL key part is refused, never matched to the text `\N` (RT-B1/B2).
+    ms_null = _mssql_table(
+        mssql_rt,
+        "rt_key_mix_n",
+        "k1 nvarchar(20), k2 nvarchar(20), v int",
+        [(None, "x", 1)],
+    )
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _live_diff(MSSQL_URL, ms_null, PG_URL, tp, ["k1", "k2"])
 
 
 # ---------------------------------------------- RT-B9: MySQL collation keys
@@ -1064,7 +1033,6 @@ def test_live_mssql_ci_keys_against_postgres(pg_rt, mssql_rt):
     assert _found(result) == [("abc ", "different")]
 
 
-
 # ===========================================================================
 # Wave 2: findings and controls added after the resume
 # ===========================================================================
@@ -1098,6 +1066,7 @@ def test_rt_b8_timezone_aware_key_against_naive_key_is_named(pg_rt, tmp_path):
     )
     result = _live_diff(PG_URL, t, f"duckdb:///{p}", "main.t", "k")
     assert result.identical or any("timezone" in w for w in result.warnings), (
+
         _found(result),
         result.warnings,
     )
@@ -1107,13 +1076,6 @@ def test_rt_b8_timezone_aware_key_against_naive_key_is_named(pg_rt, tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-B10: PG nondeterministic-collation key: count(distinct) merges "
-        "'abc'/'ABC' -> false 'not unique'"
-    ),
-)
 def test_rt_b10_postgres_nondeterministic_collation_key_is_unique(pg_rt):
     """PostgreSQL 12+ ICU nondeterministic collations (case-insensitive natural
     keys) make `count(distinct k::text)` compare under the collation, because
@@ -1476,10 +1438,6 @@ def test_live_mssql_key_shapes_against_postgres(
 
 
 @pytest.mark.mssql
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B1: SQL Server NULL text key == SQL Server '\\N' key -> false match",
-)
 def test_rt_b1_live_mssql_to_mssql(mssql_rt):
     ta = _mssql_table(
         mssql_rt, "rt_key_nk_a", "k nvarchar(10), v int", [(None, 1), ("x", 2)]
@@ -1487,14 +1445,12 @@ def test_rt_b1_live_mssql_to_mssql(mssql_rt):
     tb = _mssql_table(
         mssql_rt, "rt_key_nk_b", "k nvarchar(10), v int", [("\\N", 1), ("x", 2)]
     )
-    assert not _live_diff(MSSQL_URL, ta, MSSQL_URL, tb, "k").identical
+    # Fixed by refusing the NULL key (RT-B2).
+    with pytest.raises(ValueError, match=r"\[side A\].*1 NULL"):
+        _live_diff(MSSQL_URL, ta, MSSQL_URL, tb, "k")
 
 
 @pytest.mark.mssql
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B3: SQL Server 0x1f inside composite key parts merges identities",
-)
 def test_rt_b3_live_mssql_to_mssql(mssql_rt):
     ddl = "k1 nvarchar(10), k2 nvarchar(10), v int"
     ta = _mssql_table(mssql_rt, "rt_key_sep_a", ddl, [("a\x1fb", "c", 1)])

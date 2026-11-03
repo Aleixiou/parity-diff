@@ -1092,4 +1092,7 @@ def test_snowflake_variant_rendering_keeps_the_json_type():
 
     d = SnowflakeDialect(side="A")
     col = Column("V", map_type_snowflake("VARIANT", None), "VARIANT")
-    assert d.normalize(col) != """coalesce(cast("V" as varchar), (chr(92) || 'N'))"""
+    # The bare cast, as escaped like all text since RT-A1/A2 - escaping alone
+    # does not restore the lost JSON type.
+    bare = d.escape_text('cast("V" as varchar)')
+    assert d.normalize(col) != f"coalesce({bare}, {d.null_sentinel_sql()})"
