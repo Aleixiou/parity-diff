@@ -287,7 +287,10 @@ def _wagner_values(keys, orig: str = "orig", bits: int = 16) -> list[str] | None
     for k in keys:
         base = row_hash(f"{k}\x1f{orig}")
         lists.append(
-            [((row_hash(f"{k}\x1ft{j}") - base) % m, (f"t{j}",)) for j in range(1 << bits)]
+            [
+                ((row_hash(f"{k}\x1ft{j}") - base) % m, (f"t{j}",))
+                for j in range(1 << bits)
+            ]
         )
     level = 1
     while len(lists) > 1:
@@ -298,7 +301,11 @@ def _wagner_values(keys, orig: str = "orig", bits: int = 16) -> list[str] | None
             for y, q in right:
                 by_low.setdefault((-y) & mask, []).append((y, q))
             merged.append(
-                [((x + y) % m, p + q) for x, p in left for y, q in by_low.get(x & mask, ())]
+                [
+                    ((x + y) % m, p + q)
+                    for x, p in left
+                    for y, q in by_low.get(x & mask, ())
+                ]
             )
         lists = merged
         level += 1
@@ -384,11 +391,9 @@ def test_rt_b5_double_keys_differing_past_the_scale_are_different_rows(tmp_path)
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B6: TIMESTAMP_NS key truncated to microseconds - distinct keys match",
-)
 def test_rt_b6_nanosecond_timestamp_keys_are_different_rows(tmp_path):
+    """RT-B6, fixed with RT-A7: a TIMESTAMP_NS renders its nanoseconds when it
+    has any, so two keys a nanosecond apart are two rows."""
     for side, ns in (("a", 1), ("b", 2)):
         con = duckdb_write(str(tmp_path / f"{side}.duckdb"))
         con.execute("create table t (k timestamp_ns, v int)")
@@ -439,44 +444,58 @@ def test_rt_b5_control_decimal_keys_on_the_scale_are_exact(tmp_path):
 # cast(100000001 as number(38,0)))` - 0 is exact, 1 confirms the bug.
 
 
-def _snowflake_bucket(k: int, lo: int, hi: int, n: int) -> int:
-    """`floor((k - lo) * n / (hi - lo))` as Snowflake evaluates NUMBER division:
-    the quotient rounded half-up to scale 6, then floored."""
-    q = (Decimal((k - lo) * n) / Decimal(hi - lo)).quantize(
-        Decimal("0.000001"), rounding=ROUND_HALF_UP
-    )
+def _snowflake_decimal_div(n: int, d: int) -> int:
+    """`floor(n / d)` as Snowflake evaluates NUMBER division: the quotient
+    rounded half-up to scale 6, then floored."""
+    q = (Decimal(n) / Decimal(d)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
     return int(q // 1)
+
+
+def _snowflake_bucket(k: int, lo: int, hi: int, n: int) -> int:
+    """The bucket the *old* `floor((k - lo) * n / (hi - lo))` gave on Snowflake."""
+    return _snowflake_decimal_div((k - lo) * n, hi - lo)
+
+
+def _snowflake_bucket_fixed(k: int, lo: int, hi: int, n: int) -> int:
+    """The bucket `int_div` gives now: `(m - mod(m, d)) / d` divides an exact
+    multiple, so Snowflake's 6-place rounding has nothing to round."""
+    m, d = (k - lo) * n, hi - lo
+    return _snowflake_decimal_div(m - m % d, d)
 
 
 class _SnowflakeLikeFake(FakeDialect):
     """A fake whose checksum buckets follow Snowflake's division, nothing else."""
 
+    bucket = staticmethod(_snowflake_bucket_fixed)
+
     def segment_checksums(self, table, key, columns, lo, hi, n_segments):
+        """Checksums bucketed by `self.bucket`, Snowflake's division model."""
         self.queries += 1
         out: dict[int, list[int]] = {}
         for k in self.table.keys_in(lo, hi):
-            acc = out.setdefault(_snowflake_bucket(k, lo, hi, n_segments), [0, 0])
+            acc = out.setdefault(self.bucket(k, lo, hi, n_segments), [0, 0])
             acc[0] += 1
             text = self.table.text(k, columns)
             acc[1] += row_hash(str(k) if not columns else f"{k}\x1f{text}")
         return {i: (c, s) for i, (c, s) in out.items()}
 
 
-def test_rt_b7_snowflake_int_div_is_floor_of_decimal_division():
-    """What the dialect emits today - the precondition of the model below."""
+def test_rt_b7_snowflake_int_div_divides_an_exact_multiple():
+    """What the dialect emits now - the precondition of the model below.
+    Offline only: no Snowflake account, so the rounding itself is modelled."""
     d = SnowflakeDialect()
-    assert d.int_div("n", "d") == "floor((n) / (d))"
+    assert d.int_div("n", "d") == "cast(((n) - mod((n), (d))) / (d) as number(38,0))"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-B7: Snowflake floor(n/d) rounds q.9999999 up a bucket (offline model)",
-)
 def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
+    """RT-B7, fixed in the model: a key whose quotient is q.9999999 lands in
+    bucket q on Snowflake too, so a change to it is found."""
     span = 10**8 + 1  # keys 0 .. 10^8
     n = 32
     k_bad = (span - 1) * pow(n, -1, span) % span  # (k*n) % span == span - 1
+    # The old expression put it one bucket high; the new one does not.
     assert _snowflake_bucket(k_bad, 0, span, n) != (k_bad * n) // span
+    assert _snowflake_bucket_fixed(k_bad, 0, span, n) == (k_bad * n) // span
     cols = [Column("v", LogicalType.STRING, "varchar")]
     rows = {0: ("lo",), k_bad: ("same",), span - 1: ("hi",)}
     changed = {**rows, k_bad: ("CHANGED",)}
@@ -484,6 +503,29 @@ def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
     b = _SnowflakeLikeFake(DictTable(cols, changed), side="B")
     result = diff(a, b, "t", "t", "id")
     assert _found(result) == [(k_bad, "different")]
+
+
+def test_rt_b7_the_old_snowflake_division_missed_the_change():
+    """Control: the same walk under the old rounding division loses the row,
+    so the model above is not passing vacuously."""
+    span = 10**8 + 1
+    n = 32
+    k_bad = (span - 1) * pow(n, -1, span) % span
+    cols = [Column("v", LogicalType.STRING, "varchar")]
+    rows = {0: ("lo",), k_bad: ("same",), span - 1: ("hi",)}
+    changed = {**rows, k_bad: ("CHANGED",)}
+
+    class Old(_SnowflakeLikeFake):
+        bucket = staticmethod(_snowflake_bucket)
+
+    result = diff(
+        Old(DictTable(cols, rows), side="A"),
+        Old(DictTable(cols, changed), side="B"),
+        "t",
+        "t",
+        "id",
+    )
+    assert _found(result) != [(k_bad, "different")]
 
 
 # ===========================================================================
@@ -1064,7 +1106,6 @@ def test_live_mssql_ci_keys_against_postgres(pg_rt, mssql_rt):
     assert _found(result) == [("abc ", "different")]
 
 
-
 # ===========================================================================
 # Wave 2: findings and controls added after the resume
 # ===========================================================================
@@ -1295,9 +1336,7 @@ def test_rt_b12_control_postgres_bytea_keys_are_exact(pg_rt):
 @pytest.mark.duckdb
 def test_rt_b12_control_duckdb_blob_keys_are_exact(tmp_path):
     """Control: DuckDB renders every byte of a blob key (escaped)."""
-    result = _duck_diff(
-        tmp_path, "k blob, v varchar", BINARY_ROWS_A, BINARY_ROWS_B, "k"
-    )
+    result = _duck_diff(tmp_path, "k blob, v varchar", BINARY_ROWS_A, BINARY_ROWS_B, "k")
     assert sorted(kind for _, kind in _found(result)) == [
         "different",
         "only_in_a",
@@ -1309,18 +1348,10 @@ def test_rt_b12_control_duckdb_blob_keys_are_exact(tmp_path):
 
 
 @pytest.mark.duckdb
-@pytest.mark.xfail(
-    strict=True,
-    raises=OverflowError,
-    reason=(
-        "RT-B13: DuckDB HUGEINT key wider than ~2^122 overflows INT128 - "
-        "raw crash, no side named"
-    ),
-)
 @pytest.mark.parametrize(
     "keys",
-    [[0, 2**123], [-(2**126), 2**126]],
-    ids=["times-n-overflows", "offset-overflows"],
+    [[0, 2**123], [-(2**126), 2**126], [-(2**127), 0, 2**127 - 1]],
+    ids=["times-n-overflows", "offset-overflows", "full-int128"],
 )
 def test_rt_b13_hugeint_key_range_does_not_crash(tmp_path, keys):
     """`hugeint` is mapped to INTEGER and bisected directly, but `wide_int` is
@@ -1331,7 +1362,7 @@ def test_rt_b13_hugeint_key_range_does_not_crash(tmp_path, keys):
     import duckdb
 
     rows_a = [(k, "x") for k in keys]
-    rows_b = [(keys[0], "x"), (keys[1], "y")]
+    rows_b = [(k, "y" if k == keys[1] else "x") for k in keys]
     try:
         result = _duck_diff(tmp_path, "k hugeint, v varchar", rows_a, rows_b, "k")
     except duckdb.OutOfRangeException as exc:
@@ -1340,6 +1371,53 @@ def test_rt_b13_hugeint_key_range_does_not_crash(tmp_path, keys):
             raise
         raise OverflowError(str(exc)) from exc
     assert _found(result) == [(keys[1], "different")]
+
+
+@pytest.mark.duckdb
+def test_rt_b13_wide_hugeint_bucket_matches_python_for_every_boundary_key():
+    """The INT128-safe bucket expression (`DuckDBDialect.bucket_expr`) against
+    Python's exact `floor((k - lo) * n / (hi - lo))` and `bucket_bounds`, on
+    every bucket edge and its neighbours, over spans up to the full 2^128.
+    An off-by-one here would let the walker skip rows and still report a
+    match, so it is checked key by key rather than through one diff."""
+    import random
+
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+    from parity.engine import bucket_bounds
+    from parity.types import KeySpec
+
+    d = DuckDBDialect(side="A")
+    d.connect("duckdb:///:memory:")
+    key = KeySpec((Column("k", LogicalType.INTEGER, "HUGEINT"),), False)
+    rng = random.Random(20261103)
+    lo_min, hi_max = -(2**127), 2**127
+    tried = 0
+    try:
+        for _ in range(120):
+            lo = rng.choice(
+                [lo_min, lo_min + 1, -(2**126), -1, 0, rng.randint(lo_min, 2**125)]
+            )
+            hi = rng.choice([hi_max, rng.randint(max(lo + 2**121, 2**125), hi_max)])
+            n = rng.choice([2, 3, 7, 32, 1000])
+            if (hi - lo) * n <= 2**127 - 1:
+                continue  # the shared expression, covered elsewhere
+            keys = {lo, hi - 1}
+            for i in range(n):
+                b_lo, b_hi = bucket_bounds(i, lo, hi, n)
+                keys |= {x for x in (b_lo - 1, b_lo, b_hi - 1, b_hi) if lo <= x < hi}
+            keys |= {rng.randint(lo, hi - 1) for _ in range(10)}
+            values = ", ".join(f"(cast('{x}' as hugeint))" for x in keys)
+            got = d.query(
+                f"select k, {d.bucket_expr(key, 'k', lo, hi, n)} from (values {values}) t(k)"
+            )
+            for k, b in got:
+                assert b == (k - lo) * n // (hi - lo), (lo, hi, n, k, b)
+                b_lo, b_hi = bucket_bounds(b, lo, hi, n)
+                assert b_lo <= k < b_hi
+                tried += 1
+    finally:
+        d.close()
+    assert tried > 10_000
 
 
 @pytest.mark.duckdb
@@ -1396,9 +1474,7 @@ def test_live_mssql_bucket_expression_matches_bucket_bounds(mssql_rt):
     cases = [(I64_MIN, I64_MAX + 1, 32), (0, 10**8 + 1, 32)]
     for _ in range(25):
         lo = rnd.randint(I64_MIN, I64_MAX - 2)
-        hi = rnd.randint(
-            lo + 2, min(I64_MAX + 1, lo + rnd.choice([10**3, 10**9, 2**64]))
-        )
+        hi = rnd.randint(lo + 2, min(I64_MAX + 1, lo + rnd.choice([10**3, 10**9, 2**64])))
         cases.append((lo, hi, rnd.choice([2, 3, 7, 32, 97])))
     keys: set[int] = set()
     for lo, hi, n in cases:

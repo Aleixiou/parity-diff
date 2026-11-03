@@ -56,6 +56,7 @@ The BigQuery-specific decisions, each confirmed by that run:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
@@ -92,6 +93,17 @@ def parse_bigquery_url(connection_string: str) -> tuple[str, str, str | None]:
     """
     rest = connection_string.split("://", 1)[1] if "://" in connection_string else ""
     path, _, query = rest.partition("?")
+    if "@" in path or "%40" in path.lower():
+        # `user:password@project` would otherwise become the project id, and
+        # the client sends that in a request URL that Google's error echoes
+        # back (RT-F4). No project or dataset id can hold `@`, and BigQuery
+        # takes no credentials in the URL at all, so refuse - without quoting
+        # the string, which holds the secret.
+        raise ValueError(
+            "bigquery connection string must not contain credentials "
+            "(user:password@): BigQuery authenticates through Application "
+            "Default Credentials only - bigquery://<project>[/<dataset>]"
+        )
     parts = [unquote(p) for p in path.split("/") if p]
     if not parts:
         raise ValueError(
@@ -133,6 +145,9 @@ class BigQueryDialect(Dialect):
         #: Base tables (project, dataset, table) that read at `snapshot`. Only
         #: base tables: on a view BigQuery ignores time travel without an error.
         self._pinned: set[tuple[str, str, str]] = set()
+        #: Tables `columns()` found to be views (or anything but a base
+        #: table): read live at every level, which `caveats` reports.
+        self._live: set[tuple[str, str, str]] = set()
 
     # ---------------------------------------------------------------- setup
 
@@ -258,7 +273,30 @@ class BigQueryDialect(Dialect):
             self.snapshot = str(rows[0][3])
         if rows[0][2] == "BASE TABLE":
             self._pinned.add((project, dataset, name))
+        else:
+            self._live.add((project, dataset, name))
         return [_column(str(r[0]), str(r[1])) for r in rows]
+
+    def caveats(self, columns: Sequence[Column]) -> list[str]:
+        """Say so when the walk is not one snapshot (RT-D7).
+
+        A view ignores `FOR SYSTEM_TIME AS OF` without an error, so it is read
+        live at every level - the gap the module docstring documents, which
+        CLAUDE.md section 8 says must reach the output, as SQL Server's
+        dialect reports its READ COMMITTED fallback.
+        """
+        if not self._live:
+            return []
+        names = sorted(".".join(ref) for ref in self._live)
+        note = (
+            f"{' and '.join(names)} is not a base table, and BigQuery ignores "
+            "time travel on a view, so it is read live at every level rather "
+            "than as one snapshot: rows written during the diff can be "
+            "reported as differences that never existed at one point in time, "
+            "or missed. Diff the base table, or a snapshot of the view, for a "
+            "single-snapshot result"
+        )
+        return [note]
 
     def quote(self, identifier: str) -> str:
         """Back-quote one identifier, escaping backslash and backtick.

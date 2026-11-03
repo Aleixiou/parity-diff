@@ -146,10 +146,6 @@ def _ms_url() -> str:
 # gets a caveat - nothing in the output says the comparison was truncated.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C1: DuckDB TIMESTAMP_NS differing below 1us reads identical, no caveat",
-)
 def test_duckdb_timestamp_ns_difference_is_found_or_caveated(tmp_path):
     """Plant a 998 ns difference; it must be reported or the loss said aloud."""
     paths = []
@@ -323,10 +319,6 @@ def test_mysql_invisible_column_is_compared(my, mysql_url):
     ],
     ids=["float", "datetime", "int-vs-string"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C5: SQL Server sql_variant renders lossily (6 digits / minutes)",
-)
 def test_mssql_sql_variant_differences_are_reported(ms, a_val, b_val):
     """Two different values inside sql_variant must not compare equal."""
     for t, v in (("va", a_val), ("vb", b_val)):
@@ -359,22 +351,18 @@ def test_mssql_sparse_columns_and_time7_are_compared(ms):
 
 
 @pytest.mark.parametrize("raw", ["TIMESTAMP_TZ", "TIMESTAMP_LTZ"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C6: Snowflake TIMESTAMP_TZ/LTZ are classified as timezone-naive",
-)
 def test_snowflake_timezone_aware_types_are_recognised(raw):
-    """What the Snowflake dialect builds for a TZ column must read as aware."""
-    from parity.dialects.snowflake_dialect import map_type_snowflake
+    """What the Snowflake dialect builds for a TZ column must read as aware.
 
-    col = Column("TS", map_type_snowflake(raw, None), raw)
-    assert _is_tz_aware(col)
+    RT-C6, fixed: built through the dialect's own `_column` (what `columns()`
+    returns), which sets `tz_aware` - a bare Column carries no such knowledge.
+    """
+    from parity.dialects.snowflake_dialect import _column
+
+    assert _is_tz_aware(_column("TS", raw, None, 9))
+    assert not _is_tz_aware(_column("TS", "TIMESTAMP_NTZ", None, 9))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C7: Snowflake TIMESTAMP(9) compared at FF6 with no caveat",
-)
 def test_snowflake_nanosecond_timestamps_carry_a_caveat():
     """Snowflake timestamps default to 9 digits; FF6 drops three, silently.
 
@@ -632,10 +620,6 @@ def test_wide_tables_find_a_difference_in_the_last_column_on_mssql(ms, tmp_path,
 # complaint (up to 1,024 columns). Loud, not a false match.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C8: SQL Server diff of > ~307 columns dies on the 8060-byte row limit",
-)
 def test_a_400_column_sql_server_table_can_be_diffed(ms, tmp_path):
     """400 int columns - a quarter under SQL Server's own 1,024 limit."""
     n = 400
@@ -899,11 +883,6 @@ def test_postgres_bc_dates_do_not_match_ad_dates(pg, tmp_path, pg_t, bc, ad, eng
 # differently from TIMESTAMP_NTZ (e.g. convert_timezone('UTC', c) first).
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C11: Snowflake TIMESTAMP_TZ rendered at its stored offset, not UTC "
-    "(inferred from docs + SQL, not live)",
-)
 def test_snowflake_timestamp_tz_is_rendered_as_an_instant():
     """TIMESTAMP_TZ needs a UTC conversion that TIMESTAMP_NTZ must not get."""
     from parity.dialects.snowflake_dialect import SnowflakeDialect, map_type_snowflake
@@ -1043,10 +1022,6 @@ def test_postgres_stored_generated_column_with_a_changed_expression_is_found(pg)
     ],
     ids=["union", "variant"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C14: DuckDB UNION/VARIANT render without their tag, int 1 == '1'",
-)
 def test_duckdb_tagged_values_of_different_member_types_differ(
     tmp_path, ddl, a_val, b_val
 ):
@@ -1081,11 +1056,6 @@ def test_duckdb_tagged_values_of_different_member_types_differ(
 # (to_json, say) must not be the plain varchar cast.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-C15: Snowflake VARIANT cast to varchar drops string quotes, 1 == '1' "
-    "(inferred from docs + SQL, not live)",
-)
 def test_snowflake_variant_rendering_keeps_the_json_type():
     """The VARIANT expression must not be the bare varchar cast."""
     from parity.dialects.snowflake_dialect import SnowflakeDialect, map_type_snowflake

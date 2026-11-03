@@ -171,15 +171,32 @@ def test_quiet_wins_over_json_and_keeps_the_exit_code(base, mixed):
         "",
         "",
     )
-    assert run_cli(*duck_args(base, base, "--quiet", "--json")) == (EXIT_IDENTICAL, "", "")
+    assert run_cli(*duck_args(base, base, "--quiet", "--json")) == (
+        EXIT_IDENTICAL,
+        "",
+        "",
+    )
 
 
 @pytest.mark.parametrize(
     "argv",
     [
         ["diff", "--a", "duckdb:///:memory:"],  # required flags missing
-        ["diff", "--a", "x", "--a-table", "t", "--b", "y", "--b-table", "t",
-         "--key", "id", "--max-diffs", "ten"],
+        [
+            "diff",
+            "--a",
+            "x",
+            "--a-table",
+            "t",
+            "--b",
+            "y",
+            "--b-table",
+            "t",
+            "--key",
+            "id",
+            "--max-diffs",
+            "ten",
+        ],
         ["frobnicate"],
     ],
 )
@@ -745,11 +762,6 @@ def test_mysql_url_options_are_honoured_or_refused(monkeypatch):
     assert refused or {"ssl_ca", "ssl_verify_cert", "ssl_disabled"} & set(seen), seen
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F4: bigquery:// accepts user:password@ and sends it to Google "
-    "as part of the project id in a request URL",
-)
 def test_bigquery_refuses_credentials_in_the_url():
     """The README says no secret goes in a BigQuery URL; one that does is not refused.
 
@@ -759,8 +771,25 @@ def test_bigquery_refuses_credentials_in_the_url():
     """
     from parity.dialects.bigquery_dialect import parse_bigquery_url
 
-    with pytest.raises(ValueError):
-        parse_bigquery_url(f"bigquery://u:{SECRET}@proj/ds")
+    for url in (
+        f"bigquery://u:{SECRET}@proj/ds",
+        f"bigquery://u:{SECRET}@proj",
+        f"bigquery://u:a/{SECRET}@proj",  # a raw '/' in the password
+        f"bigquery://u%40x:{SECRET}%40proj/ds",
+    ):
+        with pytest.raises(ValueError) as caught:
+            parse_bigquery_url(url)
+        assert SECRET not in str(caught.value)
+    # And through the CLI: named side, no secret.
+    pytest.importorskip("google.cloud.bigquery")
+    msg = _connect_error(f"bigquery://u:{SECRET}@proj/ds")
+    assert "side A" in msg and SECRET not in msg, msg
+    # A plain project id, including a domain-scoped one, still parses.
+    assert parse_bigquery_url("bigquery://example.com:proj/ds") == (
+        "example.com:proj",
+        "ds",
+        None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -787,11 +816,6 @@ def test_these_errors_name_the_side_and_hide_the_password(conn):
     assert SECRET not in msg, msg
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F6: the documented ?login_timeout= is mapped to an ODBC keyword "
-    "mssql-python rejects, so every connection using it fails",
-)
 def test_mssql_documented_login_timeout_is_accepted():
     """README lists `login_timeout` (seconds) as a supported mssql option.
 
@@ -1325,9 +1349,7 @@ _TXN = re.compile(r"^\s*(begin|rollback|commit)\b", re.IGNORECASE)
 
 
 @pytest.mark.postgres
-def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(
-    pg_url, duck_orders
-):
+def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(pg_url, duck_orders):
     """Every frontend message psycopg sends during a full diff, decoded off the wire.
 
     Proves three things the driver-level capture could not: no statement of
@@ -1364,7 +1386,9 @@ def test_postgres_wire_carries_only_reads_in_a_read_only_transaction(
         _assert_found_the_two_planted(code, out)
         texts = [t for kind, t in tap.log if kind in ("query", "parse")]
         print("postgres wire:", tap.connections, "connection(s),", len(texts), "stmts")
-        print(sorted({t.strip()[:60] for t in texts if not t.lower().startswith("select")}))
+        print(
+            sorted({t.strip()[:60] for t in texts if not t.lower().startswith("select")})
+        )
         assert tap.connections == 1
         assert [k for k, _ in tap.log if k not in ("query", "parse")] == []
         assert [t for t in texts if not (_READ.match(t) or _TXN.match(t))] == []
@@ -1388,7 +1412,9 @@ def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
     `transaction_read_only` - the wire confirms RT-F11 from the server's side.
     """
     u = urlparse(mysql_url)
-    tap = _WireTap((u.hostname or "127.0.0.1", u.port or 3306), _mysql_parser, _mysql_greeting)
+    tap = _WireTap(
+        (u.hostname or "127.0.0.1", u.port or 3306), _mysql_parser, _mysql_greeting
+    )
     try:
         tapped = f"{u.scheme}://{u.netloc.rsplit('@', 1)[0]}@127.0.0.1:{tap.port}{u.path}"
         code, out, err = run_cli(
@@ -1398,7 +1424,12 @@ def test_mysql_wire_carries_only_reads(mysql_url, mysql_orders, duck_orders):
         )  # fmt: skip
         _assert_found_the_two_planted(code, out)
         texts = [t for kind, t in tap.log if kind == "query"]
-        print("mysql wire:", len(texts), "stmts", sorted({t[:60] for t in texts if not t.lower().startswith("select")}))
+        print(
+            "mysql wire:",
+            len(texts),
+            "stmts",
+            sorted({t[:60] for t in texts if not t.lower().startswith("select")}),
+        )
         assert tap.connections == 1
         assert {t for k, t in tap.log if k == "command"} <= {"ping", "quit"}
         assert [t for t in texts if not _READ.match(t)] == []
@@ -1553,11 +1584,6 @@ def test_mssql_receives_only_selects_as_a_datareader(mssql_url, duck_orders):
         master.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F12: the SQL Server SELECT-only guard is a prefix check, so "
-    "'select ... into' and 'select 1; drop ...' pass it",
-)
 @pytest.mark.parametrize(
     "sql",
     [
@@ -1669,11 +1695,6 @@ def test_duckdb_diff_opens_no_socket_at_all(base, mixed, monkeypatch):
     assert guard.seen == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F13: DuckDB sessions keep autoinstall_known_extensions on, so a "
-    "table or view needing an extension downloads it from extensions.duckdb.org",
-)
 def test_duckdb_session_cannot_download_extensions(base):
     """CLAUDE.md section 6: no network calls, ever.
 
@@ -1686,8 +1707,15 @@ def test_duckdb_session_cannot_download_extensions(base):
 
     d = get_dialect(f"duckdb:///{base}", side="A")
     try:
-        (row,) = d.query("select current_setting('autoinstall_known_extensions')")
-        assert row[0] is False
+        (row,) = d.query(
+            "select current_setting('autoinstall_known_extensions'), "
+            "current_setting('autoload_known_extensions')"
+        )
+        assert row == (False, False)
+        # And a query that needs httpfs is refused up front instead of fetching
+        # the extension (loopback URL: nothing external even if it were not).
+        with pytest.raises(Exception, match=r"(?i)extension"):
+            d.query("select * from read_csv('https://127.0.0.1:1/x.csv')")
     finally:
         d.close()
 
@@ -1766,11 +1794,6 @@ def _connect_error_table(conn: str, table: str) -> str:
     return out + err
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-F14: the Snowflake connection leaves the connector's client "
-    "telemetry on, which reports driver usage back to Snowflake",
-)
 def test_snowflake_connection_disables_client_telemetry(monkeypatch):
     """Offline: capture what the dialect passes to `snowflake.connector.connect`."""
     sf = pytest.importorskip("snowflake.connector")
@@ -1784,3 +1807,7 @@ def test_snowflake_connection_disables_client_telemetry(monkeypatch):
     _connect_error("snowflake://u:p@acct/db/sch?warehouse=w")
     flat = json.dumps(seen, default=str).lower()
     assert "telemetry" in flat
+    # RT-F14, fixed (offline only - no Snowflake account): switched off in the
+    # login request itself, since the connector logs during connect.
+    assert seen["session_parameters"]["CLIENT_TELEMETRY_ENABLED"] is False
+    assert seen["log_imported_packages_in_telemetry"] is False

@@ -233,12 +233,6 @@ def test_rt_e6_an_integral_decimal_key_matches_an_integer_key(tmp_path):
     assert result.identical or key_warned
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-E7: DuckDB TIMESTAMP_NS is compared at microseconds with no "
-    "caveat - .123456789 and .123456001 read identical, while SQL Server's "
-    "datetime2(7) reports its lost digit",
-)
 def test_rt_e7_nanosecond_timestamps_are_compared_or_caveated(tmp_path):
     """RT-E7: TIMESTAMP_NS differences below a microsecond are seen or caveated."""
     ddl = "id int, t timestamp_ns"

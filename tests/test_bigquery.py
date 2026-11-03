@@ -409,6 +409,8 @@ def test_a_view_is_not_pinned_and_says_so_by_behaving_live(bigquery_url, rw):
     try:
         key = a.key_spec(view, "id")
         assert "for system_time" not in a.qualify(view)
+        # RT-D7: and the output says so.
+        assert any("read live" in n for n in a.caveats(list(key.columns)))
         assert a.key_stats(view, key).rows == 1
         run(f"insert into {ds}.`{base}` (id) values (2)")
         assert a.key_stats(view, key).rows == 2
