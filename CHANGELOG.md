@@ -22,8 +22,8 @@ with the caveat that 0.x means the CLI surface may still move.
   against a logon trigger setting all of them hostile); one `READ ONLY`
   transaction is the snapshot (ORA-01466 for a table changed during the run
   is reported naming the side). `LONG`, `XMLTYPE`, `VECTOR` and object
-  columns are refused; `JSON` and `ROWID` are not covered. Only non-AL32UTF8
-  databases are refused at connect.
+  columns are refused; `JSON` and `ROWID` are not covered; databases not in
+  AL32UTF8, and servers older than 19c, are refused at connect.
 - **User documentation restructured** for someone who has never seen the
   tool. The README is now install, a five-minute first try on two DuckDB
   files (no server needed), use on real databases, reading the output, CI,

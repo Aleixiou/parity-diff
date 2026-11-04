@@ -188,10 +188,11 @@ Decisions, not just spellings:
 - SQL Server floats cannot hold Infinity or NaN, so no tokens are emitted.
 
 **Oracle** (verified live 2026-11-04 against Oracle Database 23ai Free
-23.26 in a container, byte-for-byte with DuckDB over 5,000 mixed-type rows,
-the conformance sweep at scales 6 and 2, and the FLOAT form on 11,576
+23.26 and 21c XE 21.3 in containers, byte-for-byte with DuckDB over 5,000
+mixed-type rows, the conformance sweep at scales 6 and 2 (818 cells on 23ai,
+788 on 21c, which has no BOOLEAN or JSON type), and the FLOAT form on 11,576
 doubles at scales 0, 2, 6, 9 and 20; `tests/test_oracle.py`,
-`tests/test_oracle_offline.py`). python-oracledb thin mode. Every value is
+`tests/test_oracle_offline.py`; the whole live suite passes on both). python-oracledb thin mode. Every value is
 VARCHAR2 in the database character set, which must be AL32UTF8 (refused
 otherwise), so its bytes *are* UTF-8:
 
@@ -266,12 +267,16 @@ Decisions, not just spellings:
   given its first segment just before) raises ORA-01466 - measured always at
   0 s, sometimes at 1.1 s, never from 1.6 s - which `query` re-raises naming
   the side. A TIMESTAMP WITH LOCAL TIME ZONE at 9999-12-31 23:59:59.999999
-  UTC reads as year 10000 and TO_CHAR raises ORA-01877 on it: the year guard
-  refuses it.
+  UTC reads as year 10000 on 23ai and TO_CHAR raises ORA-01877 on it: the
+  year guard refuses it (21c renders it correctly).
 - **Julian dates.** Oracle's calendar is Julian before 1582-10-15, also in
   arithmetic: `date '0999-12-25' + 66` is 1000-02-29 (DuckDB: 1000-03-01).
   Values compare by their Y-M-D labels, which is what drivers and exports
   carry; data built by date arithmetic before 1582 differs, and is reported.
+- **DBMS_CRYPTO, where granted.** `connect` probes `DBMS_CRYPTO.HASH`; when
+  the login may call it, long rows are hashed by it natively (it hashes a
+  CLOB as AL32UTF8 - verified equal to `parity_md5` and to Python on every
+  test text). Otherwise `parity_md5`. Both paths ran the full live suite.
 - **Driver binds.** python-oracledb binds a Python float as NUMBER (lossy, or
   DPY-4003) and a timedelta of -1 us as -1 day + 23:59:59.999999; tests bind
   BINARY_DOUBLE explicitly and intervals as `numtodsinterval`. The dialect

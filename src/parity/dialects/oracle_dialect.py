@@ -1,7 +1,7 @@
 """Oracle dialect (Oracle Database 21c and 23ai; python-oracledb, thin mode).
 
-Verified against a live Oracle Database 23ai Free (23.26) in a container,
-2026-11-04: the hash constant agrees, rows render byte-identically to DuckDB,
+Verified against live Oracle Database 23ai Free (23.26) and 21c XE (21.3) in
+containers, 2026-11-04: the hash constant agrees, rows render byte-identically to DuckDB,
 the FLOAT expression matches `canonical_float_text` on the adversarial sample
 and on random doubles, and `tests/test_oracle.py` finds every planted
 difference exactly. Nothing below is taken from the documentation alone.
@@ -18,10 +18,11 @@ The Oracle-specific decisions, each confirmed live:
   concatenation raises ORA-01489, and `STANDARD_HASH` takes no CLOB (ORA-00902).
   So each row's text is hashed by `STANDARD_HASH` when an upper bound on its
   length, computed from the raw column lengths, is at most 4,000 bytes, and
-  otherwise built as a CLOB and hashed by `parity_md5`, an MD5 written in
-  PL/SQL and declared inline in the query (`WITH FUNCTION`), which needs no
-  privilege beyond SELECT - `DBMS_CRYPTO` needs an EXECUTE grant a reader
-  does not hold. Both paths hash the same text, so a row's hash never depends
+  otherwise built as a CLOB and hashed by `DBMS_CRYPTO.HASH` where the login
+  may call it, else by `parity_md5`, an MD5 written in PL/SQL and declared
+  inline in the query (`WITH FUNCTION`), which needs no privilege beyond
+  SELECT - `DBMS_CRYPTO` needs an EXECUTE grant a reader does not usually
+  hold. All paths hash the same text, so a row's hash never depends
   on which one ran; `parity_md5` equals Python's `hashlib.md5` on texts up to
   600 kB with emoji straddling every chunk boundary. A bound that ever came
   out too small would raise ORA-01489, never truncate.

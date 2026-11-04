@@ -25,7 +25,7 @@ that can only read anyway: then the server itself refuses a write.
 | SQL Server / Azure SQL | `mssql` | only with `ALLOW_SNAPSHOT_ISOLATION ON` | 2019+; 2019 and 2022 verified; FLOAT needs compatibility level 130+ |
 | Snowflake | `snowflake` | no (READ COMMITTED only) | verified live on AWS; connector 4.x only |
 | BigQuery | `bigquery` | base tables yes (time travel); views no | verified live in the EU region |
-| Oracle | `oracle` | yes (READ ONLY transaction) | 19c+; 21c and 23ai verified; AL32UTF8 databases |
+| Oracle | `oracle` | yes (READ ONLY transaction) | 19c+ (19c not yet verified); 21c and 23ai verified; AL32UTF8 databases |
 
 Every run that lacks a single snapshot says so in a caveat. Redshift,
 Databricks and Fabric are not supported yet.
@@ -327,7 +327,8 @@ oracle://user:password@host:2484/service_name?protocol=tcps
 mode: pure Python, no Oracle client or Instant Client to install). The path is
 the **service name** (a PDB such as `ORCLPDB1`, `FREEPDB1`, an Autonomous
 Database service), not a SID. Verified on Oracle Database 23ai (Free 23.26)
-and 21c (XE); 19c or newer is required, and older servers are refused.
+and 21c (XE 21.3), where the whole live suite passes; 19c is accepted but
+not yet verified, and older servers are refused.
 
 **Authentication.** User and password only, for now (no wallet, Kerberos or
 OS authentication). Options, all others refused: `tcp_connect_timeout`
@@ -375,6 +376,14 @@ Oracle specifics:
 VARCHAR2 bytes in the database character set and the tool hashes UTF-8.
 NVARCHAR2, NCHAR and NCLOB values are converted to it first; a value that
 does not convert raises (`NLS_NCHAR_CONV_EXCP` is pinned on).
+
+**Speed.** Measured on Oracle Database 23ai Free (which caps itself at two
+CPU threads) in a container on a laptop, against DuckDB, 1,000,000 rows of
+five columns (integer key, NUMBER(12,2), VARCHAR2, BINARY_DOUBLE,
+TIMESTAMP): identical tables in 51 s (4 queries, no rows downloaded), one
+changed row found in 63 s (8 queries, 1,952 rows downloaded), the sample
+check included. A licensed server with more cores is faster; the work is
+one hash pass per side, as on every engine.
 
 **Session settings pinned at connect:** `NLS_LANGUAGE`, `NLS_TERRITORY`,
 `NLS_CALENDAR` (Gregorian), `NLS_NUMERIC_CHARACTERS`, `NLS_DATE_FORMAT`,

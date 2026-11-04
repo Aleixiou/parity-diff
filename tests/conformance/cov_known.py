@@ -107,9 +107,9 @@ REFUSED: dict[tuple[str, str, str], str] = {
         "timestamp(9) with local time zone",
         "tz:9999-12-31 23:59:59.999999+00:00",
     ): (
-        "Oracle stores the instant but cannot print it: TO_CHAR raises ORA-01877 "
-        "and EXTRACT reads year 10000, so the year guard refuses it naming the "
-        "column - loud, never `#####`"
+        "Oracle 23ai stores the instant but cannot print it: TO_CHAR raises "
+        "ORA-01877 and EXTRACT reads year 10000, so the year guard refuses it "
+        "naming the column - loud, never `#####` (21c renders it)"
     ),
 }
 
