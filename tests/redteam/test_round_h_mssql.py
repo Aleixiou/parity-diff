@@ -384,6 +384,33 @@ def test_rt_hs4_invalid_dbcs_bytes_are_distinct():
 
 @pytest.mark.xfail(
     strict=True,
+    reason="RT-HS4: varchar in a DBCS code page (cp949/950/936): every invalid "
+    "byte pair decodes to '?' and hashes like a real '?' (false match)",
+)
+@pytest.mark.parametrize(
+    "collation", ["Korean_Wansung_CI_AS", "Chinese_Taiwan_Stroke_CI_AS", "Chinese_PRC_CI_AS"]
+)
+def test_rt_hs4_invalid_dbcs_bytes_are_distinct_in_korean_and_chinese(collation):
+    """The same in the Korean and both Chinese code pages, measured over all
+    255 trail bytes after lead 0x81: every invalid pair is stored as-is and
+    converts to '?' - so 0x8101, 0x8102 and the text '?' all render alike."""
+    url = make_db("rth_mssql_dbcs", collation=collation)
+    ta, tb = pair(
+        "rth_mssql_dbcs",
+        "id int primary key, v varchar(20)",
+        ["(1, convert(varchar(20), 0x8101))", "(2, convert(varchar(20), 0x8102))", "(3, 'b')"],
+        ["(1, convert(varchar(20), 0x8102))", "(2, '?')", "(3, 'c')"],
+        "cjk",
+    )
+    assert found(run(url, url, ta, tb)) == [
+        (1, "different", ("v",)),
+        (2, "different", ("v",)),
+        (3, "different", ("v",)),
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
     reason="RT-HS7: a DECIMAL with more than 38 - scale integer digits kills "
     "the diff with a bare 'Arithmetic overflow', naming no column or value",
 )
