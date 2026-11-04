@@ -1326,3 +1326,24 @@ def test_rt_hm18_columns_that_differ_beyond_case_are_not_matched(
         'id int primary key, "strasse" int', ["insert into {t} values (1, 1), (2, 3)"],
     )  # fmt: skip
     assert r.schema_differences
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM1: two unmappable legacy-charset keys collapse into one '?' key",
+)
+def test_rt_hm1_unmappable_keys_are_not_called_duplicates(tables, mysql_url):
+    """As a key the same loss is loud but misleading: two distinct Shift-JIS
+    user-defined characters both render `?`, so a primary key is refused as
+    'not unique' and the user is sent to look for duplicates that do not
+    exist."""
+    ddl = "id varchar(10) character set sjis primary key, v int"
+    r = _mysql_pair(
+        tables,
+        mysql_url,
+        ddl,
+        ["insert into {t} values (_sjis x'F040', 1), (_sjis x'F041', 2)"],
+        ["insert into {t} values (_sjis x'F040', 1), (_sjis x'F041', 3)"],
+        tag="sjis_key",
+    )
+    assert len(found(r)) == 1
