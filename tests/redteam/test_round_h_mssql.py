@@ -120,6 +120,14 @@ def run(ua: str, ub: str, ta: str, tb: str, **kw: Any):
         b.close()
 
 
+def series(n: int) -> str:
+    """A derived table of `value` 1..n - `generate_series` is 2022+ only."""
+    return (
+        f"(select top ({n}) row_number() over (order by (select null)) as value "
+        "from sys.all_objects a cross join sys.all_objects b) as s"
+    )
+
+
 def found(result) -> list[tuple]:
     """(key, kind, sorted columns) of every reported difference, sorted."""
     return sorted(
@@ -705,10 +713,10 @@ def test_temporal_columnstore_partitioned_and_indexed_view_sources(db):
     )
     ex(
         DB,
-        "insert t_sys (id, v) select value, value from generate_series(1, 300)",
-        "insert t_plain select value, value from generate_series(1, 300)",
-        "insert t_cs select value, value from generate_series(1, 300)",
-        "insert t_part select value, value from generate_series(1, 300)",
+        f"insert t_sys (id, v) select value, value from {series(300)}",
+        f"insert t_plain select value, value from {series(300)}",
+        f"insert t_cs select value, value from {series(300)}",
+        f"insert t_part select value, value from {series(300)}",
         "update t_sys set v = -1 where id = 7",
         "update t_cs set v = -1 where id = 150",
         "update t_part set v = -1 where id = 250",
@@ -825,7 +833,7 @@ def test_an_escaping_filter_is_never_read_as_identical(db):
     ex(DB, f"create table esc_a ({ddl})", f"create table esc_b ({ddl})")
     fill = (
         "select value, value, case when value % 10 = 0 then 1 else 0 end "
-        "from generate_series(1, 2000)"
+        f"from {series(2000)}"
     )
     ex(DB, f"insert esc_a {fill}", f"insert esc_b {fill}", "update esc_b set v = -1 where id = 1500")
     r = run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=ESCAPING_FILTER, where_b=ESCAPING_FILTER)
