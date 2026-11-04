@@ -527,6 +527,7 @@ class SnowflakeDialect(Dialect):
     _masked: list[tuple[str, str, str]]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Start with no policy notes, masked columns or checked VARIANT doubles."""
         super().__init__(*args, **kwargs)
         self._policy_notes = []
         self._masked = []

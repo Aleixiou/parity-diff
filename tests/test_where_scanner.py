@@ -60,18 +60,21 @@ ORDINARY = [
 
 @pytest.mark.parametrize("predicate", ESCAPES)
 def test_shared_check_refuses_every_bracket_escape(predicate):
+    """The shared check refuses every bracket escape."""
     assert row_filter_problem(predicate) is not None
 
 
 @pytest.mark.parametrize("dialect", DIALECTS, ids=lambda d: d.__name__)
 @pytest.mark.parametrize("predicate", ESCAPES)
 def test_every_dialect_refuses_every_bracket_escape(dialect, predicate):
+    """Every dialect's `check_where` refuses every bracket escape, naming side A."""
     with pytest.raises(ValueError, match=r"\[side A: .*\] row filter"):
         dialect(side="A").check_where(predicate)
 
 
 @pytest.mark.parametrize("predicate", ORDINARY)
 def test_ordinary_bracket_and_quote_spellings_pass(predicate):
+    """Ordinary bracket and quote spellings pass the shared check."""
     assert row_filter_problem(predicate) is None
 
 
@@ -87,5 +90,6 @@ def test_ordinary_spellings_pass_each_dialect(dialect):
 
 
 def test_the_bracket_reading_is_named_in_the_refusal():
+    """The refusal names the SQL Server identifier reading of `[`."""
     problem = row_filter_problem("']' in unnest([']'])) or (true or 'x' in unnest(['['])")
     assert problem is not None and "SQL Server identifier" in problem

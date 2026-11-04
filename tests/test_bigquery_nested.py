@@ -57,10 +57,12 @@ RUN = uuid.uuid4().hex[:8]
     ],
 )
 def test_type_map(raw, kind):
+    """Each BigQuery nested or spatial type maps to its logical type."""
     assert map_type_bigquery(raw) is kind
 
 
 def test_struct_fields_are_parsed_with_nesting_parameters_and_backticks():
+    """STRUCT field lists split at top-level commas, unquoting backticked names."""
     assert _struct_fields(
         "a INT64, b NUMERIC(10, 2), c ARRAY<STRUCT<x STRING, y INT64>>"
     ) == [
@@ -78,6 +80,7 @@ def test_struct_fields_are_parsed_with_nesting_parameters_and_backticks():
 
 
 def test_the_struct_spec_keeps_boundaries_nulls_and_names_apart():
+    """The struct spec keeps field boundaries, NULLs and field names apart."""
     texts = {
         canonical_struct_text([("x", "a, b"), ("y", "c")]),
         canonical_struct_text([("x", "a"), ("y", "b, c")]),
@@ -97,12 +100,14 @@ def test_the_struct_spec_keeps_boundaries_nulls_and_names_apart():
 
 
 def test_the_dialect_spells_the_struct_mark_from_its_code_point():
+    """The struct field mark is built from chr(92), never a backslash literal."""
     sql = BigQueryDialect().normalize(_column("s", "STRUCT<x STRING>"))
     assert "concat(chr(92), '=')" in sql and "\\=" not in sql
     assert "from unnest([`s`])" in sql
 
 
 def test_arrays_are_read_in_offset_order_and_null_safe():
+    """Arrays are aggregated in offset order; a NULL array renders the sentinel."""
     sql = BigQueryDialect().normalize(_column("a", "ARRAY<INT64>"))
     assert "with offset as `__parity_offset`" in sql
     assert "order by `__parity_offset`" in sql
@@ -110,11 +115,13 @@ def test_arrays_are_read_in_offset_order_and_null_safe():
 
 
 def test_geography_renders_its_wkb():
+    """GEOGRAPHY renders as the hex of its WKB."""
     sql = BigQueryDialect().normalize(_column("g", "GEOGRAPHY"))
     assert sql == "coalesce(to_hex(st_asbinary(`g`)), concat(chr(92), 'N'))"
 
 
 def test_a_list_key_is_refused():
+    """An ARRAY column is refused as a key."""
     from parity.types import KeySpec
 
     d = BigQueryDialect(side="A")
@@ -139,10 +146,12 @@ def test_a_list_key_is_refused():
     ],
 )
 def test_table_names_with_backticks_and_domains(name, parts):
+    """Table names split on dots outside backticks; malformed ones give None."""
     assert _split_table_name(name) == parts
 
 
 def test_a_misplaced_backtick_is_refused_naming_backticks():
+    """A backtick in the middle of a name is refused naming backticks."""
     d = BigQueryDialect(side="A")
     d.project = "p"
     with pytest.raises(ValueError, match="backticks"):
@@ -154,6 +163,7 @@ def test_a_misplaced_backtick_is_refused_naming_backticks():
 
 @pytest.fixture(scope="module")
 def client(bigquery_url):
+    """A BigQuery client and a list of tables to delete afterwards."""
     from google.cloud import bigquery
 
     project, dataset, location = parse_bigquery_url(bigquery_url)
@@ -258,6 +268,7 @@ def test_each_literal_renders_exactly_its_spec(client):
 
 @pytest.mark.bigquery
 def test_geography_points_stored_differently_render_differently(client):
+    """Two GEOGRAPHY points one ulp apart render differently, equal ones alike."""
     c, *_ = client
     sql = BigQueryDialect().normalize(_column("g", "GEOGRAPHY"))
     got = [

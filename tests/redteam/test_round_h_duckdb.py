@@ -456,7 +456,7 @@ def test_a_view_needing_an_extension_fails_without_installing_it(tmp_path):
         "else:\n    print('RAN')\n"
     )
     env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
-    out = subprocess.run(
+    out = subprocess.run(  # noqa: S603 - fixed script, this interpreter
         [sys.executable, "-c", code, path],
         env=env,
         capture_output=True,
@@ -503,7 +503,7 @@ def test_a_file_held_by_a_writer_process_names_the_side(tmp_path):
         tmp_path, "held", "create table t (id int)", "insert into t values (1)"
     )
     code = "import duckdb, sys, time\nc = duckdb.connect(sys.argv[1])\nprint('ok', flush=True)\ntime.sleep(60)\n"
-    writer = subprocess.Popen(
+    writer = subprocess.Popen(  # noqa: S603 - fixed script, this interpreter
         [sys.executable, "-c", code, ref], stdout=subprocess.PIPE, text=True
     )
     try:
@@ -1056,7 +1056,7 @@ def test_a_writer_cannot_change_the_file_during_a_diff(tmp_path):
     a, b = open_duckdb(p, "A"), open_duckdb(q, "B")
     try:
         code = "import duckdb, sys\ncon = duckdb.connect(sys.argv[1])\ncon.execute('delete from t')\nprint('WROTE')\n"
-        out = subprocess.run(
+        out = subprocess.run(  # noqa: S603 - fixed script, this interpreter
             [sys.executable, "-c", code, p], capture_output=True, text=True, timeout=120
         )
         assert "WROTE" not in out.stdout

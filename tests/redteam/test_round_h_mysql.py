@@ -59,6 +59,7 @@ def tables() -> Iterator[Callable[..., str]]:
     made: list[tuple[str, str]] = []
 
     def make(url: str, tag: str, ddl: str, *statements: Any) -> str:
+        """Create the table on `url`, run `statements` into it, return its name."""
         name = f"rth_mysql_{tag}_{RUN}"
         conn = mysql_connect(url)
         cur = conn.cursor()
@@ -111,6 +112,7 @@ def pg_table(pg_url) -> Iterator[Callable[..., str]]:
     made: list[str] = []
 
     def make(tag: str, ddl: str, *statements: str) -> str:
+        """Create the qualified table, run `statements` into it, return its name."""
         name = f"rth_mysql.{tag}_{RUN}"
         conn.execute(f"drop table if exists {name}")
         made.append(name)
@@ -143,6 +145,7 @@ def _init_hook(monkeypatch, *statements: str) -> None:
     real = MySQLConnectionAbstract._post_connection
 
     def post_connection(self) -> None:
+        """Run the hostile statements, then the connector's own setup."""
         for s in statements:
             self._execute_query(s)
         real(self)
@@ -339,6 +342,7 @@ def test_rt_hm9_enum_without_an_invalid_value_equals_text(
 
 
 def test_rt_hm2_two_different_emoji_in_ucs2_are_not_equal(tables, mysql_url):
+    """RT-HM2: two different emoji stored as ucs2 surrogates are not equal."""
     r = _mysql_pair(
         tables,
         mysql_url,
@@ -352,6 +356,7 @@ def test_rt_hm2_two_different_emoji_in_ucs2_are_not_equal(tables, mysql_url):
 
 @pytest.mark.sample_check_may_disagree
 def test_rt_hm2_ucs2_value_with_a_surrogate_is_not_null(tables, mysql_url):
+    """RT-HM2: a ucs2 value holding a lone surrogate is not equal to NULL."""
     r = _mysql_pair(
         tables,
         mysql_url,
@@ -424,6 +429,7 @@ def test_a_read_only_replica_is_diffed_normally(root80, tables):
 
 
 def test_rt_hm4_zerofill_integer_equals_the_same_plain_integer(tables, mysql_url):
+    """RT-HM4: a ZEROFILL integer renders as the plain integer, not padded."""
     ta = tables(mysql_url, "zf_a", "id int primary key, v int(8) zerofill",
                 "insert into {t} values (1, 5), (2, 7)")  # fmt: skip
     tb = tables(mysql_url, "zf_b", "id int primary key, v int",
@@ -435,6 +441,7 @@ def test_rt_hm4_zerofill_integer_equals_the_same_plain_integer(tables, mysql_url
 
 
 def test_rt_hm4_zerofill_integer_against_postgres(tables, pg_table, mysql_url, pg_url):
+    """RT-HM4: a ZEROFILL integer matches the same PostgreSQL integer."""
     r = _cross(
         tables, pg_table, mysql_url, pg_url,
         "id int primary key, v int(6) zerofill", ["insert into {t} values (1, 42), (2, 7)"],
@@ -793,6 +800,7 @@ def test_mysql_row_filters_that_could_escape_are_refused(mysql_url, where):
     ],
 )
 def test_rt_hm12_locking_and_into_clauses_are_refused(mysql_url, where):
+    """RT-HM12: a locking or INTO clause in a row filter is refused."""
     d = get_dialect(mysql_url, side="A")
     try:
         with pytest.raises(ValueError, match=r"side A.*row filter"):
@@ -811,6 +819,7 @@ def test_rt_hm12_locking_and_into_clauses_are_refused(mysql_url, where):
     ],
 )
 def test_rt_hm12_the_words_in_strings_and_names_are_fine(mysql_url, where):
+    """RT-HM12: the same words inside strings and names do not trip the guard."""
     d = get_dialect(mysql_url, side="A")
     try:
         d.check_where(where)
@@ -1053,6 +1062,7 @@ VERSION_CASES = [
     ("label", "col", "va", "vb"), VERSION_CASES, ids=[c[0] for c in VERSION_CASES]
 )
 def test_rt_hm1_hm2_on_every_version(tables, url, label, col, va, vb):
+    """RT-HM1/HM2 hold on every MySQL version listed in the environment."""
     r = _mysql_pair(
         tables, url, f"id int primary key, {col}",
         [f"insert into {{t}} values (1, {va}), (2, 'same')"],
