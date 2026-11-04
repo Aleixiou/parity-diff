@@ -517,6 +517,21 @@ FOUND_PAIRS = [
     ("STRUCT(a VARCHAR)[]", "[{'a': 'x, y'}]", "[{'a': 'x'}, {'a': 'y'}]"),
     ("ENUM('a, b', 'a', 'b')[]", "['a, b']", "['a', 'b']"),
     ("GEOMETRY", "'POINT(1 2)'::geometry", "'POINT(1 3)'::geometry"),
+    ("DOUBLE[]", "['nan'::double]", "['inf'::double]"),
+    ("DOUBLE[]", "['nan'::double]", "[NULL]"),
+    ("FLOAT[]", "['nan'::float]", "[NULL]"),
+    ("TIMESTAMP_S[]", "['0001-01-01 00:00:00']", "['0001-01-01 00:00:01']"),
+    ("TIMESTAMP_MS[]", "['9999-12-31 23:59:59.999']", "['9999-12-31 23:59:59.998']"),
+    ("TIMESTAMPTZ[]", "['infinity']", "['-infinity']"),
+    ("DATE[]", "['0001-01-01 (BC)']", "['0001-01-01']"),
+    ("DECIMAL(38,30)[]", "[1.000001]", "[1.000002]"),
+    ("VARCHAR[]", "[chr(0)]", "['']"),
+    ("VARCHAR[]", "['\\N']", "[NULL]"),
+    ("BLOB[]", "[NULL]", "['\\x5CN'::blob]"),
+    ("INTERVAL[]", "[interval '1 day']", "[interval '24 hours']"),
+    ("BOOLEAN[]", "[true, false]", "[false, true]"),
+    ("ENUM('a','b')[]", "[NULL]", "['a']"),
+    ("BIT[]", "[NULL]", "['0'::bit]"),
 ]
 
 
@@ -747,6 +762,53 @@ def test_a_fixed_size_decimal_array_is_compared(tmp_path, typ):
     """A fixed-size array of decimals: a changed element is found."""
     result = diff_pair(tmp_path, typ, "[1.10, 2]", "[1.20, 2]")
     assert found(result) == ONE
+
+
+@pytest.mark.parametrize(
+    ("schema", "table"),
+    [("main", 'we"ird tab'), ("my schema", "Ünï 表"), ("main", "select"), ("SELECT", "FROM"), ("main", "ORDERS"), ("main", " lead")],
+)
+def test_odd_schema_and_table_names(tmp_path, schema, table):
+    """Quotes, spaces, Unicode, reserved words, upper case, a leading space;
+    the key matched case-insensitively (`--key id` for column "Id")."""
+    qs = '"' + schema.replace('"', '""') + '"'
+    qt = '"' + table.replace('"', '""') + '"'
+    st = (
+        f"create schema if not exists {qs}",
+        f'create table {qs}.{qt} ("Id" int, "v a" varchar)',
+        f"insert into {qs}.{qt} select i, 'v' || i from range(1, 11) r(i)",
+    )
+    pa = duck_file(tmp_path, "a", *st)
+    pb = duck_file(tmp_path, "b", *st, f"update {qs}.{qt} set \"v a\" = 'x' where \"Id\" = 3")
+    name = f"{schema}.{table}"
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), name, name, key="id")
+    assert found(result) == [(3, "different", ("v a",))]
+
+
+def test_a_table_name_with_a_dot_is_refused_clearly(tmp_path):
+    """DuckDB allows `"a.b"`; the tool splits on dots and refuses, naming
+    the side - a limitation, never a different table read."""
+    p = duck_file(tmp_path, "a", 'create table "a.b" (id int)', 'insert into "a.b" values (1)')
+    with pytest.raises(ValueError, match=r"\[side A: duckdb\].*3 dot-separated parts"):
+        run_diff(open_duckdb(p, "A"), open_duckdb(p, "B"), "main.a.b", "main.a.b")
+
+
+def test_a_writer_cannot_change_the_file_during_a_diff(tmp_path):
+    """The read-only side holds the file: a writer process started mid-run
+    cannot open it, so the walk sees one version (DuckDB's snapshot)."""
+    p = duck_file(tmp_path, "a", "create table t (id int, v int)", "insert into t select i, i from range(1, 101) r(i)")
+    q = duck_file(tmp_path, "b", "create table t (id int, v int)", "insert into t select i, i from range(1, 101) r(i)", "update t set v = 0 where id = 50")
+    a, b = open_duckdb(p, "A"), open_duckdb(q, "B")
+    try:
+        code = "import duckdb, sys\ncon = duckdb.connect(sys.argv[1])\ncon.execute('delete from t')\nprint('WROTE')\n"
+        out = subprocess.run([sys.executable, "-c", code, p], capture_output=True, text=True, timeout=120)
+        assert "WROTE" not in out.stdout
+        from parity.engine import diff
+        result = diff(a, b, "main.t", "main.t", key="id")
+    finally:
+        a.close()
+        b.close()
+    assert found(result) == [(50, "different", ("v",))]
 
 
 def test_a_700_column_table_with_odd_names_and_5mb_rows(tmp_path):
@@ -983,6 +1045,31 @@ def test_every_windows_spelling_of_the_path_finds_the_change(two_files):
         assert code == 1, (url, err)
         diffs = json.loads(out)["differences"]
         assert [(d["key"], d["kind"]) for d in diffs] == [(5, "different")], url
+
+
+def test_cli_exit_codes_and_json_follow_the_filter(two_files):
+    """Row 5 differs. Filtered past it: exit 0, identical, the filter in the
+    JSON. Filtered onto it: exit 1, exactly row 5. --quiet prints nothing on
+    stdout but keeps the code."""
+    base, chg = two_files
+    common = ["diff", "--a", "duckdb:///" + base, "--a-table", "t", "--b", "duckdb:///" + chg,
+              "--b-table", "t", "--key", "id"]
+    code, out, err = run_cli(*common, "--where", "id > 5", "--json")
+    j = json.loads(out)
+    assert code == 0 and j["identical"] is True and j["where_a"] == "id > 5", err
+    code, out, err = run_cli(*common, "--where", "id <= 5", "--json")
+    j = json.loads(out)
+    assert code == 1 and [(d["key"], d["kind"]) for d in j["differences"]] == [(5, "different")]
+    code, out, _ = run_cli(*common, "--quiet")
+    assert code == 1 and out == ""
+
+
+def test_a_quoted_windows_path_is_refused_clearly(two_files):
+    """Explorer's "Copy as path" adds quotes: a clear 'not found' naming the
+    side and the path, exit 2."""
+    base, chg = two_files
+    code, _, err = _cli_diff("duckdb:///" + base, 'duckdb:///"' + chg + '"')
+    assert code == 2 and "[side B: duckdb] database file not found" in err
 
 
 def test_a_path_with_spaces_unicode_and_a_hash_opens(tmp_path, two_files):
