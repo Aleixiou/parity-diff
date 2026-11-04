@@ -206,7 +206,58 @@ EXTRA_DDL: dict[str, dict[str, Callable[[bool], str]]] = {
         "duckdb": lambda key: "json",
         "mysql": lambda key: "json",
     },
+    # The same logical type in another native type: what a migration does.
+    "small": {
+        "postgres": lambda key: "smallint",
+        "duckdb": lambda key: "smallint",
+        "mysql": lambda key: "smallint",
+        "mssql": lambda key: "smallint",
+        "bigquery": lambda key: "INT64",
+    },
+    "tiny": {
+        "postgres": lambda key: "smallint",
+        "duckdb": lambda key: "utinyint",
+        "mysql": lambda key: "tinyint unsigned",
+        "mssql": lambda key: "tinyint",
+        "bigquery": lambda key: "INT64",
+    },
+    "ubig": {  # only where the engine has a 64-bit unsigned integer
+        "duckdb": lambda key: "ubigint",
+        "mysql": lambda key: "bigint unsigned",
+    },
+    "char": {
+        "postgres": lambda key: "char(12)",
+        "duckdb": lambda key: "varchar",
+        "mysql": lambda key: "char(12)",
+        "mssql": lambda key: "nchar(12)",
+        "bigquery": lambda key: "STRING",
+    },
+    "ascii": {
+        "postgres": lambda key: "varchar(200)",
+        "duckdb": lambda key: "varchar",
+        "mysql": lambda key: "varchar(200) character set latin1",
+        "mssql": lambda key: "varchar(200)",
+        "bigquery": lambda key: "STRING",
+    },
+    "money": {
+        "postgres": lambda key: "numeric(19,4)",
+        "duckdb": lambda key: "decimal(19,4)",
+        "mysql": lambda key: "decimal(19,4)",
+        "mssql": lambda key: "money",
+        "bigquery": lambda key: "NUMERIC(19,4)",
+    },
+    "ts3": {
+        "postgres": lambda key: "timestamp(3)",
+        "duckdb": lambda key: "timestamp_ms",
+        "mysql": lambda key: "datetime(3)",
+        "mssql": lambda key: "datetime2(3)",
+        "bigquery": lambda key: "DATETIME",
+    },
 }
+
+#: Kinds whose values are integers / exact decimals / naive timestamps / text.
+INT_LIKE = {"int": 2**31, "bigint": 2**63, "small": 2**15, "tiny": 256, "ubig": 2**64}
+TEXT_LIKE = {"text", "char", "ascii"}
 
 
 def _snowflake_ddl(c: Col) -> str:
@@ -225,6 +276,12 @@ def _snowflake_ddl(c: Col) -> str:
         "time": "time(6)",
         "binary": "binary",
         "uuid": "varchar(36)",
+        "small": "smallint",
+        "tiny": "number(3,0)",
+        "char": "varchar",
+        "ascii": "varchar",
+        "money": "number(19,4)",
+        "ts3": "timestamp_ntz(3)",
     }[c.kind]
 
 
@@ -274,7 +331,8 @@ EDGE_TEXT = [
 def gen_value(rng: random.Random, c: Col, engines: set[str], fs: int, known: set[str]):
     """One value for column `c`, biased towards edges every engine can store."""
     k = c.kind
-    if k in ("time", "binary", "uuid", "json"):
+    if k in ("time", "binary", "uuid", "json", "small", "tiny", "ubig", "char",
+             "ascii", "money", "ts3"):
         return gen_extra(rng, k, engines)
     if k == "int":
         return rng.choice(
@@ -422,6 +480,30 @@ def gen_extra(rng: random.Random, k: str, engines: set[str]) -> Any:
         )
     if k == "json":
         return json_text(gen_json(rng))
+    if k == "small":
+        return rng.choice([0, 1, -1, 32767, -32768, rng.randint(-32768, 32767)])
+    if k == "tiny":
+        return rng.choice([0, 1, 255, 127, 128, rng.randint(0, 255)])
+    if k == "ubig":
+        return rng.choice([0, 1, 2**63 - 1, 2**63, 2**64 - 1, 2**53 + 1,
+                           rng.randint(0, 2**64 - 1)])
+    if k == "char":
+        # No trailing spaces: char(n) cannot hold them apart from padding.
+        v = rng.choice(["", "a", "A", " a", "abc", "é", "日本", "x" * 12, "a b",
+                        "".join(rng.choice("abcXYZ 0é") for _ in range(rng.randint(0, 12)))])
+        return v.rstrip(" ")
+    if k == "ascii":
+        return rng.choice(["", " ", "a", "A", "a ", "it's", "back\\slash", "%_",
+                           "".join(chr(rng.randint(32, 126)) for _ in range(rng.randint(0, 30)))])
+    if k == "money":
+        top = 922337203685476  # money max is ...477.5807
+        return Decimal(rng.choice([0, 1, -1, top, -top, rng.randint(-top, top),
+                                   rng.randint(-10**6, 10**6)])) + Decimal(
+            rng.choice([0, 5, 9999, 5000, rng.randint(0, 9999)])
+        ).scaleb(-4)
+    if k == "ts3":
+        base = dt.datetime(1900, 1, 1) + dt.timedelta(seconds=rng.randint(0, 6 * 10**9))
+        return base.replace(microsecond=rng.choice([0, 1, 999, 500, rng.randint(0, 999)]) * 1000)
     raise AssertionError(k)
 
 
@@ -747,10 +829,25 @@ def _mutate_cell(rng: random.Random, op: str, c: Col, v: Any, fs: int, engines: 
             return _f32(nv) if k == "real" else nv
         if k in ("int", "bigint"):
             return _SKIP
-    if op == "int_bump" and k in ("int", "bigint") and v is not None:
-        lim = 2**31 if k == "int" else 2**63
+    if op == "int_bump" and k in INT_LIKE and v is not None:
+        lim = INT_LIKE[k]
+        lo = 0 if k in ("tiny", "ubig") else -lim
         nv = v + rng.choice([1, -1])
-        return nv if -lim <= nv < lim else _SKIP
+        return nv if lo <= nv < lim else _SKIP
+    if op in ("num_visible", "num_invisible") and k == "money" and v is not None:
+        step = Decimal(1).scaleb(-min(fs, 4)) if op == "num_visible" else _SKIP
+        if step is _SKIP or fs > 4:
+            return _SKIP
+        nv = v + step
+        return nv if abs(nv) < Decimal("922337203685477.5807") else _SKIP
+    if op == "ts_micro" and k == "ts3" and v is not None:
+        return v + dt.timedelta(milliseconds=rng.choice([1, -1]))
+    if op == "case" and k in ("char", "ascii") and v:
+        nv = v.swapcase()
+        return nv if nv != v else _SKIP
+    if op == "space" and k in ("char", "ascii") and v is not None:
+        nv = " " + v if k == "char" else rng.choice([v + " ", " " + v])
+        return nv if len(nv) <= 12 or k == "ascii" else _SKIP
     if op == "case" and k == "text" and v:
         nv = v.swapcase()
         return nv if nv != v else _SKIP
@@ -924,6 +1021,14 @@ def logical(v: Any, kind: str, fs: int) -> Any:
     """Reduce a fetched value to what the comparison is *documented* to see."""
     if v is None:
         return None
+    if kind == "money":
+        return ("num", num_text(v, fs))
+    if kind in ("small", "tiny", "ubig"):
+        return int(v)
+    if kind == "ts3" and isinstance(v, dt.datetime):
+        return v.replace(tzinfo=None)
+    if kind == "char":
+        return v.rstrip(" ")  # char(n) pads; the rules trim (CLAUDE.md 4.2)
     if kind in ("dec", "double", "real"):
         if kind == "real":
             v = _f32(float(v))
@@ -1212,7 +1317,7 @@ class Duck(Engine):
         """Turn a Python value into what this driver binds losslessly."""
         if c.kind == "tstz" and v is not None:
             return v.isoformat(sep=" ")
-        if c.kind == "dec" and v is not None:
+        if c.kind in ("dec", "money") and v is not None:
             # The driver binds a Python Decimal through DOUBLE, which loses
             # digits past 2^53 silently; text casts to DECIMAL exactly.
             return format(v, "f")
@@ -1392,12 +1497,12 @@ class MSSQL(Engine):
             return None
         if c.kind == "tstz":
             return v.isoformat(sep=" ")
-        if c.kind == "ts":
+        if c.kind in ("ts", "ts3"):
             return v.isoformat(sep=" ")
         if c.kind == "date":
             # The driver binds a date as datetime, whose range starts in 1753.
             return v.isoformat()
-        if c.kind == "dec":
+        if c.kind in ("dec", "money"):
             return format(v, "f")
         if c.kind == "real":
             return float(v)
@@ -1415,7 +1520,7 @@ class MSSQL(Engine):
         # timestamp lands in the column type exactly.
         ph = ", ".join(
             f"cast(? as {ddl_type('mssql', c, False)})"
-            if c.kind in ("dec", "ts", "tstz", "date", "time", "uuid")
+            if c.kind in ("dec", "ts", "tstz", "date", "time", "uuid", "money", "ts3")
             else "?"
             for c in cols
         )
@@ -1440,8 +1545,10 @@ class MSSQL(Engine):
         """How the oracle selects one column so its value survives the driver."""
         if c.kind == "tstz":
             return f"convert(varchar(40), {self.ident(name)}, 127)"
-        if c.kind == "ts":
+        if c.kind in ("ts", "ts3"):
             return f"convert(varchar(40), {self.ident(name)}, 126)"
+        if c.kind == "money":  # money's default text has two decimals
+            return f"convert(varchar(80), cast({self.ident(name)} as decimal(19,4)))"
         if c.kind == "dec":
             return f"convert(varchar(80), {self.ident(name)})"
         if c.kind == "real":
@@ -1462,9 +1569,9 @@ class MSSQL(Engine):
                     continue
                 if c.kind == "tstz":
                     r[i] = dt.datetime.fromisoformat(r[i].replace("Z", "+00:00"))
-                elif c.kind == "ts":
+                elif c.kind in ("ts", "ts3"):
                     r[i] = dt.datetime.fromisoformat(r[i])
-                elif c.kind == "dec":
+                elif c.kind in ("dec", "money"):
                     r[i] = Decimal(r[i])
                 elif c.kind == "time" and isinstance(r[i], str):
                     r[i] = dt.time.fromisoformat(r[i])
@@ -1520,9 +1627,9 @@ class BigQuery(Engine):
             """One value as the JSON a BigQuery load job accepts."""
             if v is None:
                 return None
-            if c.kind == "dec":
+            if c.kind in ("dec", "money"):
                 return format(v, "f")
-            if c.kind in ("date", "ts"):
+            if c.kind in ("date", "ts", "ts3"):
                 return v.isoformat()
             if c.kind == "tstz":
                 return v.astimezone(UTC).isoformat()

@@ -111,9 +111,9 @@ class Snowflake(fh.Engine):
                 return bytes(v).hex()
             if c.kind in ("double", "real"):
                 return repr(float(v))
-            if c.kind == "dec":
+            if c.kind in ("dec", "money"):
                 return format(v, "f")
-            if c.kind in ("ts", "tstz", "date", "time"):
+            if c.kind in ("ts", "tstz", "date", "time", "ts3"):
                 return v.isoformat()
             if c.kind == "bool":
                 return "true" if v else "false"
@@ -214,6 +214,15 @@ def kinds_for(engines: set[str]) -> list[str]:
     out = [*fh.KINDS, "time", "binary", "uuid"]
     if engines <= JSON_OK:
         out.append("json")
+    # Native variants of the same logical types (smallint, tinyint, ubigint,
+    # char(n), latin1/varchar, money, millisecond timestamps), each where
+    # every engine of the pair has one. Half the weight of the core kinds.
+    variants = ["small", "tiny", "ubig", "char", "ascii", "money", "ts3"]
+    for k in variants:
+        if all(
+            e in fh.EXTRA_DDL[k] if e != "snowflake" else k != "ubig" for e in engines
+        ):
+            out.append(k)
     banned = set().union(*(NO_KIND.get(e, set()) for e in engines))
     return [k for k in out if k not in banned]
 
@@ -280,6 +289,8 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
             b_kind = "double"
         cols.append(Col(name, kind, b_kind=b_kind))
     keys = fh.gen_key(rng, key, n, engines)
+    if any(c.kind == "text" for c in key) and rng.random() < 0.4:
+        keys = hostile_text_keys(rng, key, keys)
     null_rate = rng.choice([0.0, 0.1, 0.3])
     rows = []
     for k in keys:
@@ -314,6 +325,47 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
     if rng.random() < 0.3:
         plan_where(rng, case)
     return case
+
+
+def hostile_text_keys(rng: random.Random, key: list[Col], keys: list[tuple]) -> list[tuple]:
+    """Text key parts that differ only by case, trailing or leading space,
+    tab, accent, normalisation form, a backslash or a separator - the keys a
+    case- or pad-insensitive collation would merge."""
+    import unicodedata
+
+    stems = ["a", "abc", "Straße", "é", "x y", "日本", "", "0", "İ", "ß"]
+
+    def variant(s: str) -> str:
+        return rng.choice(
+            [
+                s,
+                s.upper(),
+                s.swapcase(),
+                s + " ",
+                " " + s,
+                s + "\t",
+                s + "  ",
+                unicodedata.normalize("NFD", s),
+                s + "́",
+                s + "\\",
+                s + "\\s",
+                s + "\x1f",
+                s + "​",
+                s.casefold(),
+            ]
+        )
+
+    out, seen = [], set()
+    for k in keys:
+        k = list(k)
+        for j, c in enumerate(key):
+            if c.kind == "text":
+                k[j] = variant(rng.choice(stems))
+        t = tuple(k)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 EXTRA_OPS = ["time_micro", "bytes_tweak", "uuid_tweak", "json_tweak", "colswap", "keytweak"]
@@ -431,7 +483,7 @@ def _pred(rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]
     c = allc[j].on_b() if side == "B" else allc[j]
     q = ident(names[j])
     r = rng.random()
-    if c.kind in ("int", "bigint") and r < 0.8:
+    if c.kind in fh.INT_LIKE and r < 0.8:
         n = rng.choice([0, 1, -1, 5, 50, 100, 2**31 - 1])
         op = rng.choice([">", ">=", "<", "<=", "<>", "="])
         if rng.random() < 0.4:
@@ -440,7 +492,7 @@ def _pred(rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]
                 return f"mod({q}, {m}) = {rng.randrange(m)}", ("mod", j)
             return f"{q} % {m} = {rng.randrange(m)}", ("mod", j)
         return f"{q} {op} {n}", ("cmp", j)
-    if c.kind == "text" and r < 0.7:
+    if c.kind in fh.TEXT_LIKE and r < 0.7:
         lit = rng.choice(["", "a", "m", "x", "é", "it''s", "50%", "a_b", "日"])
         op = rng.choice(["<>", ">", "<", "=", "like"])
         if op == "like":
@@ -450,7 +502,7 @@ def _pred(rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]
         d = rng.choice(["2010-01-01", "2000-06-15", "1999-12-31"])
         lit = f"'{d}'" if eng == "mssql" else f"date '{d}'"
         return f"{q} >= {lit}", ("date", j)
-    if c.kind in ("dec", "double", "real") and r < 0.7:
+    if c.kind in ("dec", "double", "real", "money") and r < 0.7:
         return f"{q} > {rng.choice(['0', '0.5', '-1', '1e3'])}", ("num", j)
     if c.kind == "bool" and r < 0.5 and eng != "mssql":
         return f"{q}", ("bool", j)
@@ -748,6 +800,16 @@ def main() -> int:
                     logf.write(msg + "\n")
                     logf.flush()
                 continue
+            except Exception:  # a harness crash must not end the campaign
+                import traceback
+
+                tally["CRASH"] += 1
+                msg = f"[CRASH] seed={seed} {sa}->{sb}:\n{traceback.format_exc()[-1500:]}"
+                print(msg)
+                if logf:
+                    logf.write(msg + "\n")
+                    logf.flush()
+                continue
             v = out.verdict()
             tally[v] += 1
             tally["with_diffs"] += bool(out.expected)
@@ -756,8 +818,11 @@ def main() -> int:
             if v != "OK":
                 bad += 1
                 if not args.no_shrink and v != "ERROR":
-                    small = shrink_h(case, x, y, lambda o, v=v: o.verdict() == v)
-                    out = run_case_h(small, x, y)
+                    try:
+                        small = shrink_h(case, x, y, lambda o, v=v: o.verdict() == v)
+                        out = run_case_h(small, x, y)
+                    except Exception as exc:  # keep the unshrunk repro
+                        print(f"    (shrink failed: {type(exc).__name__}: {exc})"[:400])
                 text = report(out)
                 print(text)
                 if logf:

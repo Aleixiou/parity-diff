@@ -115,6 +115,39 @@ def test_the_round_h_harness_catches_a_planted_false_match(monkeypatch):
     assert {"FALSE MATCH", "MISSED DIFF", "SAMPLE FAIL"} & set(verdicts), verdicts
 
 
+@pytest.mark.sample_check_may_disagree
+@pytest.mark.parametrize(
+    ("where_a", "where_b"),
+    [
+        ("random() < 0.5", "random() < 0.5"),
+        ("random() < 0.999", None),
+        ("id % 2 = 0 or random() < 0.01", "id % 2 = 0"),
+    ],
+)
+def test_a_filter_that_changes_between_queries_is_never_identical(
+    tmp_path, where_a, where_b
+):
+    """A `--where` whose rows change from one query to the next (here a
+    random() predicate) selects a different row set at every level of the
+    walk. Identical tables (planted: the filter itself differs per query)
+    must never come back identical - measured 59 of 60 runs unexplained and
+    sample-failed, every one reported with differences."""
+    rows = ", ".join(f"({i}, {i * 2})" for i in range(3000))
+    for _ in range(3):
+        a = _duck(tmp_path, f"a{_}", "id int, v int", rows, side="A")
+        b = _duck(tmp_path, f"b{_}", "id int, v int", rows)
+        try:
+            r = fx.diff(
+                a, b, "t", "t", key="id", where_a=where_a, where_b=where_b,
+                threshold=50, bisection_factor=4,
+            )
+        finally:
+            a.close()
+            b.close()
+        assert not r.identical
+        assert r.diffs or r.unexplained
+
+
 def test_fresh_random_doubles_render_the_spec_on_duckdb(tmp_path):
     """The FLOAT canonical form on 3,000 fresh doubles (the deep run takes
     100k per engine, `float_fresh.py`), with a planted difference: the
