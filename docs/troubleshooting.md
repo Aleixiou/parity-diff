@@ -59,7 +59,8 @@ parity: [side A] key column ['status'] in orders contains 14,285 NULL value(s). 
 
 `--key` must name columns that identify one row on both sides. Key names are
 matched case-insensitively (`id` matches `ID`). If one column is not unique,
-give several: `--key customer_id,line_no`. Uniqueness is counted by bytes, so
+give several: `--key customer_id,line_no`. A PostgreSQL composite key
+counts as NULL only when the value itself is NULL: `row(1, NULL)` is a key. Uniqueness is counted by bytes, so
 on a case-insensitive collation `'a'` and `'A'` are two keys, as they should
 be. A table without any unique key cannot be compared one-to-one; diff a view
 that adds one (for example a row number over a deterministic order) only if
@@ -177,6 +178,9 @@ parity: [side A] no dialect for scheme 'postgress'. Supported: duckdb, postgres,
   connection string needs a user: SQL authentication (user:password@host) is
   the only kind verified so far`. A named instance goes in
   `?instance=SQLEXPRESS`; `?login_timeout=30` waits longer for a slow server.
+- **PostgreSQL gives up connecting after 30 seconds** (an unreachable host or
+  port used to hang with no output). `?connect_timeout=120` in the URL waits
+  longer.
 
 ## Columns refused
 
@@ -190,6 +194,33 @@ parity: --columns and --exclude both name: ['x']
 
 As each says. A SQL Server table too wide to compile into one checksum query
 asks you to compare fewer columns per run with `--columns` / `--exclude`.
+
+```
+parity: [side A: postgres] column 'v' holds public.seg, whose text output is not known to be exact (two different values can print alike) and which this server cannot compare any other way (...); leave it out with --exclude, or compare an exact cast of it through a view
+✗ not compared, side A cannot read ['salary'] of public.staff: this login lacks SELECT on those columns (column-level privileges)
+```
+
+- **An extension type is refused** when its text output may print two
+  different values alike (contrib `seg` prints `123456789` and `123456788`
+  both as `1.23457e+08`) and PostgreSQL has no exact binary form of it to
+  compare instead - no send function, or the type sits inside an array,
+  composite or range. `--exclude` the column, or diff a view that casts it to
+  something exact (`lower(v)::numeric`, say). Extension types whose text is
+  exact (citext, hstore, ltree, isn, cube, PostGIS, pgvector) are compared as
+  before.
+- **Columns the login cannot read** (PostgreSQL column-level `GRANT SELECT
+  (a, b)`) are not compared, and the run is not identical. Grant SELECT on
+  the whole table, or `--exclude` them to make the gap deliberate.
+
+```
+parity: [side A: postgres] row filter "set_config('x', 'y', false) is not null" calls set_config(), which changes the session or acts outside the read - a filter may only select rows
+```
+
+A PostgreSQL row filter may not call functions that change session settings,
+take locks, sleep, notify, touch sequences or large objects, reach another
+server or run SQL given as a string. A user function doing any of that
+inside a filter or a view is caught after the walk: the run is then not
+identical, naming the setting that moved.
 
 ## Everything reads as different
 

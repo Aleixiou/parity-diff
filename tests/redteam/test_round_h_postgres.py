@@ -245,6 +245,90 @@ def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
+@pytest.mark.parametrize(
+    "w",
+    [
+        "pg_catalog.set_config('extra_float_digits', '-15', false) is not null",
+        "\"set_config\"('extra_float_digits', '-15', false) is not null",
+        "U&\"\\0073et_config\"('extra_float_digits', '-15', false) is not null",
+        "pg_sleep(1) is not null",
+        "pg_advisory_lock(1) is not null",
+        "query_to_xml('select 1', true, true, '') is not null",
+    ],
+)
+def test_rt_hp6_session_changing_filters_are_refused(schema, w):
+    _exec(ADMIN, f"create table {schema}.a (id int primary key)")
+    with pytest.raises(ValueError, match="row filter"):
+        _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.a", where_a=w, where_b=w)
+
+
+def test_rt_hp6_set_config_out_of_sight_is_never_identical(schema):
+    """A user function - which no name check can see into - that rewrites a
+    pin from inside the filter: the post-walk check makes it unexplained."""
+    for t in "ab":
+        _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
+    _exec(
+        ADMIN,
+        f"insert into {schema}.a values (1, 0.1), (2, 1e15 + 0.5)",
+        f"insert into {schema}.b values (1, 0.1), (2, 1e15)",
+        f"create function {schema}.f() returns bool language sql as "
+        "$$ select set_config('extra_float_digits', '-15', false) is not null $$",
+    )
+    w = f"{schema}.f()"
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", where_a=w, where_b=w)
+    assert not r.identical
+    assert any("extra_float_digits" in u for u in r.unexplained)
+    # Without it, the planted difference is found and nothing is unexplained.
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    assert [d.key for d in r.diffs] == [2] and not r.unexplained
+
+
+def test_rt_hp1_excluded_unreadable_column_is_a_note(schema):
+    role = _role(f"rth_postgres_cx_{RUN}")
+    _exec(
+        ADMIN,
+        f"grant usage on schema {schema} to rth_postgres_cx_{RUN}",
+        *[
+            f"create table {schema}.{t} (id int primary key, x text, secret text)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {schema}.{t} select g, 'v'||g, 's' from generate_series(1,50) g"
+            for t in "ab"
+        ],
+        f"update {schema}.b set x = 'D' where id = 3",
+        *[f"grant select (id, x) on {schema}.{t} to rth_postgres_cx_{RUN}" for t in "ab"],
+    )
+    try:
+        r = _diff(role, f"{schema}.a", role, f"{schema}.b")
+        assert [d.key for d in r.diffs] == [3]
+        assert any("cannot read ['secret']" in s for s in r.schema_differences)
+        r = _diff(role, f"{schema}.a", role, f"{schema}.b", exclude=["secret"])
+        assert [d.key for d in r.diffs] == [3] and not r.schema_differences
+        assert any("secret" in w for w in r.warnings)
+    finally:
+        _exec(
+            ADMIN,
+            f"drop owned by rth_postgres_cx_{RUN}",
+            f"drop role rth_postgres_cx_{RUN}",
+        )
+
+
+def test_inheritance_children_draw_a_caveat(schema):
+    _exec(
+        ADMIN,
+        f"create table {schema}.p (id int primary key, x text)",
+        f"create table {schema}.ch (check (id > 100)) inherits ({schema}.p)",
+        f"create table {schema}.b (id int primary key, x text)",
+        f"insert into {schema}.p values (1, 'a')",
+        f"insert into {schema}.ch values (101, 'b')",
+        f"insert into {schema}.b values (1, 'a')",
+    )
+    r = _diff(ADMIN, f"{schema}.p", ADMIN, f"{schema}.b")
+    assert [(d.key, d.kind) for d in r.diffs] == [(101, "only_in_a")]
+    assert any("inheritance children" in w and ".ch" in w for w in r.warnings)
+
+
 def test_where_and_map_postgres_quoting(schema):
     """E'', U&'', doubled quotes and casts work; $$ and backslash-quote are refused;
     a filter cannot close the parentheses it is wrapped in."""
@@ -323,6 +407,48 @@ def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
     )
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", key="k")
     assert [(d.key, d.kind) for d in r.diffs] == [('(1,"")', "only_in_a")]
+
+
+def test_rt_hp9_untrusted_type_is_compared_by_its_send_bytes(schema, monkeypatch):
+    """A base type outside the trusted list, with a send function, compares by
+    its bytes too (cube, taken off the list for the test); nested in an array
+    it is refused, naming the column."""
+    from parity.dialects import postgres_dialect
+
+    monkeypatch.setattr(
+        postgres_dialect,
+        "TRUSTED_EXTENSION_TYPES",
+        postgres_dialect.TRUSTED_EXTENSION_TYPES - {"cube"},
+    )
+    _exec(
+        ADMIN,
+        "create extension if not exists cube",
+        *[
+            f"create table {schema}.{t} (id int primary key, v cube, w text)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {schema}.{t} values (1, cube(1.5), 'x'), (2, cube(2), 'x'), "
+            "(3, NULL, 'x')"
+            for t in "ab"
+        ],
+        f"update {schema}.b set v = cube(2.0000001) where id = 2",
+        f"update {schema}.b set w = 'y' where id = 1",
+    )
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [
+        (1, ("w",)),
+        (2, ("v",)),
+    ]
+    _exec(
+        ADMIN,
+        *[f"create table {schema}.n{t} (id int primary key, v cube[])" for t in "ab"],
+        *[f"insert into {schema}.n{t} values (1, array[cube(1)])" for t in "ab"],
+    )
+    with pytest.raises(ValueError, match=r"column 'v' holds .*cube.*--exclude"):
+        _diff(ADMIN, f"{schema}.na", ADMIN, f"{schema}.nb")
+    r = _diff(ADMIN, f"{schema}.na", ADMIN, f"{schema}.nb", exclude=["v"])
+    assert r.identical
 
 
 def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
