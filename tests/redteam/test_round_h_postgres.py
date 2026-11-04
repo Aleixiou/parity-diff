@@ -274,7 +274,134 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
     assert p.returncode == 2 and "side A" in p.stderr
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HP8: a composite-type key with a NULL field, row(1, NULL), is "
+    "refused as 'contains 1 NULL value(s)': PostgreSQL's row IS NOT NULL is "
+    "false when any field is NULL, though the key itself is not NULL (unclear error)",
+)
+def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
+    _exec(ADMIN, f"create type {schema}.c as (a int, b text)",
+          *[f"create table {schema}.{t} (k {schema}.c, v int)" for t in "ab"],
+          f"insert into {schema}.a values (row(1, NULL), 1), (row(1, ''), 2)",
+          f"insert into {schema}.b values (row(1, NULL), 1)")
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", key="k")
+    assert [(d.key, d.kind) for d in r.diffs] == [('(1,"")', "only_in_a")]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HP9: unmapped types are compared by ::text, which is not always "
+    "injective - contrib seg prints 123456789 and 123456788 alike "
+    "('1.23457e+08') though PostgreSQL's own = calls them different (FALSE MATCH)",
+)
+def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
+    _exec(ADMIN, "create extension if not exists seg",
+          *[f"create table {schema}.{t} (id int primary key, v seg)" for t in "ab"],
+          f"insert into {schema}.a values (1, '1.5'), (2, '123456789')",
+          f"insert into {schema}.b values (1, '1.5'), (2, '123456788')")
+    assert not _exec(ADMIN, f"select a.v = b.v from {schema}.a a join {schema}.b b using (id) "
+                     "where id = 2")[0][0]
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    assert [d.key for d in r.diffs] == [2]
+
+
 # ------------------------------------------------- held (regression tests)
+
+
+def test_hostile_alter_role_set_defaults_do_not_move_the_verdict(schema):
+    """Every rendering setting at a hostile value, stored the way a real login
+    carries them (ALTER ROLE ... SET), and the planted values are still found -
+    including the ones each setting would hide - at every sample size."""
+    role = f"rth_postgres_hr_{RUN}"
+    url = _role(role)
+    s = schema
+    _exec(ADMIN, f"grant usage on schema {s} to {role}",
+          *[f"create table {s}.{t} (id int primary key, f float8, ts timestamptz, d date, "
+            "i interval, b bytea, t text, m money)" for t in "ab"],
+          *[f"insert into {s}.{t} select g, g * 0.1, timestamptz '2024-01-01' + g * interval '1 h', "
+            "date '2024-01-01' + g, g * interval '1 day', '\\x00ff', 'N', g "
+            "from generate_series(1, 2000) g" for t in "ab"],
+          f"update {s}.b set f = 1e15 + 0.5 where id = 1", f"update {s}.a set f = 1e15 where id = 1",
+          f"update {s}.b set ts = ts + interval '1 h' where id = 2",
+          f"update {s}.b set i = interval '1 mon' where id = 3", f"update {s}.a set i = interval '30 days' where id = 3",
+          f"update {s}.b set t = NULL where id = 4",
+          *[f"grant select on {s}.{t} to {role}" for t in "ab"])
+    for setting in ["extra_float_digits = -15", "IntervalStyle = sql_standard", "DateStyle = 'German, DMY'",
+                    "TimeZone = 'Asia/Kathmandu'", "bytea_output = escape",
+                    "standard_conforming_strings = off", "search_path = pg_temp, public",
+                    "idle_in_transaction_session_timeout = '1s'", "quote_all_identifiers = on",
+                    "default_transaction_isolation = serializable"]:
+        _exec(ADMIN, f"alter role {role} set {setting}")
+    try:
+        for sample in (0, 1, 50000):
+            r = _diff(url, f"{s}.a", url, f"{s}.b", verify_sample=sample)
+            assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [
+                (1, ("f",)), (2, ("ts",)), (3, ("i",)), (4, ("t",))], sample
+    finally:
+        _exec(ADMIN, f"drop owned by {role}", f"drop role {role}")
+
+
+def test_unmapped_and_temporal_keys(schema):
+    """Range, enum and composite keys stay distinct; a PostgreSQL 18 temporal
+    primary key (WITHOUT OVERLAPS) finds the planted period; two spellings of
+    one discrete range are one key, so a duplicate."""
+    s = schema
+    _exec(ADMIN, "create extension if not exists btree_gist",
+          f"create type {s}.e as enum ('x', 'X')", f"create type {s}.c as (a int, b text)")
+    for i, (t, k1, k2) in enumerate([
+        ("int4range", "'[1,5)'", "'[1,6)'"),
+        ("tstzrange", "'[2024-01-01,2024-02-01)'", "'[2024-01-01,2024-02-02)'"),
+        (f"{s}.e", "'x'", "'X'"),
+        (f"{s}.c", "row(1,'a b')", "row(1,'a  b')"),
+    ]):
+        _exec(ADMIN, f"create table {s}.a{i} (k {t}, v int)", f"create table {s}.b{i} (k {t}, v int)",
+              f"insert into {s}.a{i} values ({k1}, 1), ({k2}, 2)", f"insert into {s}.b{i} values ({k1}, 1)")
+        r = _diff(ADMIN, f"{s}.a{i}", ADMIN, f"{s}.b{i}", key="k")
+        assert [d.kind for d in r.diffs] == ["only_in_a"], t
+    _exec(ADMIN, f"create table {s}.dup (k int4range, v int)",
+          f"insert into {s}.dup values ('[1,5)', 1), ('(0,4]', 2)")
+    with pytest.raises(ValueError, match="not unique"):
+        _diff(ADMIN, f"{s}.dup", ADMIN, f"{s}.dup", key="k")
+    _exec(ADMIN,
+          *[f"create table {s}.t{t} (id int, valid tstzrange, x text, "
+            "primary key (id, valid without overlaps))" for t in "ab"],
+          *[f"insert into {s}.t{t} values (1, '[2024-01-01,2024-02-01)', 'a'), "
+            "(1, '[2024-02-01,2024-03-01)', 'b'), (2, '[2024-01-01,)', 'c')" for t in "ab"],
+          f"update {s}.tb set x = 'B' where id = 1 and lower(valid) = '2024-02-01'")
+    r = _diff(ADMIN, f"{s}.ta", ADMIN, f"{s}.tb", key=["id", "valid"])
+    assert [(d.kind, d.columns) for d in r.diffs] == [("different", ["x"])]
+    assert "2024-02-01" in str(r.diffs[0].key)
+
+
+def test_foreign_table_and_bisection_extremes(schema):
+    """A postgres_fdw foreign table reads like the table it mirrors (the remote
+    session's own settings do not reach the canonical text); every bisection
+    extreme finds the planted 1 us change and ignores a change below the scale."""
+    s = schema
+    srv = f"rth_postgres_loop_{RUN}"
+    _exec(ADMIN, "create extension if not exists postgres_fdw",
+          f"create server {srv} foreign data wrapper postgres_fdw "
+          "options (host '127.0.0.1', port '5432', dbname 'rth')",
+          f"create user mapping for current_user server {srv} options (user 'rth', password 'rth')",
+          *[f"create table {s}.{t} (id int primary key, x text, f float8, ts timestamptz, "
+            "i interval, n numeric)" for t in "ab"],
+          *[f"insert into {s}.{t} select g, 'v'||g, g * 0.1 + 1e-9, "
+            "timestamptz '2024-06-01 12:00+02' + g * interval '1 min', "
+            "g * interval '1 mon 1 day', g / 7.0 from generate_series(1, 5000) g" for t in "ab"],
+          f"update {s}.b set f = f + 1e-15 * f where id = 10",
+          f"update {s}.b set ts = ts + interval '1 us' where id = 20",
+          f"create foreign table {s}.fb (id int, x text, f float8, ts timestamptz, i interval, "
+          f"n numeric) server {srv} options (schema_name '{s}', table_name 'b')")
+    try:
+        r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.fb")
+        assert [(d.key, d.columns) for d in r.diffs] == [(20, ["ts"])]
+        for factor, threshold in [(2, 1), (1000, 1), (2, 100000)]:
+            r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b",
+                      bisection_factor=factor, threshold=threshold)
+            assert [(d.key, d.columns) for d in r.diffs] == [(20, ["ts"])]
+    finally:
+        _exec(ADMIN, f"drop server if exists {srv} cascade")
 
 
 @pytest.mark.parametrize(
