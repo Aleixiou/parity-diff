@@ -45,16 +45,21 @@ MY = "src/parity/dialects/mysql_dialect.py"
 MS = "src/parity/dialects/mssql_dialect.py"
 BQ = "src/parity/dialects/bigquery_dialect.py"
 SF = "src/parity/dialects/snowflake_dialect.py"
+OR = "src/parity/dialects/oracle_dialect.py"
 
 #: The existing suite only - the "before" score. The redteam kills are run
 #: separately (``-- tests/redteam``) for the "after" score.
 #: The docstring lint reads the *real* tree (not the mutated copy), so it can
 #: never see a mutation - but it can fail on work in progress under tests/ and
 #: masquerade as a kill. Deselected here; the normal suite still runs it.
+#: Likewise the risk file's stamp check fails on *any* change under src/, so
+#: it "killed" every mutation the real tests let survive (seen: P3, after a
+#: 13-minute run, killed by it alone).
 T_SUITE = [
     "tests",
     "--ignore=tests/redteam",
     "--deselect=tests/test_encoding.py::test_every_function_has_a_docstring",
+    "--deselect=tests/test_risk_doc.py::test_the_risk_file_was_reviewed_for_the_current_source",
 ]
 
 
@@ -105,6 +110,7 @@ _BY_FILE = {
         "test_mssql_offline.py",
         "test_encoding.py",
     ],
+    OR: ["test_oracle_offline.py", "test_oracle.py", "test_encoding.py"],
 }
 
 
@@ -123,9 +129,16 @@ def m(
     new: str,
     false_match: bool = True,
     more: tuple[tuple[str, str, str], ...] = (),
+    tests: tuple[str, ...] = (),
 ) -> Mutation:
-    """Build a one-edit mutation (plus `more` edits applied with it)."""
-    return Mutation(id_, why, [(file, old, new), *more], _tests_for(file), false_match)
+    """Build a one-edit mutation (plus `more` edits applied with it).
+
+    `tests` adds files to the selection - for a defence pinned only by a
+    live red-team test, which `T_SUITE` leaves out.
+    """
+    return Mutation(
+        id_, why, [(file, old, new), *more], [*_tests_for(file), *tests], false_match
+    )
 
 
 # fmt: off
@@ -178,11 +191,14 @@ MUTATIONS: list[Mutation] = [
     m("E18", "NULL-key refusal removed", ENGINE,
       "            if ks.has_null_keys:\n", "            if False:\n"),
     m("E19", "a queued sub-range is occasionally dropped", ENGINE,
-      "                s_lo, s_hi = queue.pop()\n",
-      "                s_lo, s_hi = queue.pop()\n"
+      "                s_lo, s_hi, parent = queue.pop()\n",
+      "                s_lo, s_hi, parent = queue.pop()\n"
       "                if len(queue) % 7 == 3:\n                    queue.pop()\n"),
+    # The shared-column set's copy, not --map's validation of the same name.
     m("E20", "--exclude ignored", ENGINE,
-      "    excluded = {e.casefold() for e in exclude}\n", "    excluded = set()\n",
+      "    both = (set(cols_a) & set(cols_b)) - key_folds\n"
+      "    excluded = {e.casefold() for e in exclude}\n",
+      "    both = (set(cols_a) & set(cols_b)) - key_folds\n    excluded = set()\n",
       false_match=False),
     m("E21", "-only-on-one-side warning dropped", ENGINE,
       '            warnings.append(f"not compared, present only on side {side}: {names}")\n',
@@ -205,18 +221,19 @@ MUTATIONS: list[Mutation] = [
     m("B5", "NULL sentinel is the empty string", BASE,
       'NULL_SENTINEL = "\\\\N"', 'NULL_SENTINEL = ""'),
     m("B6", "checksum WHERE upper bound excludes hi-1", BASE,
-      "and {k} <= {self.int_literal(hi - 1)} ", "and {k} < {self.int_literal(hi - 1)} "),
+      'f"{k} <= {self.int_literal(hi - 1)}",', 'f"{k} < {self.int_literal(hi - 1)}",'),
     m("B7", "checksum WHERE lower bound exclusive", BASE,
-      "where {k} >= {self.int_literal(lo)} and", "where {k} > {self.int_literal(lo)} and"),
+      'f"{k} >= {self.int_literal(lo)}",', 'f"{k} > {self.int_literal(lo)}",'),
     m("B8", "key not folded into the row checksum", BASE,
       # `or ["''"]`: with no comparable columns the key was the only part, and
       # an empty concat_ws is a syntax error (row_text's constant fallback).
       "            [*self._key_parts(key), *(self.normalize(c) for c in columns)]\n",
       "            [*(self.normalize(c) for c in columns)] or [\"''\"]\n"),
     m("B9", "fetch_range upper bound excludes hi-1", BASE,
-      "and {bucket} <= {hi - 1} order by", "and {bucket} < {hi - 1} order by"),
+      'f"{bucket} <= {hi - 1}")', 'f"{bucket} < {hi - 1}")'),
     m("B10", "fetch_range duplicate-key guard removed", BASE,
-      "            if rk in out:\n", "            if False:\n"),
+      "            if rk in out:\n                # Second line of defence",
+      "            if False:\n                # Second line of defence"),
     m("B11", "key_stats counts NULL keys as non-null", BASE,
       'f"{non_null_sql}, {self.count_distinct_key(key, identity)} "',
       'f"{self.count()}, {self.count_distinct_key(key, identity)} "'),
@@ -243,7 +260,8 @@ MUTATIONS: list[Mutation] = [
              "from decimal import ROUND_HALF_EVEN, Context, Decimal"),),
       false_match=False),
     m("B18", "map_type: numeric not DECIMAL", BASE,
-      'if t in {"decimal", "numeric"}:', 'if t in {"decimal"}:', false_match=False),
+      'if t in {"decimal", "numeric", "money"}:', 'if t in {"decimal", "money"}:',
+      false_match=False),
     m("B19", "separator chr(31) -> chr(44) (comma)", BASE,
       '    "chr(31)"  # default', '    "chr(44)"  # default'),
     m("B20", "fetch_range returns only the first column", BASE,
@@ -256,8 +274,13 @@ MUTATIONS: list[Mutation] = [
       "expr = f\"case when {c} then 'true' else 'false' end\""),
     m("P2", "PG no coalesce (NULL drops out of concat_ws)", PG,
       'return f"coalesce({expr}, {self.null_sentinel_sql()})"', 'return f"{expr}"'),
-    m("P3", "PG hash prefix 16 hex chars (bit(60) truncates it back)", PG,
-      "substr(md5({text_expr}), 1, {HASH_HEX_CHARS})", "substr(md5({text_expr}), 1, 16)",
+    # 16 hex digits into bit(60) alone is an equivalent mutant: the cast drops
+    # the 16th digit (0 of 100,000 hashes moved, verified on PostgreSQL 18).
+    # The trap CLAUDE.md 4.1 names is 16 digits read as bit(64), which wraps
+    # negative and disagrees with every other engine.
+    m("P3", "PG hash prefix 16 hex chars as bit(64) (wraps negative)", PG,
+      "substr(md5({utf8}), 1, {HASH_HEX_CHARS}))::bit(60)::bigint",
+      "substr(md5({utf8}), 1, 16))::bit(64)::bigint",
       false_match=False),
     m("P4", "PG UTC pin removed", PG,
       "    (\"TimeZone\", \"'UTC'\"),\n", ""),
@@ -276,8 +299,8 @@ MUTATIONS: list[Mutation] = [
     m("P10", "PG NaN detected with c <> c", PG,
       "f\"when {c} = 'NaN'::float8 then 'NaN' \"", "f\"when {c} <> {c} then 'NaN' \""),
     m("P11", "PG DECIMAL truncates instead of rounding", PG,
-      'expr = f"cast(round(({c})::numeric, {self.float_scale}) as text)"',
-      'expr = f"cast(trunc(({c})::numeric, {self.float_scale}) as text)"'),
+      'expr = f"cast(round({num}, {self.float_scale}) as text)"',
+      'expr = f"cast(trunc({num}, {self.float_scale}) as text)"'),
     m("P12", "PG timestamp at milliseconds", PG,
       'expr = self._datetime_text(c, "-MM-DD HH24:MI:SS.US")',
       'expr = self._datetime_text(c, "-MM-DD HH24:MI:SS.MS")'),
@@ -304,8 +327,8 @@ MUTATIONS: list[Mutation] = [
       "f\"when abs({c}) < cast('{float_tiny_sql(s)}' as double) then '{zero}' \"", '""',
       false_match=False),
     m("D7", "DuckDB timestamp at milliseconds", DUCK,
-      "expr = f\"strftime({c}, '%Y-%m-%d %H:%M:%S.%f')\"",
-      "expr = f\"strftime({c}, '%Y-%m-%d %H:%M:%S.%g000')\""),
+      "expr = f\"strftime({src}, '%Y-%m-%d %H:%M:%S.%f')\"",
+      "expr = f\"strftime({src}, '%Y-%m-%d %H:%M:%S.%g000')\""),
     m("D8", "DuckDB DECIMAL at scale-3", DUCK,
       'expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as varchar)"',
       'expr = f"cast(cast({c} as decimal(38,{self.float_scale - 3})) as varchar)"'),
@@ -378,7 +401,8 @@ MUTATIONS: list[Mutation] = [
       "return f\"left(convert(nvarchar(max), cast({c} as datetime2(7)), 121), 23)"
       " + N'000'\""),
     m("S9", "MSSQL snapshot never set (silent READ COMMITTED)", MS,
-      '+ ("snapshot" if self.snapshot else "read committed")', '+ "read committed"'),
+      'self.isolation = "snapshot" if self.snapshot else "read committed"',
+      'self.isolation = "read committed"'),
     m("S10", "MSSQL UTF-8 collation dropped before MD5", MS,
       'f"collate {UTF8_COLLATION} as varchar(max))"', 'f"as varchar(max))"',
       false_match=False),
@@ -408,8 +432,8 @@ MUTATIONS: list[Mutation] = [
       "expr = f\"case when {c} then 'true' when not {c} then 'false' end\"",
       "expr = f\"case when {c} then 'true' else 'false' end\""),
     m("G2", "BigQuery %t NULL guard removed ('NULL' text)", BQ,
-      "expr = self.escape_text(f\"if({c} is null, null, format('%t', {c}))\")",
-      "expr = self.escape_text(f\"format('%t', {c})\")"),
+      "return self.escape_text(f\"if({c} is null, null, format('%t', {c}))\")",
+      "return self.escape_text(f\"format('%t', {c})\")"),
     m("G3", "BigQuery hash prefix 16", BQ,
       'f"{HASH_HEX_CHARS})) as int64)"', 'f"16)) as int64)"'),
     m("G4", "BigQuery int_literal plain digits", BQ,
@@ -437,8 +461,10 @@ MUTATIONS: list[Mutation] = [
     m("F4", "Snowflake NUMBER scale 0 not INTEGER", SF,
       "return LogicalType.INTEGER if scale == 0 else LogicalType.DECIMAL",
       "return LogicalType.DECIMAL", false_match=False),
+    # Pinned offline only by test_mutation_kills (connect is live-only code).
     m("F5", "Snowflake UTC pin removed", SF,
-      "cur.execute(\"alter session set timezone = 'UTC'\")", "pass"),
+      "    \"alter session set timezone = 'UTC'\",\n", "",
+      tests=("tests/redteam/test_mutation_kills.py",)),
     m("F6", "Snowflake NULL sentinel empty", SF,
       "return \"(chr(92) || 'N')\"", "return \"''\""),
     # ------------------------------------------- second batch (resumed run)
@@ -482,7 +508,34 @@ MUTATIONS: list[Mutation] = [
       "f\"then convert(nvarchar(max), cast({x} as decimal(38,0))) + N'{frac}' \"",
       "f\"then convert(nvarchar(max), cast({x} as decimal(38,0))) \"", false_match=False),
     m("S22", "MSSQL snapshot rollback replaced by commit", MS,
-      "self._conn.rollback()", "self._conn.commit()", false_match=False),
+      "        try:\n            self._conn.rollback()\n        finally:\n",
+      "        try:\n            self._conn.commit()\n        finally:\n", false_match=False),
+    # ------------------------------------- third batch (round-H defences)
+    m("E22", "per-level sum check skipped (rows changing mid-walk unseen)", ENGINE,
+      "                check_level(s_lo, s_hi, cs_a, cs_b, parent)\n", ""),
+    m("E23", "sample check that could not run is swallowed", ENGINE,
+      "            except ValueError as exc:\n                verification.error = str(exc)\n",
+      "            except ValueError:\n                pass\n"),
+    m("T4", "a sample-check error does not block identical", TYPES,
+      "            and not (self.verification and self.verification.error)\n", ""),
+    m("B21", "--where scan reads `[` only as a SQL Server identifier (RT-HB6)", BASE,
+      "_FILTER_BRACKET_READINGS = (True, False)", "_FILTER_BRACKET_READINGS = (True,)"),
+    m("B22", "--where scan reads `[` only as code, never as an identifier", BASE,
+      "_FILTER_BRACKET_READINGS = (True, False)", "_FILTER_BRACKET_READINGS = (False,)"),
+    m("P17", "PG row-level security on a table not noted (no caveat)", PG,
+      "        if rows and rows[0][0]:\n            self._row_security = [",
+      "        if False:\n            self._row_security = [",
+      tests=("tests/redteam/test_settings.py", "tests/redteam/test_round_h_postgres.py")),
+    m("F7", "Snowflake row access policy not reported", SF,
+      '            elif kind_text == "ROW_ACCESS_POLICY":\n', "            elif False:\n"),
+    m("S23", "MSSQL row-level security policy not reported", MS,
+      "        if rows:\n            names = sorted(str(r[0]) for r in rows)\n",
+      "        if False:\n            names = sorted(str(r[0]) for r in rows)\n"),
+    # Too small a bound sends a row past 4,000 bytes down STANDARD_HASH, which
+    # raises ORA-01489 - loud, never a truncation - so not a false match.
+    m("O1", "Oracle row bound ignores the separators (4,000-byte path)", OR,
+      "        total = sum(static) + len(parts) - 1\n", "        total = sum(static)\n",
+      false_match=False),
 ]
 # fmt: on
 
@@ -696,7 +749,10 @@ def _shards(tests: list[str]) -> list[list[str]]:
     """
     opts = [t for t in tests if t.startswith("-")]
     paths = [t for t in tests if not t.startswith("-")]
-    if paths == ["tests"]:
+    if "tests" in paths:
+        # Expanded to files, so a red-team file a mutation adds (`m(tests=)`)
+        # is run rather than swallowed by `--ignore=tests/redteam`.
+        added = [p for p in paths if p != "tests"]
         ignored = {
             o.split("=", 1)[1].rstrip("/") for o in opts if o.startswith("--ignore=")
         }
@@ -706,6 +762,7 @@ def _shards(tests: list[str]) -> list[list[str]]:
             if f.startswith("test_") and f.endswith(".py")
         )
         paths = [p for p in paths if not any(p.startswith(i) for i in ignored)]
+        paths += [p for p in added if p not in paths]
         opts = [o for o in opts if not o.startswith("--ignore=")]
     if len(paths) <= 1:
         return [paths + opts]

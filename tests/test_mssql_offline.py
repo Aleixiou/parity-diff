@@ -696,3 +696,35 @@ def test_a_query_too_large_for_sql_server_names_the_side_and_table():
             d.segment_checksums("s.wide", INT_KEY, [], 1, 100, 4)
         msg = str(caught.value)
         assert "[side A: mssql]" in msg and "s.wide" in msg and "--columns" in msg
+
+
+def test_an_enabled_filter_predicate_is_a_caveat_naming_its_policy():
+    """RT-HS2 offline: a security policy's filter predicate hides rows from
+    this login, so the rows it hides differ unseen. The live test needs a
+    server; here the catalog is canned - one table, visible policies, one
+    enabled filter predicate on it - and the caveat must name the policy. No
+    policy, no caveat."""
+
+    def answer(policies):
+        """Answer the inspection queries; `policies` for sys.security_policies."""
+
+        def reply(sql):
+            """The canned rows for one statement."""
+            if "from sys.objects o" in sql:
+                # type, memory-optimized, object_id, VIEW DEFINITION held
+                return [("U", 0, 42, 1)]
+            if "sys.security_policies" in sql:
+                return policies
+            return []
+
+        return reply
+
+    cols = [Column("v", LogicalType.INTEGER, "int")]
+    plain = _d(answer([]))
+    plain._inspect("dbo.t", "dbo", "t", cols)
+    assert not any("row-level security" in n for n in plain.caveats(cols))
+
+    filtered = _d(answer([("tenant_pol",)]))
+    filtered._inspect("dbo.t", "dbo", "t", cols)
+    notes = [n for n in filtered.caveats(cols) if "row-level security" in n]
+    assert len(notes) == 1 and "tenant_pol" in notes[0] and "dbo.t" in notes[0], notes

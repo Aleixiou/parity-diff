@@ -482,3 +482,24 @@ def test_static_bounds_cover_the_longest_text(raw, logical, bound):
     a = d()
     part = a.normalize(Column("C", logical, raw))
     assert a._parts[part][0] == bound
+
+
+def test_the_row_bound_counts_the_separators_between_parts():
+    """The 4,000-byte bound is the parts' bounds *plus* one chr(31) between
+    each pair. NUMBER(10,0) renders in at most 11 bytes, so 333 such parts
+    need 11 * 333 + 332 = 3,995 bytes and fit STANDARD_HASH, while 334 need
+    4,007 and must not: forgetting the separators (3,674) would send that row
+    to STANDARD_HASH and fail it with ORA-01489."""
+    a = d()
+
+    def row(n):
+        """The hash of a row of `n` NUMBER(10,0) columns."""
+        parts = [
+            a.normalize(Column(f"C{i}", LogicalType.INTEGER, "NUMBER(10,0)"))
+            for i in range(n)
+        ]
+        assert {a._parts[p][0] for p in parts} == {"11"}
+        return a.hash_parts(parts)
+
+    assert "parity_md5(" not in row(333)
+    assert "parity_md5(" in row(334)

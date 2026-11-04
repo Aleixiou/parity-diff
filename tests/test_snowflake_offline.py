@@ -192,3 +192,33 @@ def test_variant_keeps_its_json_type():
         sql = d.normalize(col)
         assert 'to_json("V")' in sql
         assert 'when "V" is not null then typeof("V") || \':\' ||' in sql
+
+
+def test_a_row_access_policy_on_the_table_is_a_caveat_naming_it():
+    """RT-HF5 offline: a row access policy hides rows from both sides alike,
+    so the rows it hides differ unseen. The live test needs an account; this
+    stub answers POLICY_REFERENCES with one policy, planted on the table, and
+    the caveat must name it - and a table with none must draw no such caveat."""
+
+    policies: list[tuple[str, str, str | None]] = []
+
+    class Stubbed(SnowflakeDialect):
+        def query(self, sql):  # type: ignore[override]
+            """Canned catalog answers: one table, its columns, its policies."""
+            if "current_database()" in sql:
+                return [("DB",)]
+            if "information_schema.tables" in sql:
+                return [("BASE TABLE",)]
+            if "policy_references" in sql:
+                return policies
+            return [("ID", "NUMBER", 0, None), ("V", "TEXT", None, None)]
+
+    plain = Stubbed(side="A")
+    cols = plain.columns("S.T")
+    assert not any("row access policy" in n for n in plain.caveats(cols))
+
+    policies.append(("ROW_ACCESS_POLICY", "TENANT_RAP", None))
+    filtered = Stubbed(side="A")
+    cols = filtered.columns("S.T")
+    notes = [n for n in filtered.caveats(cols) if "row access policy" in n]
+    assert len(notes) == 1 and "TENANT_RAP" in notes[0] and "S.T" in notes[0], notes
