@@ -21,13 +21,13 @@ import fuzz_harness as fh  # noqa: E402
 
 def urls() -> dict[str, str]:
     """Engine URLs from the same environment variables as tests/conftest.py."""
-    from conftest import MYSQL_URL, PG_URL
+    from conftest import BIGQUERY_URL, MSSQL_URL, MYSQL_URL, PG_URL
 
     out = {"postgres": PG_URL, "mysql": MYSQL_URL, "duckdb": ""}
-    if os.environ.get("PARITY_TEST_MSSQL"):
-        out["mssql"] = os.environ["PARITY_TEST_MSSQL"]
-    if os.environ.get("PARITY_TEST_BIGQUERY"):
-        out["bigquery"] = os.environ["PARITY_TEST_BIGQUERY"]
+    if MSSQL_URL:
+        out["mssql"] = MSSQL_URL
+    if BIGQUERY_URL:
+        out["bigquery"] = BIGQUERY_URL
     return out
 
 

@@ -126,6 +126,22 @@ def test_rt_hf6_offline_strict_json_output_is_pinned(monkeypatch):
     assert any("strict_json_output=false" in s for s in log), log
 
 
+def test_rt_hf11_offline_a_secret_url_never_shows_its_password():
+    """The conftest URL type masks the password wherever pytest would print
+    it - repr() of a fixture argument and saferepr() in an assertion's
+    explanation - while handing the driver the real value."""
+    from _pytest._io.saferepr import saferepr
+    from conftest import SecretUrl, redact_url
+
+    secret = "Rth-" + uuid.uuid4().hex
+    url = SecretUrl(f"snowflake://me:{secret}@acct-x/db/sch?warehouse=w")
+    shown = [repr(url), saferepr(url), repr([url]), repr({"u": url}), redact_url(url)]
+    leaked = [secret in s for s in shown]
+    assert leaked == [False] * len(shown)
+    assert str(url).endswith("?warehouse=w") and secret in f"{url}"
+    assert urlsplit(url).password == secret
+
+
 def test_the_existing_pins_are_still_made(monkeypatch):
     """Control for the two tests above: the fake really records the pins."""
     log = _connect_log(monkeypatch)
@@ -153,11 +169,6 @@ def _with_schema(url: str, schema: str) -> str:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF11: the conftest URL fixtures are plain strings, so a failing "
-    "live test prints the password and account in pytest's report",
-)
 def test_rt_hf11_the_url_fixture_never_shows_its_password(snowflake_url):
     """Leaked secret (test suite). pytest prints a failing test's arguments
     with repr(); `snowflake_url` (and the BigQuery, SQL Server, MySQL ones)
