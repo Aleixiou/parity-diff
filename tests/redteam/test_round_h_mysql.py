@@ -1162,3 +1162,95 @@ def test_rt_hm17_view_over_a_non_transactional_table_says_so(tables, mysql_url, 
         conn.close()
     assert found(r) == [(2, "different", ("v",))]
     assert any(engine.upper() in w.upper() and "snapshot" in w for w in r.warnings)
+
+
+CROSS_KEYS = [
+    (
+        "bigint unsigned", "numeric(20)",
+        ["18446744073709551615", "0", "9223372036854775808"], "0",
+    ),
+    ("decimal(20,0)", "bigint", ["-9223372036854775808", "0", "42"], "0"),
+    ("decimal(10,2)", "numeric", ["-0.00", "1.50", "2.25"], "1.5"),
+    (
+        "datetime(6)", "timestamp",
+        ["'2024-01-01 00:00:00.000001'", "'2024-01-01'", "'1000-01-01 23:59:59.999999'"],
+        "2024-01-01 00:00:00.000000",
+    ),
+    ("time(6)", "time", ["'10:00:00.5'", "'23:59:59'", "'00:00:00'"], "23:59:59.000000"),
+    (
+        "binary(4)", "bytea",
+        ["x'00112233'", "x'ff112233'", "x'00000000'"], "\\\\xff112233",
+    ),
+    (
+        "char(36)", "uuid",
+        ["'0e2d9a6e-9c1b-4d7c-8f0a-1b2c3d4e5f60'", "'1e2d9a6e-9c1b-4d7c-8f0a-1b2c3d4e5f60'",
+         "'2e2d9a6e-9c1b-4d7c-8f0a-1b2c3d4e5f60'"],
+        "1e2d9a6e-9c1b-4d7c-8f0a-1b2c3d4e5f60",
+    ),
+    ("varchar(10) collate utf8mb4_bin", "text", ["'a'", "'A'", "'é'"], "A"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("my_type", "pg_type", "keys", "planted"), CROSS_KEYS, ids=[c[0] for c in CROSS_KEYS]
+)
+def test_key_types_match_across_mysql_and_postgres(
+    tables, pg_table, mysql_url, pg_url, my_type, pg_type, keys, planted
+):
+    """Every MySQL key family against its PostgreSQL counterpart: rows pair
+    up by exact key text (a -0.00 decimal is 0, an integer key equals an
+    integral numeric one), and only the planted row differs."""
+    pg_keys = [
+        "'\\x" + k[2:-1] + "'::bytea" if pg_type == "bytea" else k for k in keys
+    ]
+    planted_at = 1
+    my_rows = [f"insert into {{t}} values ({k}, {i})" for i, k in enumerate(keys)]
+    pg_rows = [
+        f"insert into {{t}} values ({k}, {i + (1 if i == planted_at else 0)})"
+        for i, k in enumerate(pg_keys)
+    ]
+    r = _cross(
+        tables, pg_table, mysql_url, pg_url,
+        f"id {my_type} primary key, v int", my_rows,
+        f"id {pg_type} primary key, v int", pg_rows,
+    )  # fmt: skip
+    assert found(r) == [(planted, "different", ("v",))]
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{}, {"bisection_factor": 2, "threshold": 1}, {"bisection_factor": 1024, "threshold": 50_000}],
+    ids=["default", "binary_split", "wide_split"],
+)
+def test_scale_first_last_middle_and_far_keys(tables, mysql_url, kw):
+    """100,000 rows a side (run at 1,000,000 by hand: same five differences
+    at every setting, 38 queries by default): a change in the first key, the
+    last key and one microsecond in the middle, a deleted row and one
+    inserted at 2^62, which widens the key range a millionfold."""
+    n = 100_000
+    gen = (
+        "insert into {t} with recursive n(i) as (select 1 union all select i + 1 "
+        f"from n where i < {n}) select i, concat('row', i), i / 7, "
+        "timestampadd(second, i, '2020-01-01'), md5(i) from n"
+    )
+    ddl = "id bigint primary key, s varchar(40), d decimal(18,4), ts datetime(6), u char(32)"
+    pre = "set session cte_max_recursion_depth = 1000000"
+    ta = tables(mysql_url, "scale_a", ddl, pre, gen)
+    tb = tables(
+        mysql_url, "scale_b", ddl, pre, gen,
+        "update {t} set s = 'first' where id = 1",
+        f"update {{t}} set d = d + 0.0001 where id = {n}",
+        f"delete from {{t}} where id = {n // 2}",
+        "insert into {t} values (4611686018427387904, 'far', 0, '2020-01-01', 'x')",
+        "update {t} set ts = timestampadd(microsecond, 1, ts) where id = 77777",
+    )  # fmt: skip
+    r = run_diff(
+        get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb, **kw
+    )
+    assert found(r) == [
+        (1, "different", ("s",)),
+        (n // 2, "only_in_a", ("d", "s", "ts", "u")),
+        (77777, "different", ("ts",)),
+        (n, "different", ("d",)),
+        (4611686018427387904, "only_in_b", ("d", "s", "ts", "u")),
+    ]
