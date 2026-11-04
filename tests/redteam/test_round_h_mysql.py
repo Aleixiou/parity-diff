@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 
 from parity.dialects.base import get_dialect
+
 from .rtg_servers import found, mysql_connect, mysql_run, run_diff
 
 RUN = uuid.uuid4().hex[:6]
@@ -126,7 +127,9 @@ def _cross(make, pg_make, mysql_url, pg_url, my_ddl, my_rows, pg_ddl, pg_rows, *
     """MySQL side A against PostgreSQL side B."""
     ta = make(mysql_url, "x", my_ddl, *my_rows)
     tb = pg_make("x", pg_ddl, *pg_rows)
-    return run_diff(get_dialect(mysql_url, side="A"), get_dialect(pg_url, side="B"), ta, tb, **kw)
+    return run_diff(
+        get_dialect(mysql_url, side="A"), get_dialect(pg_url, side="B"), ta, tb, **kw
+    )
 
 
 def _init_hook(monkeypatch, *statements: str) -> None:
@@ -249,7 +252,9 @@ def test_rt_hm1_unmappable_sjis_character_against_postgres_question_mark(
         ("ucs2", "4E2D", "6587"),
     ],
 )
-def test_lossless_character_sets_keep_every_difference(tables, mysql_url, charset, va, vb):
+def test_lossless_character_sets_keep_every_difference(
+    tables, mysql_url, charset, va, vb
+):
     """The control for RT-HM1: where every stored character has a Unicode
     mapping, the conversion is exact and the planted difference is found."""
     r = _mysql_pair(
@@ -312,9 +317,7 @@ def test_rt_hm2_ucs2_value_with_a_surrogate_is_not_null(tables, mysql_url):
     strict=True,
     reason="RT-HM3: columns the login cannot read are silently left out",
 )
-def test_rt_hm3_column_level_grants_do_not_silently_narrow_the_comparison(
-    root80, tables
-):
+def test_rt_hm3_column_level_grants_do_not_silently_narrow_the_comparison(root80, tables):
     """A login granted SELECT on some columns only sees only those in
     information_schema.columns, so the rest are never compared: with the
     same login on both sides the planted difference in `secret` reads
@@ -375,7 +378,9 @@ def test_rt_hm4_zerofill_integer_equals_the_same_plain_integer(tables, mysql_url
                 "insert into {t} values (1, 5), (2, 7)")  # fmt: skip
     tb = tables(mysql_url, "zf_b", "id int primary key, v int",
                 "insert into {t} values (1, 5), (2, 8)")  # fmt: skip
-    r = run_diff(get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb)
+    r = run_diff(
+        get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb
+    )
     assert found(r) == [(2, "different", ("v",))]
 
 
@@ -420,7 +425,11 @@ def test_rt_hm5_zerofill_key_matches_the_plain_key(
     ta = tables(mysql_url, "zfk_a", zf_ddl, f"insert into {{t}} values {rows_a}")
     tb = tables(mysql_url, "zfk_b", plain_ddl, f"insert into {{t}} values {rows_b}")
     r = run_diff(
-        get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb, key=key
+        get_dialect(mysql_url, side="A"),
+        get_dialect(mysql_url, side="B"),
+        ta,
+        tb,
+        key=key,
     )
     assert found(r) == expected
 
@@ -492,14 +501,18 @@ def test_rt_hm8_json_opaque_scalars_are_not_strings(tables, mysql_url):
         mysql_url,
         "id int primary key, j json",
         [
-            "insert into {t} values (1, cast(cast('2024-01-02' as date) as json)), "
-            "(2, cast(x'00ff' as json)), (3, cast(cast('10:00:00' as time) as json)), "
-            "(4, json_array(cast('2024-01-02 03:04:05.5' as datetime(6))))"
+            (
+                "insert into {t} values (1, cast(cast('2024-01-02' as date) as json)), "
+                "(2, cast(x'00ff' as json)), (3, cast(cast('10:00:00' as time) as json)), "
+                "(4, json_array(cast('2024-01-02 03:04:05.5' as datetime(6))))"
+            )
         ],
         [
-            "insert into {t} values (1, json_quote('2024-01-02')), "
-            "(2, json_quote('base64:type15:AP8=')), (3, json_quote('10:00:00.000000')), "
-            "(4, json_array('2024-01-02 03:04:05.500000'))"
+            (
+                "insert into {t} values (1, json_quote('2024-01-02')), "
+                "(2, json_quote('base64:type15:AP8=')), (3, json_quote('10:00:00.000000')), "
+                "(4, json_array('2024-01-02 03:04:05.500000'))"
+            )
         ],
         tag="json_opaque",
     )
@@ -591,7 +604,9 @@ def test_rt_hm10_refusals_are_explained_under_any_lc_messages(
                 f"insert into {{t}} values (1, {value})")  # fmt: skip
     _init_hook(monkeypatch, "set session lc_messages = 'de_DE'")
     with pytest.raises(ValueError, match=expect):
-        run_diff(get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb)
+        run_diff(
+            get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb
+        )
 
 
 # ====================================================================
@@ -687,14 +702,16 @@ WHERE_SPELLINGS = [
     ("note = '#'", [3]),
     ("note = 'a\\\\b'", [1]),  # a doubled backslash, not before a quote
     ("region = 'e''u'", [4]),
-    ("region = \"e'u\"", [4]),
+    ('region = "e\'u"', [4]),
     ("region regexp '^e[u]$'", [1, 3]),
     ("id div 2 = 0", [1]),
     ("region = 'eu'\n", [1, 3]),
 ]
 
 
-@pytest.mark.parametrize(("where", "keys"), WHERE_SPELLINGS, ids=[w for w, _ in WHERE_SPELLINGS])
+@pytest.mark.parametrize(
+    ("where", "keys"), WHERE_SPELLINGS, ids=[w for w, _ in WHERE_SPELLINGS]
+)
 def test_mysql_spellings_in_a_row_filter(tables, mysql_url, where, keys):
     """MySQL's own literal forms - introducers, hex, bit, adjacent strings,
     ODBC escapes, `#` and `\\` inside strings - filter exactly the rows they
@@ -763,7 +780,11 @@ def test_rt_hm13_zero_date_difference_is_not_called_a_false_alarm(
         "id int primary key, d date",
         ["insert into {t} values (1, null), (2, null), (3, '2024-01-02')"],
     )  # fmt: skip
-    assert found(r) == [(1, "different", ("d",)), (2, "different", ("d",)), (3, "different", ("d",))]
+    assert found(r) == [
+        (1, "different", ("d",)),
+        (2, "different", ("d",)),
+        (3, "different", ("d",)),
+    ]
     assert r.verification is not None
     assert not [n for n in r.verification.notes if "false alarm" in n]
 
@@ -816,7 +837,9 @@ def test_hostile_session_defaults_do_not_move_the_verdict(
     tb = tables(mysql_url, "sess_b", ddl, "set time_zone = '+00:00'",
                 *[(ins, r) for r in rows])  # fmt: skip
     _init_hook(monkeypatch, statement)
-    r = run_diff(get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb)
+    r = run_diff(
+        get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), ta, tb
+    )
     assert found(r) == [("x" * 200 + "B", "different", ("v",))]
 
 
@@ -853,7 +876,11 @@ def test_widest_tables_find_the_last_column(tables, mysql_url, n, engine, typ):
         ("double", -(2.0**60), -(2.0**60) - 256),
         ("float", 16777217.0, 16777218.0),  # float4: 16777216 against 16777218
         ("decimal(20,10)", "-0.0000005", "-0.0000004"),
-        ("decimal(65,30)", "0.000000500000000000000000000000", "0.000000499999999999999999999999"),
+        (
+            "decimal(65,30)",
+            "0.000000500000000000000000000000",
+            "0.000000499999999999999999999999",
+        ),
         ("decimal(65,0)", "9" * 59, "9" * 58 + "8"),
         ("bit(64)", 2**64 - 1, 2**64 - 2),
         ("bigint unsigned", 2**64 - 1, 2**64 - 2),
@@ -905,7 +932,9 @@ def _float_text(ddl: str, x: float) -> str:
     return canonical_float_text(x, 6)
 
 
-def test_mediumint_unsigned_key_against_postgres_bigint(tables, pg_table, mysql_url, pg_url):
+def test_mediumint_unsigned_key_against_postgres_bigint(
+    tables, pg_table, mysql_url, pg_url
+):
     """The narrow unsigned key types bucket as integers against a wider one."""
     r = _cross(
         tables, pg_table, mysql_url, pg_url,
@@ -917,7 +946,9 @@ def test_mediumint_unsigned_key_against_postgres_bigint(tables, pg_table, mysql_
     assert found(r) == [(0, "different", ("v",))]
 
 
-def test_storage_engines_without_transactions_are_compared_with_a_caveat(tables, mysql_url):
+def test_storage_engines_without_transactions_are_compared_with_a_caveat(
+    tables, mysql_url
+):
     """ARCHIVE and CSV, besides MyISAM and MEMORY: the walk is right on quiet
     data and each side says it is not one snapshot."""
     a = tables(mysql_url, "arch_a", "id int not null, v varchar(10)) engine=archive -- ",
@@ -947,13 +978,22 @@ VERSION_URLS = [
 
 VERSION_CASES = [
     ("sjis", "v varchar(10) character set sjis", "_sjis x'F040'", "_sjis x'F041'"),
-    ("ucs2", "v varchar(10) character set ucs2", "_ucs2 x'D83DDE00'", "_ucs2 x'D83DDE01'"),
+    (
+        "ucs2",
+        "v varchar(10) character set ucs2",
+        "_ucs2 x'D83DDE00'",
+        "_ucs2 x'D83DDE01'",
+    ),
 ]
 
 
 @pytest.mark.xfail(strict=True, reason="RT-HM1/RT-HM2: lossy conversion on every version")
-@pytest.mark.parametrize("url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0])
-@pytest.mark.parametrize(("label", "col", "va", "vb"), VERSION_CASES, ids=[c[0] for c in VERSION_CASES])
+@pytest.mark.parametrize(
+    "url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0]
+)
+@pytest.mark.parametrize(
+    ("label", "col", "va", "vb"), VERSION_CASES, ids=[c[0] for c in VERSION_CASES]
+)
 def test_rt_hm1_hm2_on_every_version(tables, url, label, col, va, vb):
     r = _mysql_pair(
         tables, url, f"id int primary key, {col}",
@@ -964,7 +1004,9 @@ def test_rt_hm1_hm2_on_every_version(tables, url, label, col, va, vb):
     assert found(r) == [(1, "different", ("v",))]
 
 
-@pytest.mark.parametrize("url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0])
+@pytest.mark.parametrize(
+    "url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0]
+)
 def test_identifiers_are_case_sensitive_on_a_case_sensitive_server(tables, url):
     """lower_case_table_names=0 (Linux): `t_Case` and `t_case` are two tables,
     and each side's columns come from exactly the one it names."""
@@ -1026,7 +1068,9 @@ def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
     schema 'rth')` - sending the user to check the name instead of the
     grants. A `select 1 from t limit 0` probe answers 1142 'SELECT command
     denied', which is what `_exists_but_unreadable` exists to report."""
-    t = tables(ROOT80, "nogrant", "id int primary key, v int", "insert into {t} values (1, 1)")
+    t = tables(
+        ROOT80, "nogrant", "id int primary key, v int", "insert into {t} values (1, 1)"
+    )
     other = tables(ROOT80, "granted", "id int primary key")
     user = f"rth_ng_{RUN}"
     mysql_run(
@@ -1156,7 +1200,12 @@ def test_rt_hm17_view_over_a_non_transactional_table_says_so(tables, mysql_url, 
     conn = mysql_connect(mysql_url)
     try:
         mysql_run(conn, f"create or replace view `{view}` as select * from `{base}`")
-        r = run_diff(get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), view, other)
+        r = run_diff(
+            get_dialect(mysql_url, side="A"),
+            get_dialect(mysql_url, side="B"),
+            view,
+            other,
+        )
     finally:
         mysql_run(conn, f"drop view if exists `{view}`")
         conn.close()
@@ -1200,9 +1249,7 @@ def test_key_types_match_across_mysql_and_postgres(
     """Every MySQL key family against its PostgreSQL counterpart: rows pair
     up by exact key text (a -0.00 decimal is 0, an integer key equals an
     integral numeric one), and only the planted row differs."""
-    pg_keys = [
-        "'\\x" + k[2:-1] + "'::bytea" if pg_type == "bytea" else k for k in keys
-    ]
+    pg_keys = ["'\\x" + k[2:-1] + "'::bytea" if pg_type == "bytea" else k for k in keys]
     planted_at = 1
     my_rows = [f"insert into {{t}} values ({k}, {i})" for i, k in enumerate(keys)]
     pg_rows = [
@@ -1219,7 +1266,11 @@ def test_key_types_match_across_mysql_and_postgres(
 
 @pytest.mark.parametrize(
     "kw",
-    [{}, {"bisection_factor": 2, "threshold": 1}, {"bisection_factor": 1024, "threshold": 50_000}],
+    [
+        {},
+        {"bisection_factor": 2, "threshold": 1},
+        {"bisection_factor": 1024, "threshold": 50_000},
+    ],
     ids=["default", "binary_split", "wide_split"],
 )
 def test_scale_first_last_middle_and_far_keys(tables, mysql_url, kw):
@@ -1254,3 +1305,24 @@ def test_scale_first_last_middle_and_far_keys(tables, mysql_url, kw):
         (n, "different", ("d",)),
         (4611686018427387904, "only_in_b", ("d", "s", "ts", "u")),
     ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM18: casefold matches differently spelled columns (straße = strasse)",
+)
+def test_rt_hm18_columns_that_differ_beyond_case_are_not_matched(
+    tables, pg_table, mysql_url, pg_url
+):
+    """Column matching is meant to bridge *case* (CLAUDE.md 4.4), but
+    `str.casefold` also folds ß to ss, the ﬁ ligature to fi and the Kelvin
+    sign to k. A MySQL column `straße` (MySQL itself keeps `straße` and
+    `strasse` apart in one table) is then silently compared with a
+    PostgreSQL column `strasse`, and reported under A's name, with no schema
+    difference. `str.lower` would bridge case only."""
+    r = _cross(
+        tables, pg_table, mysql_url, pg_url,
+        "id int primary key, `straße` int", ["insert into {t} values (1, 1), (2, 2)"],
+        'id int primary key, "strasse" int', ["insert into {t} values (1, 1), (2, 3)"],
+    )  # fmt: skip
+    assert r.schema_differences
