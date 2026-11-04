@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 305628369a22d49f`
+Source fingerprint: `src-sha256: 85aef74612d2fd67`
 
 ## Summary
 
@@ -42,7 +42,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
-| Row-level security hides rows from the reading role (PostgreSQL; SQL Server security policies) | **not bounded**: those rows are not compared; every run names the table in a caveat (on SQL Server, without VIEW DEFINITION on the database, a caveat that RLS cannot be ruled out) | Not quantifiable |
+| Row-level security hides rows from the reading role (PostgreSQL; SQL Server security policies; Oracle VPD) | **not bounded**: those rows are not compared; every run names the table in a caveat (on SQL Server, without VIEW DEFINITION on the database, a caveat that RLS cannot be ruled out) | Not quantifiable |
 | Dynamic data masking hands the login masks instead of values (SQL Server) | **0** for a table: a compared column masked for the login is refused; a view reading one is refused, and so is any view whose dependencies the login cannot see (no VIEW DEFINITION) in a database holding masked columns it cannot unmask | By design (tested live) |
 | Column-level grants hide a column from the reading login (PostgreSQL) | **0**: a column the login lacks SELECT on is a schema difference, never identical, unless `--exclude`d (round H) | By design (tested) |
 | A Snowflake row access policy hides them, or a Snowflake masking policy shows both sides the mask | **not bounded**: those rows or values are not compared; every run names the table (and a masked column) in a caveat, and on a Snowflake view says the policies beneath it are not checked | Not quantifiable |
@@ -69,9 +69,10 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT, with `extra_float_digits = 3` there so floats inside unmapped types print exactly - round H), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
 | Rows hidden from the session (row caps, RLS, Snowflake policies) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS and Snowflake masking / row access policies: **not bounded**, named in a caveat (a Snowflake view's underlying policies cannot be listed, and the caveat says so) | By design / Not quantifiable |
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
-| Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
+| Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, Oracle, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | A MySQL view over a non-transactional table read as one snapshot | **0** — the view's base tables are followed through `view_table_usage` (views of views included) and any non-InnoDB one gets the caveat below; a view whose base tables cannot be listed gets it too (round H, RT-HM17) | By design (tested) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
+| Rows or values hidden from the session on Oracle (VPD, Data Redaction) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS and Oracle VPD policies: **not bounded**, named in a caveat; Oracle Data Redaction: **not detectable** without privileges, documented | By design / Not quantifiable |
 
 ## 2. Matching schemas and columns
 
@@ -161,7 +162,10 @@ cancel at `max_user_connections` (now reported), JSON typed scalars
 problems, 4 of them false matches (dynamic data masking, row-level security
 without a caveat, spatial SRID, invalid double-byte text), all fixed. Round H on Snowflake: 11 problems
 (RT-HF1 to HF11), 6 of them false matches, all fixed or refused, plus a
-secret leak in the test suite's failure reports. Earlier campaign: about 30
+secret leak in the test suite's failure reports. The Oracle sweep (2026-11-04)
+found one value Oracle cannot print (TIMESTAMP WITH LOCAL TIME ZONE at the
+last microsecond of 9999, whose year reads 10000): now refused, naming the
+column. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range
@@ -172,14 +176,15 @@ them per key range in a wide type and counts rows.
 | Risk | Odds | Kind |
 |---|---|---|
 | A range holding a real difference sums to the same value | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per differing range: the sums differ by at least one 60-bit hash that is uniform and independent of the rest | Proven bound (data not crafted to collide) |
-| Sum overflow | **0** — summed in NUMERIC / DECIMAL(38) / HUGEINT / NUMBER(38) | By design |
+| Sum overflow | **0** — summed in NUMERIC / DECIMAL(38) / HUGEINT / NUMBER(38); an Oracle NUMBER sum is exact to about 8.6 × 10¹⁹ rows | By design |
+| A row too long for the engine's text type is truncated before hashing | **0** — SQL Server joins as `nvarchar(max)`; Oracle hashes a row whose text may pass 4,000 bytes as a CLOB with an MD5 in PL/SQL (equal to Python's on 0 B to 600 kB), and an under-estimated bound raises ORA-01489 rather than truncating | By design (tested) |
 | Crafted collision (8 rows chosen to cancel) | **not bounded** — a few seconds of computation, no secret needed | Not quantifiable |
 
 ## 6. Walking the key space (bisection)
 
 | Risk | Odds | Kind |
 |---|---|---|
-| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine; a Snowflake NUMBER(38,0) span too wide for 38 digits compares the key with its precomputed boundaries), property-tested against `bucket_bounds` | By design (tested) |
+| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine; a Snowflake NUMBER(38,0) span too wide for 38 digits compares the key with its precomputed boundaries), property-tested against `bucket_bounds`; Oracle integer keys wider than 18 digits are hashed, so no bucket product passes NUMBER's 38 digits | By design (tested) |
 | An empty range on one side is skipped | **0** — empty sums are 0 on both sides | By design (tested) |
 | A difference vanishes between two levels (rows changed between the queries) | **0** false matches — each level's buckets must add up, in rows and checksum, to the level above, or the range is unexplained | By design (tested) |
 
@@ -239,7 +244,8 @@ facts because the connector returns a SET as a Python set, the ENUM error
 value as `''` and an unconvertible character as `?`; MySQL zero dates, read
 as text because the connector returns them as None; SQL Server NULs, 7-digit times and sql_variant base
 types, PostgreSQL and DuckDB infinite and BC dates and interval months,
-DuckDB TIMETZ offsets). Measured: on the full live suite (1,620 tests, default sample 10,000) the check
+DuckDB TIMETZ offsets, Oracle NUMBER as Decimal, LOBs as text, BC and
+nanosecond timestamps as text, intervals as their components). Measured: on the full live suite (1,620 tests, default sample 10,000) the check
 raised no false disagreement; every disagreement it raised was a planted
 walk defect or a table changed mid-run.
 

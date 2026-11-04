@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [{ name = "Alessio Sorio" }]
 keywords = [
     "data-diff", "migration", "postgres", "duckdb", "data-quality",
-    "cutover", "warehouse", "parity", "bigquery", "snowflake", "sqlserver",
+    "cutover", "warehouse", "parity", "bigquery", "snowflake", "sqlserver", "oracle",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -46,10 +46,12 @@ mssql = ["mssql-python>=1.0"]
 # `parity run` reads TOML with the standard library's tomllib (3.11+). On
 # 3.10 it needs tomli; without it, a JSON config works the same.
 toml = ["tomli>=1.1; python_version < '3.11'"]
+# python-oracledb in its default thin mode: pure Python, no Oracle client.
+oracle = ["oracledb>=2"]
 all = [
     "duckdb>=1.3", "psycopg[binary]>=3.1",
     "mysql-connector-python>=8.0", "snowflake-connector-python>=4.0,<5",
-    "google-cloud-bigquery>=3.15", "mssql-python>=1.0",
+    "google-cloud-bigquery>=3.15", "mssql-python>=1.0", "oracledb>=2",
     "tomli>=1.1; python_version < '3.11'",
 ]
 # Test-only dependencies, kept out of every runtime extra. Hypothesis drives
@@ -81,6 +83,7 @@ markers = [
     "snowflake: requires a reachable Snowflake account (PARITY_TEST_SNOWFLAKE)",
     "bigquery: requires a reachable BigQuery project (PARITY_TEST_BIGQUERY)",
     "mssql: requires a reachable SQL Server (PARITY_TEST_MSSQL)",
+    "oracle: requires a reachable Oracle Database (PARITY_TEST_ORACLE)",
     "sample_check_may_disagree: the test plants a disagreement for the independent sample check on purpose",
 ]
 
@@ -126,6 +129,7 @@ ignore = [
 "src/parity/dialects/snowflake_dialect.py" = ["S608"]
 "src/parity/dialects/bigquery_dialect.py" = ["S608"]
 "src/parity/dialects/mssql_dialect.py" = ["S608"]
+"src/parity/dialects/oracle_dialect.py" = ["S608"]
 # proof.py is kept close to the original author's script so it stays readable
 # next to the findings it produced; its terse one-line style is deliberate.
 "demo/proof.py" = ["E401", "E402", "E701", "E702", "B007", "S311", "S608"]

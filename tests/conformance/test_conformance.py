@@ -31,6 +31,7 @@ from cov_engines import (
     DuckDBCov,
     MSSQLCov,
     MySQLCov,
+    OracleCov,
     PostgresCov,
     SnowflakeCov,
 )
@@ -47,6 +48,7 @@ ENGINES = [
     pytest.param("mssql", marks=pytest.mark.mssql),
     pytest.param("bigquery", marks=pytest.mark.bigquery),
     pytest.param("snowflake", marks=pytest.mark.snowflake),
+    pytest.param("oracle", marks=pytest.mark.oracle),
 ]
 
 
@@ -62,6 +64,7 @@ def make_engine(name: str, request: pytest.FixtureRequest, tmp: str) -> CovEngin
         "mssql": MSSQLCov,
         "bigquery": BigQueryCov,
         "snowflake": SnowflakeCov,
+        "oracle": OracleCov,
     }[name](url)
 
 
@@ -135,7 +138,17 @@ def test_the_sample_is_hard_and_mostly_checked(engine_runs):
     assert len(agree) >= 0.9 * len(ruled), (engine, len(agree), len(ruled))
     logical = {c.logical for c in agree}
     assert {"integer", "decimal", "float", "boolean", "string", "date", "timestamp"} <= (
-        logical | ({"boolean"} if engine == "mysql" else set())
+        logical
+        | ({"boolean"} if engine == "mysql" else set())
+        # Oracle's DATE holds a time of day: it is a TIMESTAMP, and Oracle has
+        # no date-only type.
+        | ({"date"} if engine == "oracle" else set())
+        # ... and no BOOLEAN column type before 23ai.
+        | (
+            {"boolean"}
+            if engine == "oracle" and not any(c.native == "boolean" for c in cells)
+            else set()
+        )
     ), (engine, logical)
 
 

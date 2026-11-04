@@ -72,7 +72,9 @@ stored history.
 | 3 | weeks 9-16 | Databricks, Redshift, keyed checksum, 1.0, outside review of the risk file | coverage A-, trust A+ |
 | 4 | ongoing | Teradata and DB2; users and contributors | maturity A (depends on adoption, not only on work) |
 
-Phase 1 started 2026-11-03.
+Phase 1 started 2026-11-03. Oracle landed 2026-11-04: dialect, coverage map,
+NLS red-team round, risk entry and live suite, verified on 23ai and 21c (see
+`docs/engines.md`).
 
 ## What is not done
 

@@ -79,11 +79,13 @@ The foundation of the whole tool: fold canonical row text into an integer that
 | Snowflake | `floor(md5_number_upper64(<text>) / 16)` |
 | BigQuery | `cast(concat('0x', substr(to_hex(md5(<text>)), 1, 15)) as int64)` |
 | SQL Server | `convert(bigint, convert(varbinary(8), '0' + left(convert(varchar(32), hashbytes('MD5', <utf8>), 2), 15), 2))` |
+| Oracle | `nvl(to_number(substr(rawtohex(standard_hash(<text>, 'MD5')), 1, 15), 'XXXXXXXXXXXXXXX'), <md5('')>)`; a row that may pass 4,000 bytes: the same 15 digits of `parity_md5(<clob>)` |
 
-All six return `648541476951500027` for input `'abc'` - through six different
+All seven return `648541476951500027` for input `'abc'` (Oracle on both of its paths) - through seven different
 paths (bit-cast, hex-cast, CONV, Snowflake's top-64-bits-then-drop-4,
 BigQuery's hex-cast of `to_hex`, since its `md5` returns BYTES, and SQL
-Server's style-2 hex read back as 8 bytes behind a `0` nibble), which
+Server's style-2 hex read back as 8 bytes behind a `0` nibble, and Oracle's
+`to_number(..., 'XXX...')` of `STANDARD_HASH`'s hex), which
 is exactly why a test pins the constant on each. On SQL Server `<utf8>` is
 `cast(cast(<text> as nvarchar(max)) collate Latin1_General_100_BIN2_UTF8 as
 varchar(max))`: SQL Server holds Unicode as UTF-16, and hashing that disagrees
@@ -212,6 +214,101 @@ Decisions, not just spellings:
   `bit` there would turn PostgreSQL's bit strings into booleans.
 - SQL Server floats cannot hold Infinity or NaN, so no tokens are emitted.
 
+**Oracle** (verified live 2026-11-04 against Oracle Database 23ai Free
+23.26 and 21c XE 21.3 in containers, byte-for-byte with DuckDB over 5,000
+mixed-type rows, the conformance sweep at scales 6 and 2 (818 cells on 23ai,
+788 on 21c, which has no BOOLEAN or JSON type), and the FLOAT form on 11,576
+doubles at scales 0, 2, 6, 9 and 20; `tests/test_oracle.py`,
+`tests/test_oracle_offline.py`; the whole live suite passes on both). python-oracledb thin mode. Every value is
+VARCHAR2 in the database character set, which must be AL32UTF8 (refused
+otherwise), so its bytes *are* UTF-8:
+
+| Oracle type | Expression (inside `case when c is null then <sentinel> else ... end`) |
+|---|---|
+| `NUMBER(p,0)`, `NUMBER(*,0)`, scale <= 0 | `to_char(c, 'TM9', <period as decimal character>)` |
+| `NUMBER`, `NUMBER(p,s)`, `FLOAT(p)` (a decimal NUMBER) | `parity_dec(c, s, col)`: `round(c, s)` by TM9, leading `0` restored, fraction padded; >= 1e38 raises |
+| `BINARY_DOUBLE`, `BINARY_FLOAT` (widened) | `parity_float(x, s, col)` - see FLOAT canonical form |
+| `VARCHAR2` / `CHAR` | escaped `c` / `rtrim(c)` |
+| `NVARCHAR2` / `NCHAR` | escaped `to_char(c)` / `rtrim(to_char(c))` - never left national |
+| `CLOB` / `NCLOB` | escaped `c` / `to_clob(c)` (a CLOB) |
+| `DATE` | the TIMESTAMP rule: `to_char(c, 'MM-DD HH24:MI:SS')` and `.000000` behind the year |
+| `TIMESTAMP(p)` | `to_char(v, 'MM-DD HH24:MI:SS.FF6')` (FF6 truncates) behind the year; TZ types use `v = sys_extract_utc(...)` |
+| year | `FM0000`; Oracle has no year 0, so -1 renders `0000` and -44 renders `-43`; > 9999 raises |
+| `INTERVAL YEAR TO MONTH` / `DAY TO SECOND` | `canonical_interval_text` from EXTRACT; DS as total microseconds split into days and the rest |
+| `RAW` / `BLOB` | `BINARY_PREFIX` and `lower(rawtohex(c))` / `lower(parity_blob_hex(c))`, as a CLOB |
+| `BOOLEAN` (23ai) | `case when c then 'true' when not c then 'false' end` |
+| `JSON`, `ROWID` | UNKNOWN (escaped `json_serialize(c returning clob)`, `rowidtochar(c)`) |
+| `LONG`, `XMLTYPE`, `VECTOR`, objects | refused, naming the column |
+
+Decisions, not just spellings:
+
+- **The 4,000-byte trap.** SQL VARCHAR2 is 4,000 bytes (MAX_STRING_SIZE
+  STANDARD); a longer `||` raises ORA-01489 and `STANDARD_HASH` rejects a
+  CLOB (ORA-00902). `DBMS_CRYPTO` needs EXECUTE, which `CREATE SESSION` +
+  `SELECT` does not give (verified with exactly that login). So `hash_parts`
+  emits `case when <bound> <= 4000 then <STANDARD_HASH of the VARCHAR2 row>
+  else <parity_md5 of the CLOB row> end`, the bound summed from each part's
+  registered upper bound (`2 * lengthb` for VARCHAR2, `3 * lengthb` for
+  national text, `3 * dbms_lob.getlength` for a CLOB, constants otherwise).
+  Both branches hash the same text; a bound too small would raise ORA-01489,
+  never truncate. `parity_md5` is RFC 1321 in PL/SQL (`DBMS_LOB.CONVERTTOBLOB`
+  to AL32UTF8, 16 kB chunks), declared in the query's `WITH FUNCTION` clause
+  - no CREATE privilege, nothing stored - and equals `hashlib.md5` from 0 B to
+  600 kB, emoji across every chunk boundary included; about 0.5 MB/s.
+- **Inline functions, because Oracle parses slowly.** The FLOAT construction
+  as one SQL expression was 171 kB per column, and a 500-column checksum
+  query sat for minutes in "latch: shared pool". `parity_float` and
+  `parity_dec` hold the same arithmetic in variables. `query` prepends
+  exactly the functions a statement calls.
+- **The empty string is NULL.** Oracle cannot store `''`, so the sentinel is
+  decided by the *column* being NULL, never by the rendered text: an
+  all-space CHAR rtrims to NULL, which `||` reads as the empty text it is.
+  Oracle NULL against another engine's `''` is a reported difference, and
+  `caveats()` says so on every run with a text column. No equating mode.
+- **FLOAT.** `cast(binary_double as number)` keeps 17 significant digits
+  (3,807 of 4,000 doubles came back inexact). The exact value is
+  `m / 2^(52-e)` in NUMBER (m < 2^53 exact; 2^s exact in NUMBER up to
+  s = 130); NUMBER to BINARY_DOUBLE is correctly rounded (3,000 random
+  decimals of 15-38 digits); the 15/16/17-digit candidates with ties to even
+  then work as on SQL Server. **Any BINARY_DOUBLE operand makes the whole
+  expression BINARY_DOUBLE** - the first draft's exponent was one, and 593
+  values disagreed.
+- **Escaping runs under `collate binary` and is handed back `collate
+  using_nls_comp`**: a column collation (EXTENDED databases) could make
+  REPLACE linguistic, and text with an explicit collation cannot be appended
+  to a CLOB (ORA-43912). A CLOB takes no COLLATE at all.
+- **Session pins** (`SESSION_PINS`): language, territory, calendar (a Thai
+  Buddha calendar moves every year), numeric characters, the date and
+  timestamp formats, NLS_SORT/NLS_COMP BINARY, TIME_ZONE +00:00 (otherwise
+  inherited from the client: +01:00 seen), NLS_NCHAR_CONV_EXCP,
+  CURSOR_SHARING EXACT, QUERY_REWRITE_ENABLED off (a stale materialized view
+  must never answer for the table). A logon trigger setting all of them
+  hostile changes no row's text (`test_hostile_session_settings_...`).
+- **Keys.** Integer keys wider than 18 digits are hashed (`bisects_natively`):
+  `(k - lo) * n` past 38 digits would round silently in NUMBER. `int_div` is
+  the exact-multiple form. LOB keys are refused. Distinct keys are counted by
+  SHA-256 of their text.
+- **Snapshot.** `SET TRANSACTION READ ONLY` after the pins: one snapshot, and
+  ORA-01456 for any write (verified around `query`). A table whose
+  definition is newer than the snapshot (created, altered, truncated, or
+  given its first segment just before) raises ORA-01466 - measured always at
+  0 s, sometimes at 1.1 s, never from 1.6 s - which `query` re-raises naming
+  the side. A TIMESTAMP WITH LOCAL TIME ZONE at 9999-12-31 23:59:59.999999
+  UTC reads as year 10000 on 23ai and TO_CHAR raises ORA-01877 on it: the
+  year guard refuses it (21c renders it correctly).
+- **Julian dates.** Oracle's calendar is Julian before 1582-10-15, also in
+  arithmetic: `date '0999-12-25' + 66` is 1000-02-29 (DuckDB: 1000-03-01).
+  Values compare by their Y-M-D labels, which is what drivers and exports
+  carry; data built by date arithmetic before 1582 differs, and is reported.
+- **DBMS_CRYPTO, where granted.** `connect` probes `DBMS_CRYPTO.HASH`; when
+  the login may call it, long rows are hashed by it natively (it hashes a
+  CLOB as AL32UTF8 - verified equal to `parity_md5` and to Python on every
+  test text). Otherwise `parity_md5`. Both paths ran the full live suite.
+- **Driver binds.** python-oracledb binds a Python float as NUMBER (lossy, or
+  DPY-4003) and a timedelta of -1 us as -1 day + 23:59:59.999999; tests bind
+  BINARY_DOUBLE explicitly and intervals as `numtodsinterval`. The dialect
+  fetches NUMBER as Decimal and LOBs as str/bytes (`_output_type_handler`).
+
 **Infinity and NaN must be special-cased for FLOAT.** DuckDB cannot cast them
 to DECIMAL at all — `Could not cast value inf to DECIMAL(38,6)` kills the whole
 diff — while PostgreSQL renders them happily. Any division by zero produces one,
@@ -291,6 +388,7 @@ for byte:
 | BigQuery | the first of `round(cast(c as bignumeric), n-1-e, 'ROUND_HALF_EVEN')` for n = 15, 16, 17 significant digits that casts back to `c`, then `round(.., 6)` |
 | SQL Server | the same construction from `cast(c as decimal(38,37))` below 1 and `cast(c as decimal(38,21))` up to 2^53, with ties to even built by hand (`ROUND` is half away from zero) at 16 and 17 digits; `--float-scale` capped at 18 |
 | Snowflake | the same two bands from `cast(c as number(38,q))`, candidates `round(.., n-1-e, 'HALF_TO_EVEN')` |
+| Oracle | `parity_float`: the exact value as `m / 2^(52-e)` in NUMBER, then the SQL Server candidates and ties |
 
 Every one of these was found by measurement, not by reading the docs:
 
@@ -1002,6 +1100,7 @@ duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute, POSIX)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 duckdb:///:memory:
 mssql://user:password@host:port/database?trust_server_certificate=yes   (also sqlserver://)
+oracle://user:password@host:port/service_name        (python-oracledb thin mode)
 ```
 
 The slash count carries meaning, as in sqlite and SQLAlchemy: exactly **one**

@@ -106,6 +106,7 @@ First non-agreeing cells per engine (scale 6):
 
 - bigquery `NUMERIC` 'd:99999999999999999999999999999.999999999': refused (documented) - text `None`, rules `None` - 400 POST <url> numeric overflow: ROUND(99999999999999999999999999999.999999999, 6)
 - bigquery `NUMERIC` 'd:-99999999999999999999999999999.999999999': refused (documented) - text `None`, rules `None` - 400 POST <url> numeric overflow: ROUND(-99999999999999999999999999999.999999999, 6)
+- oracle `timestamp(9) with local time zone` 'tz:9999-12-31 23:59:59.999999+00:00': refused (documented) - text `None`, rules `None` - parity: TIMESTAMP value past year 9999 cannot be rendered in column 'v_0'
 
 ## Per native type (scale 6)
 
@@ -272,13 +273,38 @@ First non-agreeing cells per engine (scale 6):
 | snowflake | `TIMESTAMP_TZ(9)` | timestamp | 19 | 19 | 0 | 0 | 0 | 0 |
 | snowflake | `VARCHAR` | string | 47 | 47 | 0 | 0 | 0 | 0 |
 | snowflake | `VARIANT` | json | 42 | 42 | 0 | 0 | 0 | 0 |
+| oracle | `binary_double` | float | 229 | 225 | 0 | 4 | 0 | 0 |
+| oracle | `binary_float` | float | 51 | 51 | 0 | 0 | 0 | 0 |
+| oracle | `blob` | binary | 16 | 16 | 0 | 0 | 0 | 0 |
+| oracle | `boolean` | boolean | 3 | 3 | 0 | 0 | 0 | 0 |
+| oracle | `char(20)` | string | 16 | 16 | 0 | 0 | 0 | 0 |
+| oracle | `clob` | string | 47 | 47 | 0 | 0 | 0 | 0 |
+| oracle | `date` | timestamp | 30 | 29 | 0 | 0 | 0 | 1 |
+| oracle | `integer` | integer | 26 | 26 | 0 | 0 | 0 | 0 |
+| oracle | `interval day(9) to second(6)` | interval | 6 | 6 | 0 | 0 | 0 | 0 |
+| oracle | `interval year(9) to month` | interval | 6 | 6 | 0 | 0 | 0 | 0 |
+| oracle | `nchar(20)` | string | 16 | 16 | 0 | 0 | 0 | 0 |
+| oracle | `nclob` | string | 47 | 47 | 0 | 0 | 0 | 0 |
+| oracle | `number` | decimal | 28 | 28 | 0 | 0 | 0 | 0 |
+| oracle | `number(10)` | integer | 15 | 15 | 0 | 0 | 0 | 0 |
+| oracle | `number(19)` | integer | 22 | 22 | 0 | 0 | 0 | 0 |
+| oracle | `number(38,30)` | decimal | 3 | 3 | 0 | 0 | 0 | 0 |
+| oracle | `number(38,9)` | decimal | 33 | 33 | 0 | 0 | 0 | 0 |
+| oracle | `nvarchar2(2000)` | string | 45 | 45 | 0 | 0 | 0 | 0 |
+| oracle | `raw(2000)` | binary | 16 | 16 | 0 | 0 | 0 | 0 |
+| oracle | `timestamp(6)` | timestamp | 21 | 21 | 0 | 0 | 0 | 0 |
+| oracle | `timestamp(6) with time zone` | timestamp | 19 | 19 | 0 | 0 | 0 | 0 |
+| oracle | `timestamp(9)` | timestamp | 27 | 27 | 0 | 0 | 0 | 0 |
+| oracle | `timestamp(9) with local time zone` | timestamp | 19 | 18 | 0 | 1 | 0 | 0 |
+| oracle | `varchar2(36)` | string | 5 | 5 | 0 | 0 | 0 | 0 |
+| oracle | `varchar2(4000)` | string | 45 | 45 | 0 | 0 | 0 | 0 |
 
 ## Across engines (scale 6)
 
 660 logical values are held by two or more engines. Of those:
 
-- **0** render differently under the same logical type (a rendering disagreement: false alarms at least, and a false-match risk)
-- **2** render differently because the engines map the native type to different logical types (a type-mapping mismatch: always reported as a difference, never a false match)
+- **3** render differently under the same logical type (a rendering disagreement: false alarms at least, and a false-match risk)
+- **34** render differently because the engines map the native type to different logical types (a type-mapping mismatch: always reported as a difference, never a false match)
 - **0** are UNKNOWN-mapped values that render differently (no rule; expected)
 - **15** are JSON documents whose engines' normal forms differ - key order, duplicate keys, number spelling, escapes kept as written - each held to the rule for its own engine, expected to differ across engines, and warned about in every such run (a false alarm, never a false match)
 
@@ -300,10 +326,27 @@ First non-agreeing cells per engine (scale 6):
 - json_forms jf:{"b": 1, "a": 2}: '{"a": 2, "b": 1}' <- bigquery JSON (json), mysql json (json), postgres json (json), postgres jsonb (json), snowflake VARIANT (json) / '{"b": 1, "a": 2}' <- duckdb JSON (json)
 - json_forms jf:{"é": 1, "z": 2, "Z": 3, "ab": 4}: '{"Z": 3, "ab": 4, "z": 2, "é": 1}' <- bigquery JSON (json), snowflake VARIANT (json) / '{"é": 1, "z": 2, "Z": 3, "ab": 4}' <- duckdb JSON (json) / '{"Z": 3, "z": 2, "ab": 4, "é": 1}' <- mysql json (json), postgres json (json), postgres jsonb (json)
 
+**Same logical type, different text:**
+
+- (UNEXPLAINED) bytes by:: '\\\\x' <- bigquery BYTES (binary), duckdb BLOB (binary), mssql varbinary(max) (binary), mssql varbinary(300) (binary), mssql image (binary), mysql varbinary(300) (binary), mysql blob (binary), postgres bytea (binary), snowflake BINARY (binary) / '\\N' <- oracle raw(2000) (binary), oracle blob (binary)
+- (UNEXPLAINED) char c:: '' <- mssql char(20) (string), mssql nchar(20) (string), mysql char(20) (string), postgres char(20) (string) / '\\N' <- oracle char(20) (string), oracle nchar(20) (string)
+- (UNEXPLAINED) str s:: '' <- bigquery STRING (string), duckdb VARCHAR (string), mssql varchar(max) (string), mssql nvarchar(max) (string), mysql varchar(6000) (string), mysql longtext (string), postgres text (string), postgres varchar(6000) (string), postgres name (string), snowflake VARCHAR (string) / '\\N' <- oracle varchar2(4000) (string), oracle nvarchar2(2000) (string), oracle clob (string), oracle nclob (s
+
 **Type-mapping mismatches:**
 
-- (mapping) bool b:false: 'false' <- bigquery BOOL (boolean), duckdb BOOLEAN (boolean), mssql bit (boolean), postgres boolean (boolean), snowflake BOOLEAN (boolean) / '0' <- mysql boolean (integer)
-- (mapping) bool b:true: 'true' <- bigquery BOOL (boolean), duckdb BOOLEAN (boolean), mssql bit (boolean), postgres boolean (boolean), snowflake BOOLEAN (boolean) / '1' <- mysql boolean (integer)
+- (mapping) bool b:false: 'false' <- bigquery BOOL (boolean), duckdb BOOLEAN (boolean), mssql bit (boolean), oracle boolean (boolean), postgres boolean (boolean), snowflake BOOLEAN (boolean) / '0' <- mysql boolean (integer)
+- (mapping) bool b:true: 'true' <- bigquery BOOL (boolean), duckdb BOOLEAN (boolean), mssql bit (boolean), oracle boolean (boolean), postgres boolean (boolean), snowflake BOOLEAN (boolean) / '1' <- mysql boolean (integer)
+- (mapping) date dt:0001-01-01: '0001-01-01' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '0001-01-01 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:0001-01-01 BC: '0000-01-01' <- duckdb DATE (date), postgres date (date) / '0000-01-01 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:0044-03-15 BC: '-43-03-15' <- duckdb DATE (date), postgres date (date) / '-43-03-15 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:0999-12-31: '0999-12-31' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '0999-12-31 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1000-01-01: '1000-01-01' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1000-01-01 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1582-10-10: '1582-10-10' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1582-10-15 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1752-09-05: '1752-09-05' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1752-09-05 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1899-12-30: '1899-12-30' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1899-12-30 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1900-02-28: '1900-02-28' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1900-02-28 00:00:00.000000' <- oracle date (timestamp)
+- (mapping) date dt:1900-03-01: '1900-03-01' <- bigquery DATE (date), duckdb DATE (date), mssql date (date), mysql date (date), postgres date (date), snowflake DATE (date) / '1900-03-01 00:00:00.000000' <- oracle date (timestamp)
+- ... and 22 more
 
 **Collisions: one text, two different UNKNOWN-mapped values** (on one engine or across two - a false match wherever no rule decides):
 
@@ -320,6 +363,8 @@ Native types the dialect maps to UNKNOWN have no comparison rule: each engine co
 | postgres | `jsonb[]` | 7 | 7 | none | `'{}'`, `'{"{}"}'`, `'{"[1, 2]"}'` |
 | duckdb | `INTEGER[][]` | 7 | 7 | none | `'[]'`, `'[[]]'`, `'[[1, 2]]'` |
 | duckdb | `STRUCT(a INTEGER, b VARCHAR)` | 5 | 5 | none | `"{'a': 1, 'b': x}"`, `"{'a': NULL, 'b': NULL}"`, `"{'a': 1, 'b': 'NULL'}"` |
+| oracle | `json` | 27 | 25 | **1** (UNEXPLAINED): `js:{"a": 1}` = `js:{"a":1}` = `js:{ "a" :
+ 1 }` | `'{"a":1}'`, `'{"b":[1,2]}'`, `'"1"'` |
 
 Not loaded by this suite (no measurement either way):
 
@@ -329,3 +374,4 @@ Not loaded by this suite (no measurement either way):
 - **mssql** - mapped but not loaded: text, ntext, sysname, varchar(n)/nvarchar(n) with n < max, datetime2(p) with p < 6, datetimeoffset(p) with p < 7, varchar under a non-UTF-8 collation (tested elsewhere: tests/test_mssql.py), binary(n), rowversion/timestamp (not insertable), time(1..6). UNKNOWN, not loaded: xml, geography, geometry, hierarchyid; no JSON type (an nvarchar holding JSON is STRING).
 - **bigquery** - mapped but not loaded: INT64 aliases (INTEGER, SMALLINT, ...), BIGDECIMAL, parameterised NUMERIC(p,s) / STRING(n) / BYTES(n); a JSON null (the load job cannot store one; the NULL guard is pinned offline). UNKNOWN, not loaded: STRUCT, GEOGRAPHY, INTERVAL, RANGE, and ARRAY of those or of JSON (no cross-engine rule; rendered injectively: STRUCT field by field, GEOGRAPHY as WKB). ARRAY of ruled types follows the list rule, but a BigQuery table cannot store a NULL array or a NULL element.
 - **snowflake** - mapped but not loaded: NUMBER(p,0) for p < 38 and NUMBER(p,s) for other s, INT/BIGINT aliases, CHAR/TEXT/STRING (aliases of VARCHAR), TIMESTAMP_NTZ/TZ/LTZ with precision < 9, DATETIME alias, TIME(0..8), OBJECT and ARRAY (JSON as VARIANT is), VARBINARY; no single-precision FLOAT exists. UNKNOWN, not loaded: GEOGRAPHY, GEOMETRY, VECTOR, FILE.
+- **oracle** - mapped but not loaded: NUMBER(p,0) for other p, NUMBER(p,-s), NUMBER(p,s) for other s, FLOAT(p) (a decimal NUMBER), VARCHAR2/CHAR/NVARCHAR2/NCHAR of other lengths, TIMESTAMP(p) for p other than 6 and 9, TIMESTAMP WITH TIME ZONE of other precisions, INTERVAL DAY TO SECOND(p) for p other than 6, RAW(n) for n < 2000; rows past 4,000 bytes (the PL/SQL hash path: tests/test_oracle.py). UNKNOWN, not loaded: ROWID, UROWID (text); LONG, LONG RAW, XMLTYPE, VECTOR, BFILE, SDO_GEOMETRY and object types (refused); JSON is loaded below.

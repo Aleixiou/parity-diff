@@ -12,7 +12,7 @@ that can only read anyway: then the server itself refuses a write.
 
 - [PostgreSQL](#postgresql) · [MySQL](#mysql) · [DuckDB](#duckdb) ·
   [SQL Server / Azure SQL](#sql-server--azure-sql) · [Snowflake](#snowflake) ·
-  [BigQuery](#bigquery)
+  [BigQuery](#bigquery) · [Oracle](#oracle)
 - [Keeping passwords out of logs](#keeping-passwords-out-of-logs)
 
 ## Summary
@@ -25,6 +25,7 @@ that can only read anyway: then the server itself refuses a write.
 | SQL Server / Azure SQL | `mssql` | only with `ALLOW_SNAPSHOT_ISOLATION ON` | 2019+; 2019 and 2022 verified; FLOAT needs compatibility level 130+ |
 | Snowflake | `snowflake` | no (READ COMMITTED only) | verified live on AWS; connector 4.x only |
 | BigQuery | `bigquery` | base tables and clones yes (time travel); views no | verified live in the EU region |
+| Oracle | `oracle` | yes (READ ONLY transaction) | 19c+ (19c not yet verified); 21c and 23ai verified; AL32UTF8 databases |
 
 Every run that lacks a single snapshot says so in a caveat. Redshift,
 Databricks and Fabric are not supported yet.
@@ -455,6 +456,130 @@ time instead.
 - `TIMESTAMP` on BigQuery is an instant (its naive type is `DATETIME`), and
   the tool treats it so.
 - Ctrl-C waits for the query in flight: cancelling a job needs a write scope.
+
+## Oracle
+
+```
+oracle://user:password@host:1521/service_name
+oracle://user:password@host/FREEPDB1?tcp_connect_timeout=5
+oracle://user:password@host:2484/service_name?protocol=tcps
+```
+
+`pip install "parity-diff[oracle]"` (python-oracledb in its default thin
+mode: pure Python, no Oracle client or Instant Client to install). The path is
+the **service name** (a PDB such as `ORCLPDB1`, `FREEPDB1`, an Autonomous
+Database service), not a SID. Verified on Oracle Database 23ai (Free 23.26)
+and 21c (XE 21.3), where the whole live suite passes; 19c is accepted but
+not yet verified, and older servers are refused.
+
+**Authentication.** User and password only, for now (no wallet, Kerberos or
+OS authentication). Options, all others refused: `tcp_connect_timeout`
+(seconds) and `protocol` (`tcp` or `tcps`).
+
+**Tables.** Oracle stores unquoted names in upper case, and table names are
+matched exactly: `--a-table ORDERS`, not `orders` (the "table not found" error
+names the near miss). Key and column names match case-insensitively, so
+`--key id` finds `ID`. Unqualified names mean the session's current schema —
+the login user, unless a logon trigger moved it — and every query is
+schema-qualified, so the rows read always come from the table introspected.
+
+**Minimum permissions.** `CREATE SESSION` and `SELECT` on the compared tables
+— nothing else, verified with exactly that login:
+
+```sql
+create user parity_reader identified by "…";
+grant create session to parity_reader;
+grant select on app.orders to parity_reader;
+```
+
+The tool reads `ALL_TAB_COLUMNS` (which lists only tables the login can
+read), `ALL_POLICIES` and `NLS_DATABASE_PARAMETERS`, all readable by any
+login. Long rows are hashed by an MD5 written in PL/SQL and declared inside
+the query (`WITH FUNCTION`), which needs no `CREATE PROCEDURE` and leaves
+nothing behind — and no `EXECUTE` on `DBMS_CRYPTO`, which a reader does not
+hold.
+
+**Consistency.** The session runs one `SET TRANSACTION READ ONLY`
+transaction: every query of the walk reads the database as of its first
+statement, and the server refuses any write. It is never committed. Two
+Oracle specifics:
+
+- A table created, altered or truncated during the diff, or within a few
+  seconds before it (even the first insert into a table created without a
+  segment counts; measured: always at once, sometimes 1.1 s later, never
+  after 1.6 s), cannot be read in that snapshot: the run stops with
+  ORA-01466, naming the side. Run it again.
+- A very long diff on a busy source can outlive the undo retention and stop
+  with ORA-01555 (snapshot too old). Loud, never a wrong answer; raise
+  `UNDO_RETENTION` or diff a quieter copy.
+
+**Database character set.** The database must be AL32UTF8 (the default since
+12.2); others are refused at connect, because Oracle's `STANDARD_HASH` hashes
+VARCHAR2 bytes in the database character set and the tool hashes UTF-8.
+NVARCHAR2, NCHAR and NCLOB values are converted to it first; a value that
+does not convert raises (`NLS_NCHAR_CONV_EXCP` is pinned on).
+
+**Speed.** Measured on Oracle Database 23ai Free (which caps itself at two
+CPU threads) in a container on a laptop, against DuckDB, 1,000,000 rows of
+five columns (integer key, NUMBER(12,2), VARCHAR2, BINARY_DOUBLE,
+TIMESTAMP): identical tables in 51 s (4 queries, no rows downloaded), one
+changed row found in 63 s (8 queries, 1,952 rows downloaded), the sample
+check included. A licensed server with more cores is faster; the work is
+one hash pass per side, as on every engine.
+
+**Session settings pinned at connect:** `NLS_LANGUAGE`, `NLS_TERRITORY`,
+`NLS_CALENDAR` (Gregorian), `NLS_NUMERIC_CHARACTERS`, `NLS_DATE_FORMAT`,
+`NLS_TIMESTAMP_FORMAT`, `NLS_TIMESTAMP_TZ_FORMAT`, `NLS_DATE_LANGUAGE`,
+`NLS_SORT` and `NLS_COMP` (BINARY), `TIME_ZONE` (+00:00), `NLS_NCHAR_CONV_EXCP`,
+`CURSOR_SHARING` (EXACT) and `QUERY_REWRITE_ENABLED` (off, so a stale
+materialized view can never answer for the table). A logon trigger setting
+every one of them to a hostile value was verified not to move a single row's
+text.
+
+**Types.**
+
+| Oracle | Compared as |
+|---|---|
+| `NUMBER(p,0)`, `NUMBER(*,0)`, `INTEGER` | integer, exact (38 digits); a key wider than 18 digits is hashed, never bucketed in rounding arithmetic |
+| `NUMBER`, `NUMBER(p,s)`, `FLOAT(p)` | decimal at the float scale, half away from zero; `FLOAT(p)` is a decimal NUMBER, not IEEE; a value of 10^38 or more is refused |
+| `BINARY_DOUBLE`, `BINARY_FLOAT` | the canonical FLOAT form (shortest round-trip decimal), Infinity and NaN as tokens |
+| `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `CLOB`, `NCLOB` | text, exactly; `CHAR`/`NCHAR` without trailing padding |
+| `DATE` | a **timestamp** (it holds a time of day): `2024-01-31 00:00:00.000000` |
+| `TIMESTAMP(p)` | timestamp at microseconds; p > 6 truncated, with a caveat |
+| `TIMESTAMP WITH [LOCAL] TIME ZONE` | the UTC instant |
+| `INTERVAL YEAR TO MONTH`, `INTERVAL DAY TO SECOND` | months / days and microseconds (`canonical_interval_text`) |
+| `RAW`, `BLOB` | bytes, exactly |
+| `BOOLEAN` (23ai) | boolean |
+| `JSON` (23ai), `ROWID`, `UROWID` | not covered: compared as their text, and listed as such |
+| `LONG`, `LONG RAW`, `XMLTYPE`, `VECTOR`, `BFILE`, object types | refused, naming the column: leave them out with `--exclude` |
+
+**Caveats.**
+
+- **Oracle stores the empty string as NULL.** An Oracle NULL is compared as
+  NULL, so a row the other side holds as `''` is reported as `different` —
+  which it is, on the target. Every run comparing a text column with an
+  Oracle side prints this caveat. If the migration deliberately turned
+  Oracle's NULLs into `''` (or the reverse), those rows are reported, not
+  hidden; there is no mode that equates them.
+- **DATE against a date-only column differs on every row**, since Oracle's
+  DATE carries a time and is rendered with it. The run warns about the type
+  mismatch; compare it against a timestamp column, or through a view.
+- Oracle dates before 1582-10-15 are Julian-calendar dates, as Oracle stores
+  them; they are compared by their year, month and day labels, which is how
+  every driver and export carries them. Date *arithmetic* there is Julian
+  too: `date '0999-12-25' + 66` is 1000-02-29 on Oracle and 1000-03-01 on
+  DuckDB or PostgreSQL (verified), so data generated by arithmetic before
+  1582 differs between them - and is reported, label by label.
+- Rows whose text may pass 4,000 bytes (estimated from the raw column
+  lengths and the declared number widths) are hashed as a CLOB: natively by
+  `DBMS_CRYPTO.HASH` when the login may call it, otherwise by the PL/SQL MD5
+  at roughly 0.5 MB/s per session. An ordinary row is hashed by
+  `STANDARD_HASH` in SQL. Both give the same hash; granting `EXECUTE ON
+  SYS.DBMS_CRYPTO` only makes wide or long tables faster.
+- Ctrl-C cancels the query in flight (python-oracledb's `cancel`).
+- Virtual Private Database policies can hide rows from the login; a table
+  carrying one gets a caveat. Oracle Data Redaction cannot be detected
+  without privileges: diff as a login it does not apply to.
 
 ## Keeping passwords out of logs
 
