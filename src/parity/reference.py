@@ -83,9 +83,10 @@ _UTC = dt.timezone.utc
 
 #: `[-]YYYY-MM-DD[ (BC)][( |T)HH:MM:SS[.f...]][offset][ BC]`, as engines print
 #: temporal values as text: PostgreSQL's JSON output (which ignores DateStyle)
-#: puts the era last, DuckDB's varchar cast puts it after the date.
+#: puts the era last, DuckDB's varchar cast puts it after the date. Years run
+#: to seven digits: PostgreSQL and DuckDB dates reach 5874897 AD (RT-HP3).
 _TEMPORAL = re.compile(
-    r"^(?P<neg>-)?(?P<y>\d{1,6})-(?P<mo>\d\d)-(?P<d>\d\d)(?P<bc1> \(BC\))?"
+    r"^(?P<neg>-)?(?P<y>\d{1,7})-(?P<mo>\d\d)-(?P<d>\d\d)(?P<bc1> \(BC\))?"
     r"(?:[ T](?P<h>\d\d):(?P<mi>\d\d):(?P<s>\d\d)(?:\.(?P<f>\d{1,9}))?)?"
     r"(?P<tz>Z|[+-]\d\d(?::?\d\d)?(?::?\d\d)?)?"
     r"(?P<bc> BC| \(BC\))?$"

@@ -90,12 +90,6 @@ def _role(name: str) -> str:
 # ------------------------------------------------------------- findings
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP1: column-level SELECT grants hide columns from "
-    "information_schema; the unreadable column is silently left out and the "
-    "verdict is identical with no caveat (FALSE MATCH)",
-)
 def test_rt_hp1_column_grant_hides_a_differing_column(schema):
     role = _role(f"rth_postgres_cg_{RUN}")
     _exec(
@@ -127,11 +121,6 @@ def test_rt_hp1_column_grant_hides_a_differing_column(schema):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP4: a view over a row-level-security table (security_invoker, "
-    "or owned by a role RLS applies to) hides rows with no caveat (FALSE MATCH)",
-)
 @pytest.mark.parametrize("kind", ["security_invoker", "owner_subject_to_rls"])
 def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
     reader = f"rth_postgres_vr_{RUN}"
@@ -183,11 +172,6 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP3: a DATE past 294276-12-31 (valid in PostgreSQL and DuckDB) "
-    "kills the whole diff: to_char casts it to timestamptz (crash)",
-)
 def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     for t in "ab":
         _exec(
@@ -200,12 +184,6 @@ def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP5: on PostgreSQL 9.6-11 the pinned extra_float_digits = 1 prints "
-    "doubles to 16 and reals to 7 digits, so floats inside unmapped types "
-    "(point, circle, composites) that differ past them read identical (FALSE MATCH)",
-)
 @pytest.mark.parametrize(
     ("typ", "v1", "v2"),
     [
@@ -250,12 +228,6 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP6: a --where calling set_config() rewrites a session pin "
-    "(extra_float_digits) mid-walk, after connect, so floats render at 2 digits "
-    "and a planted FLOAT difference reads identical (FALSE MATCH)",
-)
 def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
     for t in "ab":
         _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
@@ -314,11 +286,6 @@ def test_where_and_map_postgres_quoting(schema):
         _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "nm"})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP7: no connect_timeout is set, so a URL whose port has no listener "
-    "(on Windows psycopg retries a refused connect) hangs with no output (hang)",
-)
 def test_rt_hp7_unreachable_server_fails_within_a_minute():
     import subprocess
     import sys
@@ -346,12 +313,6 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
     assert p.returncode == 2 and "side A" in p.stderr
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP8: a composite-type key with a NULL field, row(1, NULL), is "
-    "refused as 'contains 1 NULL value(s)': PostgreSQL's row IS NOT NULL is "
-    "false when any field is NULL, though the key itself is not NULL (unclear error)",
-)
 def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
     _exec(
         ADMIN,
@@ -364,12 +325,6 @@ def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
     assert [(d.key, d.kind) for d in r.diffs] == [('(1,"")', "only_in_a")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP9: unmapped types are compared by ::text, which is not always "
-    "injective - contrib seg prints 123456789 and 123456788 alike "
-    "('1.23457e+08') though PostgreSQL's own = calls them different (FALSE MATCH)",
-)
 def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
     _exec(
         ADMIN,
@@ -382,7 +337,11 @@ def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
         ADMIN,
         f"select a.v = b.v from {schema}.a a join {schema}.b b using (id) where id = 2",
     )[0][0]
-    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    try:
+        r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    except ValueError as exc:  # refusing a type it cannot compare exactly is a fix too
+        assert "seg" in str(exc) and "--exclude" in str(exc)
+        return
     assert [d.key for d in r.diffs] == [2]
 
 
@@ -952,12 +911,6 @@ def test_distinct_values_of_exotic_types_are_found(schema, typ, v1, v2):
     assert not r.unexplained
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP2: money is read under the pinned lc_monetary 'C' (2 decimals), "
-    "so yen entered under a 0-decimal locale (12345 yen) renders 123.45 and "
-    "matches a DuckDB decimal 123.45 (FALSE MATCH; the true 12345 is a false alarm)",
-)
 def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
     import duckdb
 
@@ -986,8 +939,11 @@ def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
     con.execute("create table m (id int primary key, m decimal(18,2))")
     con.execute("insert into m values (1, 12345), (2, 1.00)")  # key 2 really differs
     con.close()
+    sep = "&" if "?" in pg_url else "?"
+    url = f"{pg_url}{sep}options={quote(f'-c lc_monetary={locale}')}"
     try:
-        r = _diff(pg_url, f"public.{table}", f"duckdb:///{path}", "main.m")
+        r = _diff(url, f"public.{table}", f"duckdb:///{path}", "main.m")
         assert [d.key for d in r.diffs] == [2]
+        assert any("lc_monetary" in w for w in r.warnings)
     finally:
         _exec(pg_url, f"drop table if exists public.{table}")

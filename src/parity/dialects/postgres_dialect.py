@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import Any
 from urllib.parse import unquote
 
@@ -100,6 +101,43 @@ MIN_SERVER_VERSION = 90600
 #: Older servers reject the name, so it is pinned only where it exists.
 TRANSACTION_TIMEOUT_FROM = 170000
 
+#: Seconds libpq may spend establishing the connection, unless the URL sets
+#: `connect_timeout` itself (RT-HP7).
+DEFAULT_CONNECT_TIMEOUT = 30
+
+#: Extension types whose text output is exact - two different values never
+#: print alike - so an unmapped column of one compares by its text alone, as
+#: before (RT-HP9): citext's is the text; hstore quotes every key and value;
+#: ltree's labels are text; the isn types print every digit; cube prints its
+#: doubles through float8out (shortest round-trip on 12+, 17 digits under the
+#: pin before); PostGIS prints hex EWKB; pgvector prints the shortest
+#: round-trip of each float4. Any other base type outside pg_catalog is
+#: compared by its binary send function as well, or refused
+#: (`PostgresDialect._exact_unmapped`). Matched by type name.
+TRUSTED_EXTENSION_TYPES = frozenset(
+    {
+        "citext",
+        "hstore",
+        "ltree",
+        "lquery",
+        "ltxtquery",
+        "ean13",
+        "isbn",
+        "isbn13",
+        "ismn",
+        "ismn13",
+        "issn",
+        "issn13",
+        "upc",
+        "cube",
+        "geometry",
+        "geography",
+        "vector",
+        "halfvec",
+        "sparsevec",
+    }
+)
+
 #: The text an infinite date, timestamp or timestamptz renders as. `to_char`
 #: returns SQL NULL for both infinities, which the coalesce turned into the
 #: NULL sentinel: +infinity, -infinity and NULL all compared equal - and
@@ -109,8 +147,26 @@ TRANSACTION_TIMEOUT_FROM = 170000
 #: without the DuckDB rendering, or any DuckDB checksum, moving. FLOAT's
 #: `Infinity` is capitalised, but the two never meet: a DATE column is never
 #: compared with a FLOAT one. No other supported engine can store either.
+#: The last date a timestamptz can hold, so the last one `to_char` can render.
+DATE_TIMESTAMP_MAX = "294276-12-31"
+
 DATE_INFINITY = "infinity"
 DATE_NEG_INFINITY = "-infinity"
+
+#: Functions a row filter may not call (`check_where`): they change a session
+#: setting (set_config - RT-HP6), take locks or sleep (a hang mid-walk),
+#: notify, touch sequences or large objects, signal other backends, reach
+#: another server (dblink), or run SQL given as a string (query_to_xml and
+#: friends, which could call any of the others out of sight).
+_FILTER_FORBIDDEN = re.compile(
+    r"\b(set_config|pg_(?:try_)?advisory\w*|pg_sleep\w*|pg_notify|nextval|setval|"
+    r"lo_\w+|dblink\w*|pg_terminate_backend|pg_cancel_backend|"
+    r"pg_reload_conf|pg_rotate_logfile\w*|pg_switch_wal|pg_create_restore_point|"
+    r"pg_promote|pg_log_backend_memory_contexts|"
+    r"query_to_xml\w*|cursor_to_xml\w*|ts_stat|txid_current|"
+    r"pg_current_xact_id\w*|pg_export_snapshot)\s*\(",
+    re.IGNORECASE,
+)
 
 #: Matches the scheme of a PostgreSQL URL in any case. The dialect is chosen
 #: case-insensitively (`get_dialect`), but libpq accepts only lower case and
@@ -205,12 +261,19 @@ class PostgresDialect(Dialect):
         """
         import psycopg
 
+        # libpq waits forever by default, and on Windows psycopg retries a
+        # refused connect - an unreachable port hung the CLI with no output at
+        # all (RT-HP7). A `connect_timeout` in the URL wins.
+        extra: dict[str, Any] = {}
+        if "connect_timeout" not in connection_string.lower():
+            extra["connect_timeout"] = DEFAULT_CONNECT_TIMEOUT
         try:
             # psycopg understands postgres:// and postgresql:// URLs directly,
             # but only in lower case - see `_SCHEME`.
             self._conn = psycopg.connect(
                 _SCHEME.sub(lambda m: m.group(1).lower() + "://", connection_string),
                 autocommit=True,
+                **extra,
             )
         except psycopg.Error as exc:
             # libpq quotes the token it could not parse, which for a mistyped
@@ -235,10 +298,31 @@ class PostgresDialect(Dialect):
                 "not supported: parity needs PostgreSQL 9.6 or newer (12 or newer "
                 "to compare FLOAT columns)"
             )
+        # money stores an integer count of the currency's smallest unit; how
+        # many of its digits are decimals is the lc_monetary locale's
+        # frac_digits - 2 under the pinned C, 0 for yen. Read under the
+        # login's own default, before the pin: rendered under C, 12345 yen
+        # read 123.45 and matched a migrated 123.45 (RT-HP2).
+        row = self._conn.execute(
+            "select pg_catalog.scale('0'::money::numeric), "
+            "pg_catalog.current_setting('lc_monetary')"
+        ).fetchone()
+        self._money_digits = int(row[0]) if row else 2
+        self._monetary_locale = str(row[1]) if row else "C"
         for setting, value in SESSION_PINS:
+            if setting == "extra_float_digits" and self._server_version_num < 120000:
+                # Before 12, 1 means 16 significant digits for a double and 7
+                # for a real - not enough to tell 0.1 from the next double, so
+                # floats inside unmapped types (point, circle, a composite)
+                # that differed past them read identical (RT-HP5). 3 prints
+                # 17 and 9, which round-trip. FLOAT columns stay refused there.
+                value = "3"
             self._conn.execute(f"set {setting} = {value}")
         if self._server_version_num >= TRANSACTION_TIMEOUT_FROM:
             self._conn.execute("set transaction_timeout = 0")
+        # What every pin reads back as, to check after the walk that nothing
+        # - a `--where` or a view calling set_config() - moved one (RT-HP6).
+        self._pinned = self._read_pins()
         self._conn.autocommit = False
         # Read-only by construction (CLAUDE.md section 6). Enforced by the
         # server, so no bug in query building can write to a user's database.
@@ -257,6 +341,32 @@ class PostgresDialect(Dialect):
         # verdict.
         self._conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
 
+    def check_where(self, where: str) -> None:
+        """Refuse, besides the shared checks, a filter calling a function that
+        changes the session or acts outside the read (RT-HP6).
+
+        The filter is pasted into every query, so `set_config()` in it reset a
+        pin mid-walk - after `connect` had set it - and a planted FLOAT
+        difference read identical. Names are matched outside string literals
+        (a quoted identifier is a name too: `"set_config"(...)` calls it), and
+        a Unicode-escaped identifier (`U&"..."`), which could spell any of
+        them, is refused outright. A user function that calls one is caught
+        after the walk instead (`session_drift`).
+        """
+        super().check_where(where)
+        code = re.sub(r"'(?:[^']|'')*'", "''", where)
+        if re.search(r'\bu&"', code, re.IGNORECASE):
+            raise self._err(
+                f"row filter {where!r} contains a Unicode-escaped identifier "
+                '(U&"..."); spell the name plainly'
+            )
+        found = _FILTER_FORBIDDEN.search(code.replace('"', " "))
+        if found:
+            raise self._err(
+                f"row filter {where!r} calls {found.group(1)}(), which changes the "
+                "session or acts outside the read - a filter may only select rows"
+            )
+
     def cancel(self) -> None:
         """Abort the query currently running on this connection.
 
@@ -270,6 +380,43 @@ class PostgresDialect(Dialect):
     def close(self) -> None:
         """Close the connection, ending the snapshot the diff was reading."""
         self._conn.close()
+
+    def _pin_names(self) -> list[str]:
+        """Every setting `connect` pinned, transaction_timeout where it exists."""
+        names = [s for s, _ in SESSION_PINS]
+        if self._server_version_num >= TRANSACTION_TIMEOUT_FROM:
+            names.append("transaction_timeout")
+        return names
+
+    def _read_pins(self) -> dict[str, str]:
+        """The current value of every pinned setting, by name."""
+        names = self._pin_names()
+        cols = ", ".join(f"pg_catalog.current_setting({sql_literal(n)})" for n in names)
+        row = self._conn.execute(f"select {cols}").fetchone()
+        return dict(zip(names, (str(v) for v in row or ()), strict=False))
+
+    def session_drift(self) -> list[str]:
+        """Pinned settings that no longer hold their pinned value.
+
+        Every query the walk runs pastes the user's row filter, and reads
+        views that may call functions; `set_config()` in either rewrote a pin
+        mid-walk - extra_float_digits to -15, and two different doubles
+        rendered alike (RT-HP6). `check_where` refuses the known culprits by
+        name; this is the defence that does not depend on a list. One query,
+        after the walk, outside the query count.
+        """
+        pinned = getattr(self, "_pinned", None)
+        if not pinned:
+            return []
+        now = self._read_pins()
+        return [
+            f"session setting {name} was {pinned[name]!r} at connect but "
+            f"{now.get(name)!r} after the walk: something the queries ran (the "
+            "row filter, or a function a view calls) changed it, so values may "
+            "have rendered differently from the canonical form"
+            for name in pinned
+            if now.get(name) != pinned[name]
+        ]
 
     def query(self, sql: str) -> list[tuple[Any, ...]]:
         """Run `sql` and return every row. psycopg hands back tuples already.
@@ -335,7 +482,6 @@ class PostgresDialect(Dialect):
                 table, self._with_enums(table, super().columns(table))
             )
             self._note_row_security(table)
-            return cols
         except ValueError as exc:
             try:
                 schema, name = self.split_table(table, self.default_schema)
@@ -344,7 +490,118 @@ class PostgresDialect(Dialect):
             found = self._matview_columns(table, schema, name)
             if found is None:
                 raise
-            return self._with_arrays(table, found)
+            cols = self._with_arrays(table, found)
+        self._note_relation(table, cols)
+        return cols
+
+    def _note_relation(self, table: str, cols: list[Column]) -> None:
+        """Catalog facts about `table` that the comparison must not ignore.
+
+        - **Unreadable columns** (RT-HP1): under column-level grants
+          information_schema lists only the columns the role may read, so a
+          differing column it may not was silently left out - a false match.
+          pg_attribute lists them all; `unreadable_columns` hands them to the
+          engine, which never calls such a run identical.
+        - **Inheritance children**: a parent table's rows include its
+          children's, as any `select` from it reads them - a caveat, since the
+          other side may hold the parent's own rows only. Partitions are the
+          point of a partitioned table and draw none.
+        - **Unmapped types whose text is not known exact** (RT-HP9): see
+          `_untrusted_types`.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        where = (
+            "from pg_catalog.pg_class c "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)}"
+        )
+        rows = self.query(
+            "select a.attname "
+            f"{where.replace('from ', 'from pg_catalog.pg_attribute a, ', 1)} "
+            "and a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped "
+            "and not pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') "
+            "order by a.attnum"
+        )
+        self._unreadable = {table: [str(r[0]) for r in rows]}
+        rows = self.query(
+            "select c.relkind, (select pg_catalog.string_agg(pg_catalog.quote_ident("
+            "cn.nspname) || '.' || pg_catalog.quote_ident(ch.relname), ', ' "
+            "order by cn.nspname, ch.relname) from pg_catalog.pg_inherits i "
+            "join pg_catalog.pg_class ch on ch.oid = i.inhrelid "
+            "join pg_catalog.pg_namespace cn on cn.oid = ch.relnamespace "
+            f"where i.inhparent = c.oid) {where}"
+        )
+        self._children = (
+            [(table, str(rows[0][1]))]
+            if rows and rows[0][0] == "r" and rows[0][1]
+            else []
+        )
+        self._untrusted = self._untrusted_types(schema, name, cols)
+
+    def _untrusted_types(
+        self, schema: str, name: str, cols: list[Column]
+    ) -> dict[str, tuple[str, str | None]]:
+        """Unmapped columns whose type's text may not be exact (RT-HP9).
+
+        Walks each such column's type through domains, array elements,
+        composite fields and range subtypes, and finds any base type that is
+        neither PostgreSQL's own (pg_catalog) nor in `TRUSTED_EXTENSION_TYPES`.
+        Maps the column to (that type, its send function) when the column *is*
+        that type, possibly through domains; to (type, None) - refused - when
+        it is nested, or has no send function. One catalog query, and only
+        when an unmapped column exists.
+        """
+        unknown = [c.name for c in cols if c.logical_type is LogicalType.UNKNOWN]
+        if not unknown:
+            return {}
+        multirange = (
+            "union all select r.rngtypid, true from pg_catalog.pg_range r "
+            "where ty.typtype = 'm' and r.rngmultitypid = ty.oid "
+            if getattr(self, "_server_version_num", 120000) >= 140000
+            else ""
+        )
+        trusted = ", ".join(sql_literal(t) for t in sorted(TRUSTED_EXTENSION_TYPES))
+        rows = self.query(
+            "with recursive node(attname, typ, nested) as ("
+            "select a.attname, a.atttypid, false from pg_catalog.pg_attribute a "
+            "join pg_catalog.pg_class c on c.oid = a.attrelid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)} "
+            "and a.attnum > 0 and not a.attisdropped "
+            "union select node.attname, ch.typ, node.nested or ch.nested from node "
+            "join pg_catalog.pg_type ty on ty.oid = node.typ "
+            "cross join lateral ("
+            "select ty.typbasetype as typ, false as nested where ty.typtype = 'd' "
+            "union all select ty.typelem, true where ty.typtype <> 'd' "
+            "and ty.typelem <> 0 and ty.typlen = -1 "
+            "union all select ca.atttypid, true from pg_catalog.pg_attribute ca "
+            "where ty.typtype = 'c' and ca.attrelid = ty.typrelid "
+            "and ca.attnum > 0 and not ca.attisdropped "
+            "union all select r.rngsubtype, true from pg_catalog.pg_range r "
+            f"where ty.typtype = 'r' and r.rngtypid = ty.oid {multirange}"
+            ") ch) "
+            "select node.attname, bool_or(node.nested), "
+            "min(pg_catalog.format_type(ty.oid, null)), "
+            "min(case when not node.nested and ty.typsend <> 0 then "
+            "pg_catalog.quote_ident(pn.nspname) || '.' || pg_catalog.quote_ident(p.proname) end) "
+            "from node join pg_catalog.pg_type ty on ty.oid = node.typ "
+            "join pg_catalog.pg_namespace tn on tn.oid = ty.typnamespace "
+            "left join pg_catalog.pg_proc p on p.oid = ty.typsend "
+            "left join pg_catalog.pg_namespace pn on pn.oid = p.pronamespace "
+            "where ty.typtype = 'b' and tn.nspname <> 'pg_catalog' "
+            "and not (ty.typelem <> 0 and ty.typlen = -1) "
+            f"and ty.typname not in ({trusted}) "
+            "group by node.attname"
+        )
+        out: dict[str, tuple[str, str | None]] = {}
+        for attname, nested, typ, send in rows:
+            if str(attname) in unknown:
+                out[str(attname)] = (str(typ), None if nested or not send else str(send))
+        return out
+
+    def unreadable_columns(self, table: str) -> list[str]:
+        """Columns of `table` this login lacks SELECT on (`_note_relation`)."""
+        return list(getattr(self, "_unreadable", {}).get(table, []))
 
     def _note_row_security(self, table: str) -> None:
         """Remember a table whose rows a row-level security policy filters.
@@ -357,25 +614,104 @@ class PostgresDialect(Dialect):
         schema, name = self.split_table(table, self.default_schema)
         rows = self.query(
             "select c.relrowsecurity and not (r.rolsuper or r.rolbypassrls) "
-            "and (c.relforcerowsecurity or c.relowner <> r.oid) "
+            "and (c.relforcerowsecurity or c.relowner <> r.oid), c.relkind "
             "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
             "join pg_roles r on r.rolname = current_user "
             f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)}"
         )
         if rows and rows[0][0]:
             self._row_security = [*getattr(self, "_row_security", []), table]
+        elif rows and rows[0][1] == "v":
+            self._note_view_row_security(table, schema, name)
+
+    def _note_view_row_security(self, table: str, schema: str, name: str) -> None:
+        """Remember a view that reads, at any depth, a table RLS may filter.
+
+        A view's rows are its tables' rows as *some* role sees them - the
+        reader's for a `security_invoker` view, the view owner's otherwise -
+        and a view over an RLS table hid rows with no caveat (RT-HP4). Every
+        relation the view's rewrite rule depends on is followed, through
+        nested views; the caveat fires when a reached table has RLS enabled
+        and it applies to the reader or to any owner of a view on the way.
+        That is a superset of the roles PostgreSQL actually checks, so it can
+        warn needlessly, never miss.
+        """
+        rows = self.query(
+            "with recursive dep(oid) as ("
+            "select c.oid from pg_catalog.pg_class c "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            f"where n.nspname = {sql_literal(schema)} and c.relname = {sql_literal(name)} "
+            "union select d.refobjid from dep "
+            "join pg_catalog.pg_rewrite w on w.ev_class = dep.oid "
+            "join pg_catalog.pg_depend d on d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass "
+            "and d.objid = w.oid and d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+            "and d.refobjid <> dep.oid), "
+            "who(oid) as (select r.oid from pg_catalog.pg_roles r where r.rolname = current_user "
+            "union select c.relowner from dep join pg_catalog.pg_class c on c.oid = dep.oid "
+            "where c.relkind = 'v') "
+            "select pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) "
+            "from dep join pg_catalog.pg_class c on c.oid = dep.oid "
+            "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+            "where c.relrowsecurity and exists (select 1 from who "
+            "join pg_catalog.pg_roles r on r.oid = who.oid "
+            "where not (r.rolsuper or r.rolbypassrls) "
+            "and (c.relforcerowsecurity or c.relowner <> r.oid)) "
+            "order by 1"
+        )
+        if rows:
+            under = ", ".join(str(r[0]) for r in rows)
+            self._row_security = [
+                *getattr(self, "_row_security", []),
+                f"{table} (a view over {under})",
+            ]
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """Row-level security that filters what this side can read."""
         out = list(super().caveats(columns))
         for table in getattr(self, "_row_security", []):
+            verb = "may filter" if "(a view over" in table else "filters"
             out.append(
-                f"row-level security filters {table} for this role: rows its "
+                f"row-level security {verb} {table} for this role: rows its "
                 "policies hide are not compared at all, so a difference there "
                 "cannot be seen. Diff as a role that bypasses RLS (BYPASSRLS) "
                 "for a complete result"
             )
+        for table, children in getattr(self, "_children", []):
+            out.append(
+                f"{table} has inheritance children ({children}) and its rows "
+                "include theirs, as any query on it reads them; compare against a "
+                "side that holds the same rows, or diff each table on its own"
+            )
+        money = [c.name for c in columns if self._is_money(c)]
+        if money and getattr(self, "_money_digits", 2) != 2:
+            out.append(
+                f"money columns {money} are read with {self._money_digits} decimal "
+                f"place(s), the frac_digits of this login's lc_monetary "
+                f"{self._monetary_locale!r}; money stores whole minor units, so a "
+                "value written under a locale with other decimals reads scaled"
+            )
         return out
+
+    @staticmethod
+    def _is_money(column: Column) -> bool:
+        """A money column, or a list of money (whose elements render as one)."""
+        raw = column.raw_type.lower()
+        return raw == "money" or raw == "money[]"
+
+    def _money_factor(self) -> Decimal | None:
+        """What a money value read as numeric under the pinned C locale (two
+        decimals) must be multiplied by to carry the login's own frac_digits,
+        or None when they are two - the SQL then is exactly what it was."""
+        digits = getattr(self, "_money_digits", 2)
+        return None if digits == 2 else Decimal(10) ** (2 - digits)
+
+    def money_numeric(self, c: str) -> str:
+        """A money expression `c` as exact numeric, at the login's frac_digits
+        (RT-HP2). `(c)::numeric` - the old SQL, byte for byte - at two."""
+        factor = self._money_factor()
+        if factor is None:
+            return f"({c})::numeric"
+        return f"(({c})::numeric * {format(factor, 'f')})"
 
     def _with_enums(self, table: str, columns: list[Column]) -> list[Column]:
         """Map enum columns to STRING.
@@ -575,7 +911,8 @@ class PostgresDialect(Dialect):
                 f"|| {sql_literal(float_range_where(column))} as float8) as text) end"
             )
         elif t is LogicalType.DECIMAL:
-            expr = f"cast(round(({c})::numeric, {self.float_scale}) as text)"
+            num = self.money_numeric(c) if self._is_money(column) else f"({c})::numeric"
+            expr = f"cast(round({num}, {self.float_scale}) as text)"
         elif t is LogicalType.BOOLEAN:
             # `else` must not swallow NULL. With `case when c then 'true' else
             # 'false' end` a NULL boolean renders as 'false' - identical to a
@@ -584,7 +921,16 @@ class PostgresDialect(Dialect):
             # which is exactly why the encoding tests plant differences.
             expr = f"case when {c} then 'true' when not {c} then 'false' end"
         elif t is LogicalType.DATE:
-            expr = self._datetime_text(c, "-MM-DD")
+            # `to_char` has no date overload: a date goes through timestamptz,
+            # whose range ends at 294276-12-31, and a later date - valid up to
+            # 5874897 AD in PostgreSQL and DuckDB alike - killed the whole diff
+            # (RT-HP3). Past that, the date's own text, which under the pinned
+            # DateStyle ISO is `YYYYYY-MM-DD`, what to_char prints for the
+            # dates it can reach. Earlier dates keep the old SQL's text.
+            expr = (
+                f"case when {c} > '{DATE_TIMESTAMP_MAX}'::date and isfinite({c}) "
+                f"then ({c})::text else {self._datetime_text(c, '-MM-DD')} end"
+            )
         elif t is LogicalType.TIMESTAMP:
             expr = self._datetime_text(c, "-MM-DD HH24:MI:SS.US")
         elif t is LogicalType.TIME:
@@ -628,7 +974,53 @@ class PostgresDialect(Dialect):
             # STRING, and every unmapped type (xml, ranges, composites, ...)
             # through its text output: arbitrary text, so escaped.
             expr = self.escape_text(f"({c})::text")
+            untrusted = getattr(self, "_untrusted", {}).get(column.name)
+            if t is LogicalType.UNKNOWN and untrusted:
+                expr = self._exact_unmapped(column, c, expr, untrusted)
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _exact_unmapped(
+        self, column: Column, c: str, text: str, untrusted: tuple[str, str | None]
+    ) -> str:
+        r"""An unmapped column whose type's text is not known to be exact.
+
+        `::text` is exact for PostgreSQL's own types under the pins, and for a
+        short list of extensions (`TRUSTED_EXTENSION_TYPES`), but an
+        extension's output function may round: contrib `seg` prints
+        123456789 and 123456788 both as `1.23457e+08`, which PostgreSQL's own
+        `=` calls different - a false match between two PostgreSQL tables
+        (RT-HP9). The type's binary send function is its exact value, so
+        `\b` and its hex follow the text (escaped text never holds a lone
+        backslash, so the pair cannot be forged). Such a type without a send
+        function, or one nested in an array, composite or range - where the
+        container's send would embed type OIDs that differ between databases
+        - is refused instead.
+        """
+        typ, send = untrusted
+        if send is None:
+            raise self._err(
+                f"column {column.name!r} holds {typ}, whose text output is not "
+                "known to be exact (two different values can print alike) and "
+                "which this server cannot compare any other way (no binary send "
+                "function, or nested in an array, composite or range); leave it "
+                "out with --exclude, or compare an exact cast of it through a view"
+            )
+        return self.concat_sql(
+            self.concat_sql(text, self.concat_sql(self.backslash_sql(), "'b'")),
+            f"encode({send}({c}), 'hex')",
+        )
+
+    def key_not_null_sql(self, column: Column) -> str:
+        """SQL NULL, not "every field NULL": `num_nulls`.
+
+        For a composite, PostgreSQL's `c is not null` is true only when every
+        field is non-NULL, so the key row(1, NULL) was refused as a NULL key
+        (RT-HP8). `num_nulls` asks whether the value itself is NULL, for any
+        type; other types keep the shared SQL.
+        """
+        if column.logical_type is LogicalType.UNKNOWN:
+            return f"pg_catalog.num_nulls({self.quote(column.name)}) = 0"
+        return super().key_not_null_sql(column)
 
     @staticmethod
     def _interval_text(c: str) -> str:
@@ -784,7 +1176,7 @@ class PostgresDialect(Dialect):
             return f"({c})::text"
         if column.raw_type.lower() == "money":
             # psycopg returns money as its locale text (`$1,234.56`).
-            return f"({c})::numeric"
+            return self.money_numeric(c)
         return super().sample_select(column)
 
     def sample_value(self, column: Column, value: Any) -> Any:
@@ -803,6 +1195,9 @@ class PostgresDialect(Dialect):
             items = [None if x is None else x == "t" for x in texts]
         elif kind is LogicalType.BINARY:
             items = [None if x is None else bytes.fromhex(x[2:]) for x in texts]
+        elif self._is_money(column) and (factor := self._money_factor()) is not None:
+            # As `money_numeric` scales each element of the walk (RT-HP2).
+            items = [None if x is None else str(Decimal(x) * factor) for x in texts]
         return items if dims is None else ShapedList(dims, tuple(items))
 
     def json_semantics(self, column: Column) -> str:
@@ -827,9 +1222,10 @@ class PostgresDialect(Dialect):
         drop the trailing fractional zeros its scale adds. Through `::numeric`
         first, a no-op for numeric, because a `money` key's own text is its
         locale format (`$1,234.56`)."""
-        t = f"({c})::numeric::text"
+        num = self.money_numeric(c) if self._is_money(column) else f"({c})::numeric"
+        t = f"{num}::text"
         return (
-            f"case when ({c})::numeric = 0 then '0' "
+            f"case when {num} = 0 then '0' "
             f"when strpos({t}, '.') > 0 then rtrim(rtrim({t}, '0'), '.') "
             f"else {t} end"
         )

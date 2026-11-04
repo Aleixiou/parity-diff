@@ -1071,6 +1071,30 @@ class Dialect(ABC):
         """
         return []
 
+    def unreadable_columns(self, table: str) -> list[str]:
+        """Columns of `table` that exist but this login cannot read, or [].
+
+        Called by the engine after `columns`. A catalog filtered by privilege
+        (PostgreSQL's information_schema under column-level grants) leaves
+        such a column out of `columns` altogether, and a column nobody read
+        must never pass as compared (RT-HP1). Default: none.
+        """
+        return []
+
+    def session_drift(self) -> list[str]:
+        """Session settings the walk's own queries changed, or [].
+
+        Called by the engine once after the walk; anything returned makes the
+        result unexplained, never identical. Default: nothing pinned to check.
+        """
+        return []
+
+    def key_not_null_sql(self, column: Column) -> str:
+        """SQL true when a key column's value is not SQL NULL. `is not null`,
+        which PostgreSQL overrides: there a composite is `not null` only when
+        every field is (RT-HP8)."""
+        return f"{self.quote(column.name)} is not null"
+
     # --------------------------------------------------- SQL spelling hooks
     #
     # The shared queries below are standard SQL that every engine before
@@ -1432,9 +1456,7 @@ class Dialect(ABC):
         # whose every key column is non-NULL, and the engine refuses the rest
         # exactly as it refuses a NULL integer key.
         if key.hashed:
-            all_set = " and ".join(
-                f"{self.quote(c.name)} is not null" for c in key.columns
-            )
+            all_set = " and ".join(self.key_not_null_sql(c) for c in key.columns)
             non_null_sql = self.count(f"case when {all_set} then 1 end")
         else:
             non_null_sql = self.count(identity)
