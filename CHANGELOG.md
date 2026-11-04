@@ -14,7 +14,7 @@ with the caveat that 0.x means the CLI surface may still move.
     column is refused as a whole.
   - *Row-level security* (RT-HS2): an enabled filter predicate on the table,
     or on a table a view reads, now puts a caveat in every run's output, as
-    PostgreSQL RLS does; without `VIEW DEFINITION` on the object the caveat
+    PostgreSQL RLS does; without database-level `VIEW DEFINITION` the caveat
     says RLS cannot be ruled out.
   - *Spatial SRID* (RT-HS3): `geometry`/`geography` rendered through
     `ToString()`, which has no SRID and rounds coordinates. They now render

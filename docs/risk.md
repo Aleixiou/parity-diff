@@ -34,12 +34,14 @@ For one run that reports **identical**, on columns the rules cover:
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
 | A renamed column (`--map`) compared against the wrong counterpart | **0**: pairing is exact, ambiguous maps are refused | By design (tested) |
 | A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
+| An "identical" over no rows at all (a mistyped filter, the wrong table) read as a check | **0**: a side that compared 0 rows draws a warning naming it on every run, and when both are empty the headline says `0 rows compared, both sides are empty` | By design (enforced) |
 | A filtered "identical" read as one about the whole table | **0**: the headline, a `filtered:` line, JSON and a caveat state the filter; a filtered run **proves nothing about rows outside it** | By design (enforced) |
 | A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()` without one snapshot) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
-| Row-level security hides rows from the reading role (PostgreSQL) | **not bounded**: those rows are not compared; every run names the table in a caveat | Not quantifiable |
+| Row-level security hides rows from the reading role (PostgreSQL; SQL Server security policies) | **not bounded**: those rows are not compared; every run names the table in a caveat (on SQL Server, without VIEW DEFINITION on the database, a caveat that RLS cannot be ruled out) | Not quantifiable |
+| Dynamic data masking hands the login masks instead of values (SQL Server) | **0** for a table: a compared column masked for the login is refused; a view reading one is refused, and so is any view whose dependencies the login cannot see (no VIEW DEFINITION) in a database holding masked columns it cannot unmask | By design (tested live) |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
 | Columns of types outside the rules (BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, ranges, arrays of JSON, geometry, XML; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
@@ -84,7 +86,7 @@ line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
 | Risk | Odds | Kind |
 |---|---|---|
 | One query that reads the table runs unfiltered (a row counted but never checksummed, or sampled but never walked) | **0** — the key stats, every checksum level, every download and the sample all name the table through one builder that adds the predicate; `tests/test_where_sql.py` records every statement on all six dialects | By design (tested) |
-| The predicate escapes its parentheses (`1=1) or (1=1`) or ends the statement | **0** for what the check knows: `;`, comments, MySQL `#`, a backslash before a quote, triple- and dollar-quoted strings and unbalanced quotes, brackets or parentheses are refused before any query; on SQL Server the SELECT guard also applies. Not a security boundary: it is the user's own SQL, and the sessions are read-only | By design (tested) |
+| The predicate escapes its parentheses (`1=1) or (1=1`) or ends the statement | **0** for what the check knows: `;`, comments, MySQL `#`, a backslash before a quote, triple- and dollar-quoted strings and unbalanced quotes, brackets or parentheses are refused before any query; on SQL Server the filter is re-scanned as T-SQL tokenises it (`]]` inside brackets), table and query hints and ODBC escape braces are refused, and the SELECT guard also applies. Not a security boundary: it is the user's own SQL, and the sessions are read-only | By design (tested) |
 | The predicate selects different rows in different queries (`random()`, `clock_timestamp()`; `now()`/`current_date` where an engine gives each query its own snapshot) | a change between the row count and the first level, or between two levels of one range, is **never identical** (unexplained); a row entering the filter beyond the key range measured first is **not compared**; beyond that **not bounded** — every filtered run's caveat says to prefer fixed literals | Not quantifiable |
 | A deterministic predicate inside one snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables; `now()` is stable within PostgreSQL's transaction) | **no new risk**: every query sees the same rows, so the walk is the unfiltered walk over a smaller table | By design (tested) |
 | The two sides' predicates select different slices | **not the tool's to know**: rows in one slice only read as only in A / only in B, and a one-sided filter draws a warning | By design |
@@ -116,7 +118,9 @@ false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
 +05:00:30 as +05:30) and one a refusal of ordinary values (SQL Server
 sql_variant floats, -0.0 and negatives below 1e-99); the type rules found
 one more (BigQuery SQL NULL equal to JSON `null`). Red-team round G (settings, versions): 14
-problems, 8 of them false matches, all fixed. Earlier campaign: about 30
+problems, 8 of them false matches, all fixed. Round H on SQL Server: 11
+problems, 4 of them false matches (dynamic data masking, row-level security
+without a caveat, spatial SRID, invalid double-byte text), all fixed. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range

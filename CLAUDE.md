@@ -722,7 +722,7 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   else the database grant) is refused in `normalize`, and a view reading one
   is refused in `columns()` - masks hashed alike, a false match. An enabled
   security-policy filter predicate (on the table, or what a view reads via
-  `sys.sql_expression_dependencies`) is a caveat; without VIEW DEFINITION
+  `sys.dm_sql_referenced_entities`, which needs VIEW DEFINITION on the view only) is a caveat; without database-level VIEW DEFINITION
   the policies are invisible to the login, and the caveat says RLS cannot be
   ruled out. Spatial renders `SRID=<n>;` + `AsBinaryZM()` hex (ToString has
   no SRID). varchar/char/text in code pages 932/936/949/950 (`raw_type`

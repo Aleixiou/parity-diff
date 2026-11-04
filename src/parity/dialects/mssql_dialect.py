@@ -584,37 +584,85 @@ class SQLServerDialect(Dialect):
         """
         obj = self.string_literal(f"{self.quote(schema)}.{self.quote(name)}")
         rows = self.query(
-            "select o.type, coalesce(t.is_memory_optimized, 0), "
-            f"has_perms_by_name({obj}, 'OBJECT', 'VIEW DEFINITION') "
+            "select o.type, coalesce(t.is_memory_optimized, 0), o.object_id, "
+            "coalesce(has_perms_by_name(db_name(), 'DATABASE', 'VIEW DEFINITION'), 0) "
+            "| coalesce(has_perms_by_name(db_name(), 'DATABASE', "
+            "'ALTER ANY SECURITY POLICY'), 0) "
             "from sys.objects o left join sys.tables t on t.object_id = o.object_id "
             f"where o.object_id = object_id({obj})"
         )
         if not rows:
             return
         kind = str(rows[0][0]).strip().upper()
-        visible = bool(rows[0][2])
         if rows[0][1]:
             self._check_memory_optimized(table)
-        self._check_masking(table, obj, kind, visible)
-        self._check_row_security(table, obj, kind, visible)
+        # What the object reads: itself, or for a view the (object, column)
+        # pairs it references, through nested views; None if not visible.
+        sources: list[tuple[int, int]] | None = [(int(rows[0][2]), 0)]
+        if kind == "V":
+            sources = self._view_sources(obj, 0)
+        self._check_masking(table, obj, kind, sources)
+        self._check_row_security(table, sources, bool(rows[0][3]))
 
-    def _objects_read(self, obj: str) -> str:
-        """A subquery of the object ids `obj` reads: itself, and for a view the
-        objects it references in this database, through nested views."""
-        return (
-            "(select object_id from (select object_id("
-            + obj
-            + ") as object_id union select d.referenced_id from "
-            "sys.sql_expression_dependencies d where d.referencing_id = object_id("
-            + obj
-            + ") and d.referenced_id is not null union select d2.referenced_id from "
-            "sys.sql_expression_dependencies d join sys.sql_expression_dependencies d2 "
-            "on d2.referencing_id = d.referenced_id where d.referencing_id = object_id("
-            + obj
-            + ") and d2.referenced_id is not null) as r)"
+    def _view_sources(self, obj: str, depth: int) -> list[tuple[int, int]] | None:
+        """`(object_id, column_id)` pairs view `obj` reads in this database,
+        through nested views (column 0: the object as a whole); None when the
+        login cannot see them.
+
+        `sys.dm_sql_referenced_entities` needs only VIEW DEFINITION on the
+        view; `sys.sql_expression_dependencies` would need it on the whole
+        database (verified).
+        """
+        if depth > 8:
+            return None
+        try:
+            rows = self.query(
+                "select r.referenced_id, coalesce(r.referenced_minor_id, 0), o.type, "
+                "quotename(object_schema_name(r.referenced_id)) + N'.' "
+                "+ quotename(object_name(r.referenced_id)) "
+                f"from sys.dm_sql_referenced_entities({obj}, 'OBJECT') r "
+                "join sys.objects o on o.object_id = r.referenced_id "
+                "where r.referenced_database_name is null"
+            )
+        except Exception:  # noqa: BLE001 - no VIEW DEFINITION, or a broken view
+            return None
+        if not rows:
+            return None
+        out: list[tuple[int, int]] = []
+        for oid, minor, kind, name in rows:
+            out.append((int(oid), int(minor)))
+            if str(kind).strip().upper() == "V" and not minor:
+                inner = self._view_sources(self.string_literal(str(name)), depth + 1)
+                if inner is None:
+                    return None
+                out += inner
+        return out
+
+    def _masked_columns(self, condition: str) -> list[tuple[int, int, str, bool]]:
+        """`(object_id, column_id, 'table.column', unmasked)` of every masked
+        column matching `condition`, UNMASK checked per column (SQL Server
+        2022's granular UNMASK answers for a grant at any level) and else for
+        the database (2019 has no granular UNMASK)."""
+        unmask_db = "has_perms_by_name(db_name(), 'DATABASE', 'UNMASK')"
+        named = (
+            "quotename(object_schema_name(c.object_id)) + N'.' "
+            "+ quotename(object_name(c.object_id))"
         )
+        per_column = f"has_perms_by_name({named}, 'OBJECT', 'UNMASK', c.name, 'COLUMN')"
+        sql = (
+            "select c.object_id, c.column_id, object_name(c.object_id) + N'.' + c.name, "
+            "coalesce({}, 0) from sys.masked_columns c "
+            f"where c.is_masked = 1 and {condition}"
+        )
+        try:
+            rows = self.query(sql.format(f"{per_column}, {unmask_db}"))
+        except Exception:  # noqa: BLE001 - 2019: no column-level UNMASK
+            rows = self.query(sql.format(unmask_db))
+        return [(int(o), int(c), str(n), bool(u)) for o, c, n, u in rows]
 
-    def _check_masking(self, table: str, obj: str, kind: str, visible: bool) -> None:
+    def _check_masking(
+        self, table: str, obj: str, kind: str, sources: list[tuple[int, int]] | None
+    ) -> None:
         """Refuse columns this login reads as their masks (RT-HS1).
 
         A column under dynamic data masking reads as its mask for a login
@@ -622,62 +670,49 @@ class SQLServerDialect(Dialect):
         expression over it, so two tables whose masked values all differ
         hashed alike: identical, with no warning, for the db_datareader login
         the docs recommend. Such a column is refused when it is compared (see
-        `normalize`), naming the fix: GRANT UNMASK, or --exclude it. UNMASK is
-        checked per column (SQL Server 2022's granular UNMASK, which answers
-        for grants at any level) and else for the database.
+        `normalize`), naming the fix: GRANT UNMASK, or --exclude it.
 
         A view inherits the masks of what it reads, but which view column
         carries which base column is not in the catalog: a view reading a
         masked column this login cannot unmask is refused outright. Without
-        VIEW DEFINITION on the view its dependencies are invisible, and then
-        a database holding masked columns draws a caveat instead.
+        VIEW DEFINITION on the view its sources are invisible, and then a view
+        in a database holding masked columns the login cannot unmask is
+        refused too - it may read one.
         """
-        unmask_db = "has_perms_by_name(db_name(), 'DATABASE', 'UNMASK')"
-        if kind == "U":
-            try:
-                rows = self.query(
-                    "select c.name, coalesce(has_perms_by_name("
-                    f"{obj}, 'OBJECT', 'UNMASK', c.name, 'COLUMN'), {unmask_db}, 0) "
-                    "from sys.masked_columns c "
-                    f"where c.object_id = object_id({obj}) and c.is_masked = 1"
-                )
-            except Exception:  # noqa: BLE001 - 2019 has no granular UNMASK
-                rows = self.query(
-                    f"select c.name, coalesce({unmask_db}, 0) from sys.masked_columns c "
-                    f"where c.object_id = object_id({obj}) and c.is_masked = 1"
-                )
-            for col, unmasked in rows:
+        if kind != "V":
+            for _, _, col, unmasked in self._masked_columns(
+                f"c.object_id = object_id({obj})"
+            ):
                 if not unmasked:
-                    self._masked[str(col).casefold()] = table
+                    self._masked[col.split(".", 1)[1].casefold()] = table
             return
-        rows = self.query(
-            f"select object_name(c.object_id) + N'.' + c.name, coalesce({unmask_db}, 0) "
-            "from sys.masked_columns c where c.is_masked = 1 "
-            f"and c.object_id in {self._objects_read(obj)} and c.object_id <> object_id({obj})"
-        )
-        hidden = sorted(str(c) for c, unmasked in rows if not unmasked)
-        if hidden:
+        hidden = [m for m in self._masked_columns("1 = 1") if not m[3]]
+        if not hidden:
+            return
+        if sources is None:
             raise self._err(
-                f"view {table} reads dynamically masked column(s) {hidden}, and "
+                f"this login cannot see which tables view {table} reads (it "
+                "lacks VIEW DEFINITION on it), and the database holds "
+                "dynamically masked columns it cannot unmask: if the view "
+                "reads one, its values would be compared as their masks. "
+                "GRANT VIEW DEFINITION on the view (or UNMASK) to this login"
+            )
+        read = set(sources)
+        # A whole-object reference with no column-level entry for that object
+        # (an unresolved dependency) counts as reading every column.
+        whole = {o for o, c in read if c == 0} - {o for o, c in read if c}
+        reached = sorted(n for o, c, n, _ in hidden if (o, c) in read or o in whole)
+        if reached:
+            raise self._err(
+                f"view {table} reads dynamically masked column(s) {reached}, and "
                 "this login does not hold UNMASK: every value would be compared "
                 "as its mask, so differences there could not be seen. GRANT "
                 "UNMASK to this login, or compare the base tables"
             )
-        if not visible:
-            masked = self.query(
-                f"select count_big(*), coalesce({unmask_db}, 0) "
-                "from sys.masked_columns where is_masked = 1"
-            )
-            if masked and masked[0][0] and not masked[0][1]:
-                self._notes.append(
-                    f"this login cannot see which tables view {table} reads (it "
-                    "lacks VIEW DEFINITION on it), and the database holds "
-                    "dynamically masked columns it cannot unmask: if the view "
-                    "reads one, its values are compared as their masks. GRANT "
-                    "VIEW DEFINITION on the view (or UNMASK) to rule it out"
-                )
 
-    def _check_row_security(self, table: str, obj: str, kind: str, visible: bool) -> None:
+    def _check_row_security(
+        self, table: str, sources: list[tuple[int, int]] | None, visible: bool
+    ) -> None:
         """A caveat when a security policy can hide rows (RT-HS2).
 
         A filter predicate silently removes the rows its function rejects for
@@ -685,23 +720,25 @@ class SQLServerDialect(Dialect):
         on PostgreSQL it is a caveat in the output, not a refusal - the user
         may diff deliberately what one user sees - but SQL Server has no
         BYPASSRLS, so it is said whenever an enabled filter predicate applies
-        to the table or to anything a view reads. The policies are visible
-        only with VIEW DEFINITION on the object; without it RLS cannot be
-        ruled out, and the caveat says that instead.
+        to the table or to anything a view reads. Security policies are
+        visible only to a login with VIEW DEFINITION on the policy - on the
+        table is not enough (verified) - so without the database-wide grant
+        RLS cannot be ruled out, and the caveat says that instead.
         """
-        if not visible:
+        if not visible or sources is None:
             self._notes.append(
                 f"this login cannot see whether a row-level security policy "
-                f"filters {table} (it lacks VIEW DEFINITION on it): rows a "
-                "policy hides would not be compared at all. GRANT VIEW "
-                "DEFINITION on it to let the check run"
+                f"filters {table} (it lacks VIEW DEFINITION on the database): "
+                "rows a policy hides would not be compared at all. GRANT VIEW "
+                "DEFINITION to this login to let the check run"
             )
             return
+        ids = ", ".join(str(o) for o in sorted({o for o, _ in sources}))
         rows = self.query(
             "select distinct p.name from sys.security_policies p join "
             "sys.security_predicates s on s.object_id = p.object_id "
             "where p.is_enabled = 1 and s.predicate_type = 0 "
-            f"and s.target_object_id in {self._objects_read(obj)}"
+            f"and s.target_object_id in ({ids})"
         )
         if rows:
             names = sorted(str(r[0]) for r in rows)

@@ -184,7 +184,7 @@ create login parity_reader with password = '…';
 -- in the database:
 create user parity_reader for login parity_reader;
 alter role db_datareader add member parity_reader;   -- or: grant select on dbo.orders to parity_reader;
-grant view definition on dbo.orders to parity_reader; -- lets the row-level security check run
+grant view definition to parity_reader;            -- metadata only: lets the masking and row-level security checks see policies and view sources
 grant unmask to parity_reader;                       -- only where dynamic data masking is used
 ```
 
@@ -195,12 +195,13 @@ grant unmask to parity_reader;                       -- only where dynamic data 
   side, table and column: `GRANT UNMASK` (database-wide, or on 2022 per
   schema, table or column), or leave it out with `--exclude`. A view reading
   a masked column the login cannot unmask is refused as a whole (which view
-  column carries it is not in the catalog).
+  column carries it is not in the catalog), and so is a view the login lacks
+  `VIEW DEFINITION` on, in a database holding such columns.
 - **Row-level security.** A security policy's filter predicate silently
   hides rows from the reading user, and those rows are not compared. When
   an enabled filter predicate applies to the table (or to a table a view
   reads) every run's output says so. Policies are visible only with
-  `VIEW DEFINITION` on the object; without it the output says RLS cannot be
+  `VIEW DEFINITION` on the database (on the table is not enough); without it the output says RLS cannot be
   ruled out. SQL Server has no BYPASSRLS: diff as a user the predicates let
   read every row.
 
