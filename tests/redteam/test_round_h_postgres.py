@@ -75,9 +75,15 @@ def schema():
 
 def _role(name: str) -> str:
     """A login role on the admin server (recreated), and its URL."""
-    _exec(ADMIN, f"drop owned by {name}" if _exec(
-        ADMIN, f"select 1 from pg_roles where rolname = '{name}'") else "select 1")
-    _exec(ADMIN, f"drop role if exists {name}", f"create role {name} login password 'rth'")
+    _exec(
+        ADMIN,
+        f"drop owned by {name}"
+        if _exec(ADMIN, f"select 1 from pg_roles where rolname = '{name}'")
+        else "select 1",
+    )
+    _exec(
+        ADMIN, f"drop role if exists {name}", f"create role {name} login password 'rth'"
+    )
     return f"postgres://{name}:rth@127.0.0.1:15618/rth" if "15618" in ADMIN else ADMIN
 
 
@@ -95,8 +101,14 @@ def test_rt_hp1_column_grant_hides_a_differing_column(schema):
     _exec(
         ADMIN,
         f"grant usage on schema {schema} to rth_postgres_cg_{RUN}",
-        *[f"create table {schema}.{t} (id int primary key, x text, secret text)" for t in "ab"],
-        *[f"insert into {schema}.{t} select g, 'v'||g, 's'||g from generate_series(1,100) g" for t in "ab"],
+        *[
+            f"create table {schema}.{t} (id int primary key, x text, secret text)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {schema}.{t} select g, 'v'||g, 's'||g from generate_series(1,100) g"
+            for t in "ab"
+        ],
         f"update {schema}.b set secret = 'CHANGED' where id = 7",
         *[f"grant select (id, x) on {schema}.{t} to rth_postgres_cg_{RUN}" for t in "ab"],
     )
@@ -104,10 +116,15 @@ def test_rt_hp1_column_grant_hides_a_differing_column(schema):
         r = _diff(role, f"{schema}.a", role, f"{schema}.b")
         # Either the difference is found, or the run must not read identical.
         assert [d.key for d in r.diffs] == [7] or (
-            not r.identical and any("secret" in w for w in r.warnings + r.schema_differences)
+            not r.identical
+            and any("secret" in w for w in r.warnings + r.schema_differences)
         )
     finally:
-        _exec(ADMIN, f"drop owned by rth_postgres_cg_{RUN}", f"drop role rth_postgres_cg_{RUN}")
+        _exec(
+            ADMIN,
+            f"drop owned by rth_postgres_cg_{RUN}",
+            f"drop role rth_postgres_cg_{RUN}",
+        )
 
 
 @pytest.mark.xfail(
@@ -125,7 +142,10 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
         _exec(
             ADMIN,
             f"grant usage on schema {schema} to {reader}, {owner}",
-            *[f"create table {schema}.{t} (id int primary key, x text, tenant text)" for t in "ab"],
+            *[
+                f"create table {schema}.{t} (id int primary key, x text, tenant text)"
+                for t in "ab"
+            ],
             f"insert into {schema}.a select g, 'v'||g, case when g % 2 = 0 then 'mine' "
             "else 'other' end from generate_series(1,100) g",
             f"insert into {schema}.b select * from {schema}.a",
@@ -136,20 +156,31 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
         )
         for t in "ab":
             if kind == "security_invoker":
-                _exec(ADMIN, f"create view {schema}.v{t} with (security_invoker = true) "
-                      f"as select * from {schema}.{t}")
+                _exec(
+                    ADMIN,
+                    f"create view {schema}.v{t} with (security_invoker = true) "
+                    f"as select * from {schema}.{t}",
+                )
             else:
-                _exec(ADMIN, f"create view {schema}.v{t} as select * from {schema}.{t}",
-                      f"alter view {schema}.v{t} owner to {owner}")
+                _exec(
+                    ADMIN,
+                    f"create view {schema}.v{t} as select * from {schema}.{t}",
+                    f"alter view {schema}.v{t} owner to {owner}",
+                )
             _exec(ADMIN, f"grant select on {schema}.v{t} to {reader}")
         r = _diff(url, f"{schema}.va", url, f"{schema}.vb")
         assert [d.key for d in r.diffs] == [7] or any(
             "row-level security" in w for w in r.warnings
         )
     finally:
-        _exec(ADMIN, f"drop schema if exists {schema} cascade",
-              f"drop owned by {reader}", f"drop role if exists {reader}",
-              f"drop owned by {owner}", f"drop role if exists {owner}")
+        _exec(
+            ADMIN,
+            f"drop schema if exists {schema} cascade",
+            f"drop owned by {reader}",
+            f"drop role if exists {reader}",
+            f"drop owned by {owner}",
+            f"drop role if exists {owner}",
+        )
 
 
 @pytest.mark.xfail(
@@ -159,8 +190,11 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
 )
 def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     for t in "ab":
-        _exec(ADMIN, f"create table {schema}.{t} (id int primary key, v date)",
-              f"insert into {schema}.{t} values (1, '2024-01-01'), (2, '5874897-12-31')")
+        _exec(
+            ADMIN,
+            f"create table {schema}.{t} (id int primary key, v date)",
+            f"insert into {schema}.{t} values (1, '2024-01-01'), (2, '5874897-12-31')",
+        )
     _exec(ADMIN, f"update {schema}.b set v = '5874897-12-30' where id = 2")
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
     assert [d.key for d in r.diffs] == [2]
@@ -183,13 +217,20 @@ def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
 )
 def test_rt_hp5_pg11_floats_inside_unmapped_types(typ, v1, v2):
     s = f"rth_postgres_{RUN}_f11"
-    _exec(PG11, f"drop schema if exists {s} cascade", f"create schema {s}",
-          f"create type {s}.pr as (x float8, y float4)")
+    _exec(
+        PG11,
+        f"drop schema if exists {s} cascade",
+        f"create schema {s}",
+        f"create type {s}.pr as (x float8, y float4)",
+    )
     try:
         t = typ.format(s=s)
         for tb, v in (("a", v1), ("b", v2)):
-            _exec(PG11, f"create table {s}.{tb} (id int primary key, v {t})",
-                  f"insert into {s}.{tb} values (1, {v1}), (2, {v})")
+            _exec(
+                PG11,
+                f"create table {s}.{tb} (id int primary key, v {t})",
+                f"insert into {s}.{tb} values (1, {v1}), (2, {v})",
+            )
         r = _diff(PG11, f"{s}.a", PG11, f"{s}.b")
         assert [d.key for d in r.diffs] == [2]
     finally:
@@ -200,8 +241,11 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
     """The RT-HP5 values on a 12+ server, where the shortest repr tells them apart."""
     _exec(ADMIN, f"create type {schema}.pr as (x float8, y float4)")
     for tb, v in (("a", "row(0.1, 1)"), ("b", "row(0.10000000000000002, 1)")):
-        _exec(ADMIN, f"create table {schema}.{tb} (id int primary key, v {schema}.pr)",
-              f"insert into {schema}.{tb} values (1, row(0.1, 1)), (2, {v})")
+        _exec(
+            ADMIN,
+            f"create table {schema}.{tb} (id int primary key, v {schema}.pr)",
+            f"insert into {schema}.{tb} values (1, row(0.1, 1)), (2, {v})",
+        )
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
     assert [d.key for d in r.diffs] == [2]
 
@@ -215,8 +259,11 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
 def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
     for t in "ab":
         _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
-    _exec(ADMIN, f"insert into {schema}.a values (1, 0.1), (2, 1e15 + 0.5)",
-          f"insert into {schema}.b values (1, 0.1), (2, 1e15)")
+    _exec(
+        ADMIN,
+        f"insert into {schema}.a values (1, 0.1), (2, 1e15 + 0.5)",
+        f"insert into {schema}.b values (1, 0.1), (2, 1e15)",
+    )
     w = "set_config('extra_float_digits', '-15', false) is not null"
     try:
         r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", where_a=w, where_b=w)
@@ -230,8 +277,11 @@ def test_where_and_map_postgres_quoting(schema):
     """E'', U&'', doubled quotes and casts work; $$ and backslash-quote are refused;
     a filter cannot close the parentheses it is wrapped in."""
     for t in "ab":
-        _exec(ADMIN, f'create table {schema}.{t} (id int primary key, "Name" text, amt numeric)',
-              f"insert into {schema}.{t} select g, 'n'||g, g * 1.5 from generate_series(1, 1000) g")
+        _exec(
+            ADMIN,
+            f'create table {schema}.{t} (id int primary key, "Name" text, amt numeric)',
+            f"insert into {schema}.{t} select g, 'n'||g, g * 1.5 from generate_series(1, 1000) g",
+        )
     _exec(ADMIN, f"update {schema}.b set amt = -1 where id in (10, 900)")
     a, b = f"{schema}.a", f"{schema}.b"
     for w, keys in [
@@ -243,12 +293,21 @@ def test_where_and_map_postgres_quoting(schema):
     ]:
         r = _diff(ADMIN, a, ADMIN, b, where_a=w, where_b=w)
         assert sorted(d.key for d in r.diffs) == keys, w
-    for w in ["\"Name\" <> $$x$$", "\"Name\" <> $t$x$t$", "true) or (true",
-              "id < 5 -- c", "E'\\'' <> \"Name\"", "id < 5; select 1"]:
+    for w in [
+        '"Name" <> $$x$$',
+        '"Name" <> $t$x$t$',
+        "true) or (true",
+        "id < 5 -- c",
+        "E'\\'' <> \"Name\"",
+        "id < 5; select 1",
+    ]:
         with pytest.raises(ValueError, match="row filter"):
             _diff(ADMIN, a, ADMIN, b, where_a=w, where_b=w)
-    _exec(ADMIN, f"create table {schema}.m (id int primary key, nm text, Amount numeric)",
-          f"insert into {schema}.m select * from {b}")
+    _exec(
+        ADMIN,
+        f"create table {schema}.m (id int primary key, nm text, Amount numeric)",
+        f"insert into {schema}.m select * from {b}",
+    )
     r = _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "AMOUNT"})
     assert sorted(d.key for d in r.diffs) == [10, 900] and not r.schema_differences
     with pytest.raises(ValueError, match="--map"):
@@ -264,11 +323,24 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
     import subprocess
     import sys
 
-    cmd = [sys.executable, "-c", "import sys; from parity.cli import main; sys.exit(main())",
-           "diff", "--a", "postgres://rth:x@127.0.0.1:1/rth", "--a-table", "t",
-           "--b", "duckdb:///:memory:", "--b-table", "t", "--key", "id"]
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; from parity.cli import main; sys.exit(main())",
+        "diff",
+        "--a",
+        "postgres://rth:x@127.0.0.1:1/rth",
+        "--a-table",
+        "t",
+        "--b",
+        "duckdb:///:memory:",
+        "--b-table",
+        "t",
+        "--key",
+        "id",
+    ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)  # noqa: S603 - our own CLI
     except subprocess.TimeoutExpired:
         pytest.fail("no answer after 60 s")
     assert p.returncode == 2 and "side A" in p.stderr
@@ -281,10 +353,13 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
     "false when any field is NULL, though the key itself is not NULL (unclear error)",
 )
 def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
-    _exec(ADMIN, f"create type {schema}.c as (a int, b text)",
-          *[f"create table {schema}.{t} (k {schema}.c, v int)" for t in "ab"],
-          f"insert into {schema}.a values (row(1, NULL), 1), (row(1, ''), 2)",
-          f"insert into {schema}.b values (row(1, NULL), 1)")
+    _exec(
+        ADMIN,
+        f"create type {schema}.c as (a int, b text)",
+        *[f"create table {schema}.{t} (k {schema}.c, v int)" for t in "ab"],
+        f"insert into {schema}.a values (row(1, NULL), 1), (row(1, ''), 2)",
+        f"insert into {schema}.b values (row(1, NULL), 1)",
+    )
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", key="k")
     assert [(d.key, d.kind) for d in r.diffs] == [('(1,"")', "only_in_a")]
 
@@ -296,12 +371,17 @@ def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
     "('1.23457e+08') though PostgreSQL's own = calls them different (FALSE MATCH)",
 )
 def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
-    _exec(ADMIN, "create extension if not exists seg",
-          *[f"create table {schema}.{t} (id int primary key, v seg)" for t in "ab"],
-          f"insert into {schema}.a values (1, '1.5'), (2, '123456789')",
-          f"insert into {schema}.b values (1, '1.5'), (2, '123456788')")
-    assert not _exec(ADMIN, f"select a.v = b.v from {schema}.a a join {schema}.b b using (id) "
-                     "where id = 2")[0][0]
+    _exec(
+        ADMIN,
+        "create extension if not exists seg",
+        *[f"create table {schema}.{t} (id int primary key, v seg)" for t in "ab"],
+        f"insert into {schema}.a values (1, '1.5'), (2, '123456789')",
+        f"insert into {schema}.b values (1, '1.5'), (2, '123456788')",
+    )
+    assert not _exec(
+        ADMIN,
+        f"select a.v = b.v from {schema}.a a join {schema}.b b using (id) where id = 2",
+    )[0][0]
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
     assert [d.key for d in r.diffs] == [2]
 
@@ -316,28 +396,50 @@ def test_hostile_alter_role_set_defaults_do_not_move_the_verdict(schema):
     role = f"rth_postgres_hr_{RUN}"
     url = _role(role)
     s = schema
-    _exec(ADMIN, f"grant usage on schema {s} to {role}",
-          *[f"create table {s}.{t} (id int primary key, f float8, ts timestamptz, d date, "
-            "i interval, b bytea, t text, m money)" for t in "ab"],
-          *[f"insert into {s}.{t} select g, g * 0.1, timestamptz '2024-01-01' + g * interval '1 h', "
+    _exec(
+        ADMIN,
+        f"grant usage on schema {s} to {role}",
+        *[
+            f"create table {s}.{t} (id int primary key, f float8, ts timestamptz, d date, "
+            "i interval, b bytea, t text, m money)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {s}.{t} select g, g * 0.1, timestamptz '2024-01-01' + g * interval '1 h', "
             "date '2024-01-01' + g, g * interval '1 day', '\\x00ff', 'N', g "
-            "from generate_series(1, 2000) g" for t in "ab"],
-          f"update {s}.b set f = 1e15 + 0.5 where id = 1", f"update {s}.a set f = 1e15 where id = 1",
-          f"update {s}.b set ts = ts + interval '1 h' where id = 2",
-          f"update {s}.b set i = interval '1 mon' where id = 3", f"update {s}.a set i = interval '30 days' where id = 3",
-          f"update {s}.b set t = NULL where id = 4",
-          *[f"grant select on {s}.{t} to {role}" for t in "ab"])
-    for setting in ["extra_float_digits = -15", "IntervalStyle = sql_standard", "DateStyle = 'German, DMY'",
-                    "TimeZone = 'Asia/Kathmandu'", "bytea_output = escape",
-                    "standard_conforming_strings = off", "search_path = pg_temp, public",
-                    "idle_in_transaction_session_timeout = '1s'", "quote_all_identifiers = on",
-                    "default_transaction_isolation = serializable"]:
+            "from generate_series(1, 2000) g"
+            for t in "ab"
+        ],
+        f"update {s}.b set f = 1e15 + 0.5 where id = 1",
+        f"update {s}.a set f = 1e15 where id = 1",
+        f"update {s}.b set ts = ts + interval '1 h' where id = 2",
+        f"update {s}.b set i = interval '1 mon' where id = 3",
+        f"update {s}.a set i = interval '30 days' where id = 3",
+        f"update {s}.b set t = NULL where id = 4",
+        *[f"grant select on {s}.{t} to {role}" for t in "ab"],
+    )
+    for setting in [
+        "extra_float_digits = -15",
+        "IntervalStyle = sql_standard",
+        "DateStyle = 'German, DMY'",
+        "TimeZone = 'Asia/Kathmandu'",
+        "bytea_output = escape",
+        "standard_conforming_strings = off",
+        "search_path = pg_temp, public",
+        "idle_in_transaction_session_timeout = '1s'",
+        "quote_all_identifiers = on",
+        "default_transaction_isolation = serializable",
+    ]:
         _exec(ADMIN, f"alter role {role} set {setting}")
     try:
         for sample in (0, 1, 50000):
             r = _diff(url, f"{s}.a", url, f"{s}.b", verify_sample=sample)
             assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [
-                (1, ("f",)), (2, ("ts",)), (3, ("i",)), (4, ("t",))], sample
+                (1, ("f",)),
+                (2, ("ts",)),
+                (3, ("i",)),
+                (4, ("t",)),
+            ], sample
     finally:
         _exec(ADMIN, f"drop owned by {role}", f"drop role {role}")
 
@@ -347,28 +449,50 @@ def test_unmapped_and_temporal_keys(schema):
     primary key (WITHOUT OVERLAPS) finds the planted period; two spellings of
     one discrete range are one key, so a duplicate."""
     s = schema
-    _exec(ADMIN, "create extension if not exists btree_gist",
-          f"create type {s}.e as enum ('x', 'X')", f"create type {s}.c as (a int, b text)")
-    for i, (t, k1, k2) in enumerate([
-        ("int4range", "'[1,5)'", "'[1,6)'"),
-        ("tstzrange", "'[2024-01-01,2024-02-01)'", "'[2024-01-01,2024-02-02)'"),
-        (f"{s}.e", "'x'", "'X'"),
-        (f"{s}.c", "row(1,'a b')", "row(1,'a  b')"),
-    ]):
-        _exec(ADMIN, f"create table {s}.a{i} (k {t}, v int)", f"create table {s}.b{i} (k {t}, v int)",
-              f"insert into {s}.a{i} values ({k1}, 1), ({k2}, 2)", f"insert into {s}.b{i} values ({k1}, 1)")
+    _exec(
+        ADMIN,
+        "create extension if not exists btree_gist",
+        f"create type {s}.e as enum ('x', 'X')",
+        f"create type {s}.c as (a int, b text)",
+    )
+    for i, (t, k1, k2) in enumerate(
+        [
+            ("int4range", "'[1,5)'", "'[1,6)'"),
+            ("tstzrange", "'[2024-01-01,2024-02-01)'", "'[2024-01-01,2024-02-02)'"),
+            (f"{s}.e", "'x'", "'X'"),
+            (f"{s}.c", "row(1,'a b')", "row(1,'a  b')"),
+        ]
+    ):
+        _exec(
+            ADMIN,
+            f"create table {s}.a{i} (k {t}, v int)",
+            f"create table {s}.b{i} (k {t}, v int)",
+            f"insert into {s}.a{i} values ({k1}, 1), ({k2}, 2)",
+            f"insert into {s}.b{i} values ({k1}, 1)",
+        )
         r = _diff(ADMIN, f"{s}.a{i}", ADMIN, f"{s}.b{i}", key="k")
         assert [d.kind for d in r.diffs] == ["only_in_a"], t
-    _exec(ADMIN, f"create table {s}.dup (k int4range, v int)",
-          f"insert into {s}.dup values ('[1,5)', 1), ('(0,4]', 2)")
+    _exec(
+        ADMIN,
+        f"create table {s}.dup (k int4range, v int)",
+        f"insert into {s}.dup values ('[1,5)', 1), ('(0,4]', 2)",
+    )
     with pytest.raises(ValueError, match="not unique"):
         _diff(ADMIN, f"{s}.dup", ADMIN, f"{s}.dup", key="k")
-    _exec(ADMIN,
-          *[f"create table {s}.t{t} (id int, valid tstzrange, x text, "
-            "primary key (id, valid without overlaps))" for t in "ab"],
-          *[f"insert into {s}.t{t} values (1, '[2024-01-01,2024-02-01)', 'a'), "
-            "(1, '[2024-02-01,2024-03-01)', 'b'), (2, '[2024-01-01,)', 'c')" for t in "ab"],
-          f"update {s}.tb set x = 'B' where id = 1 and lower(valid) = '2024-02-01'")
+    _exec(
+        ADMIN,
+        *[
+            f"create table {s}.t{t} (id int, valid tstzrange, x text, "
+            "primary key (id, valid without overlaps))"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {s}.t{t} values (1, '[2024-01-01,2024-02-01)', 'a'), "
+            "(1, '[2024-02-01,2024-03-01)', 'b'), (2, '[2024-01-01,)', 'c')"
+            for t in "ab"
+        ],
+        f"update {s}.tb set x = 'B' where id = 1 and lower(valid) = '2024-02-01'",
+    )
     r = _diff(ADMIN, f"{s}.ta", ADMIN, f"{s}.tb", key=["id", "valid"])
     assert [(d.kind, d.columns) for d in r.diffs] == [("different", ["x"])]
     assert "2024-02-01" in str(r.diffs[0].key)
@@ -380,25 +504,40 @@ def test_foreign_table_and_bisection_extremes(schema):
     extreme finds the planted 1 us change and ignores a change below the scale."""
     s = schema
     srv = f"rth_postgres_loop_{RUN}"
-    _exec(ADMIN, "create extension if not exists postgres_fdw",
-          f"create server {srv} foreign data wrapper postgres_fdw "
-          "options (host '127.0.0.1', port '5432', dbname 'rth')",
-          f"create user mapping for current_user server {srv} options (user 'rth', password 'rth')",
-          *[f"create table {s}.{t} (id int primary key, x text, f float8, ts timestamptz, "
-            "i interval, n numeric)" for t in "ab"],
-          *[f"insert into {s}.{t} select g, 'v'||g, g * 0.1 + 1e-9, "
+    _exec(
+        ADMIN,
+        "create extension if not exists postgres_fdw",
+        f"create server {srv} foreign data wrapper postgres_fdw "
+        "options (host '127.0.0.1', port '5432', dbname 'rth')",
+        f"create user mapping for current_user server {srv} options (user 'rth', password 'rth')",
+        *[
+            f"create table {s}.{t} (id int primary key, x text, f float8, ts timestamptz, "
+            "i interval, n numeric)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {s}.{t} select g, 'v'||g, g * 0.1 + 1e-9, "
             "timestamptz '2024-06-01 12:00+02' + g * interval '1 min', "
-            "g * interval '1 mon 1 day', g / 7.0 from generate_series(1, 5000) g" for t in "ab"],
-          f"update {s}.b set f = f + 1e-15 * f where id = 10",
-          f"update {s}.b set ts = ts + interval '1 us' where id = 20",
-          f"create foreign table {s}.fb (id int, x text, f float8, ts timestamptz, i interval, "
-          f"n numeric) server {srv} options (schema_name '{s}', table_name 'b')")
+            "g * interval '1 mon 1 day', g / 7.0 from generate_series(1, 5000) g"
+            for t in "ab"
+        ],
+        f"update {s}.b set f = f + 1e-15 * f where id = 10",
+        f"update {s}.b set ts = ts + interval '1 us' where id = 20",
+        f"create foreign table {s}.fb (id int, x text, f float8, ts timestamptz, i interval, "
+        f"n numeric) server {srv} options (schema_name '{s}', table_name 'b')",
+    )
     try:
         r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.fb")
         assert [(d.key, d.columns) for d in r.diffs] == [(20, ["ts"])]
         for factor, threshold in [(2, 1), (1000, 1), (2, 100000)]:
-            r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b",
-                      bisection_factor=factor, threshold=threshold)
+            r = _diff(
+                ADMIN,
+                f"{s}.a",
+                ADMIN,
+                f"{s}.b",
+                bisection_factor=factor,
+                threshold=threshold,
+            )
             assert [(d.key, d.columns) for d in r.diffs] == [(20, ["ts"])]
     finally:
         _exec(ADMIN, f"drop server if exists {srv} cascade")
@@ -413,7 +552,11 @@ def test_foreign_table_and_bisection_extremes(schema):
         ("text collate {s}.ci", "'a'", "'A'"),
         ("citext", "'a'", "'A'"),
         ("varchar(5)", "''", "' '"),
-        ("uuid", "'00000000-0000-0000-0000-000000000000'", "'ffffffff-ffff-ffff-ffff-ffffffffffff'"),
+        (
+            "uuid",
+            "'00000000-0000-0000-0000-000000000000'",
+            "'ffffffff-ffff-ffff-ffff-ffffffffffff'",
+        ),
         ("numeric", "1.5", "1.50000000001"),
         ("numeric", "'NaN'", "'Infinity'"),
         ("money", "1", "1.01"),
@@ -431,19 +574,28 @@ def test_foreign_table_and_bisection_extremes(schema):
 )
 def test_distinct_keys_of_every_type_stay_distinct(schema, typ, k1, k2):
     """A holds k1 and k2, B only k1: exactly k2 is only_in_a."""
-    _exec(ADMIN, "create extension if not exists citext",
-          f"create collation {schema}.ci (provider = icu, locale = 'und-u-ks-level2', "
-          "deterministic = false)")
+    _exec(
+        ADMIN,
+        "create extension if not exists citext",
+        f"create collation {schema}.ci (provider = icu, locale = 'und-u-ks-level2', "
+        "deterministic = false)",
+    )
     t = typ.format(s=schema)
-    _exec(ADMIN, f"create table {schema}.a (k {t}, v int)", f"create table {schema}.b (k {t}, v int)",
-          f"insert into {schema}.a values ({k1}, 1), ({k2}, 2)",
-          f"insert into {schema}.b values ({k1}, 1)")
+    _exec(
+        ADMIN,
+        f"create table {schema}.a (k {t}, v int)",
+        f"create table {schema}.b (k {t}, v int)",
+        f"insert into {schema}.a values ({k1}, 1), ({k2}, 2)",
+        f"insert into {schema}.b values ({k1}, 1)",
+    )
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", key="k")
     assert [d.kind for d in r.diffs] == ["only_in_a"]
 
 
 #: A hot standby of ADMIN (container `rth-pg-18r`, `pg_basebackup -R`, port 15619).
-STANDBY = os.environ.get("PARITY_RTH_PG_STANDBY", "postgres://rth:rth@127.0.0.1:15619/rth")
+STANDBY = os.environ.get(
+    "PARITY_RTH_PG_STANDBY", "postgres://rth:rth@127.0.0.1:15619/rth"
+)
 
 
 def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
@@ -458,14 +610,20 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
     finally:
         conn.close()
     s = schema
-    _exec(ADMIN, *[f"create table {s}.{t} (id int primary key, x text)" for t in "ab"],
-          *[f"insert into {s}.{t} select g, 'v'||g from generate_series(1, 50000) g" for t in "ab"],
-          f"update {s}.b set x = 'D' where id = 777")
+    _exec(
+        ADMIN,
+        *[f"create table {s}.{t} (id int primary key, x text)" for t in "ab"],
+        *[
+            f"insert into {s}.{t} select g, 'v'||g from generate_series(1, 50000) g"
+            for t in "ab"
+        ],
+        f"update {s}.b set x = 'D' where id = 777",
+    )
     for _ in range(60):
         try:
             if _exec(STANDBY, f"select count(*) from {s}.b where x = 'D'")[0][0] == 1:
                 break
-        except Exception:  # noqa: BLE001 - not replayed yet
+        except Exception:  # noqa: S110 - not replayed yet
             pass
         time.sleep(1)
     a, b = get_dialect(STANDBY, side="A"), get_dialect(STANDBY, side="B")
@@ -475,8 +633,12 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
-            _exec(ADMIN, f"update {s}.b set x = 'LIVE' where id = 2",
-                  f"delete from {s}.b where id between 100 and 20000", f"vacuum {s}.b")
+            _exec(
+                ADMIN,
+                f"update {s}.b set x = 'LIVE' where id = 2",
+                f"delete from {s}.b where id between 100 and 20000",
+                f"vacuum {s}.b",
+            )
             time.sleep(3)  # let it replay
         return out
 
@@ -494,30 +656,53 @@ def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
     s = schema
     cols = ", ".join(f"c{i} int" for i in range(600))
     names = ", ".join(f"c{i}" for i in range(600))
-    _exec(ADMIN,
-          *[f"create table {s}.w{t} (id int primary key, {cols})" for t in "ab"],
-          *[f"insert into {s}.w{t} (id, {names}) select g, {', '.join('g' for _ in range(600))} "
-            "from generate_series(1, 50) g" for t in "ab"],
-          f"update {s}.wb set c599 = -1 where id = 25", f"update {s}.wb set c0 = -1 where id = 26")
+    _exec(
+        ADMIN,
+        *[f"create table {s}.w{t} (id int primary key, {cols})" for t in "ab"],
+        *[
+            f"insert into {s}.w{t} (id, {names}) select g, {', '.join('g' for _ in range(600))} "
+            "from generate_series(1, 50) g"
+            for t in "ab"
+        ],
+        f"update {s}.wb set c599 = -1 where id = 25",
+        f"update {s}.wb set c0 = -1 where id = 26",
+    )
     r = _diff(ADMIN, f"{s}.wa", ADMIN, f"{s}.wb")
-    assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [(25, ("c599",)), (26, ("c0",))]
+    assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [
+        (25, ("c599",)),
+        (26, ("c0",)),
+    ]
     odd = f'{s} Ödd"q'
     qodd = '"' + odd.replace('"', '""') + '"'
     long = "ü" * 31
-    _exec(ADMIN, f"create schema {qodd}",
-          *[f'create table {qodd}."T {t}" ("ID" int primary key, "select ""x""\'y" text, '
-            f'"{long}" text, "order" text)' for t in "ab"],
-          *[f"insert into {qodd}.\"T {t}\" values (1, 'a', 'b', 'c'), (2, 'a', 'b', 'c')" for t in "ab"],
-          f"update {qodd}.\"T b\" set \"order\" = 'X' where \"ID\" = 2")
+    _exec(
+        ADMIN,
+        f"create schema {qodd}",
+        *[
+            f'create table {qodd}."T {t}" ("ID" int primary key, "select ""x""\'y" text, '
+            f'"{long}" text, "order" text)'
+            for t in "ab"
+        ],
+        *[
+            f"insert into {qodd}.\"T {t}\" values (1, 'a', 'b', 'c'), (2, 'a', 'b', 'c')"
+            for t in "ab"
+        ],
+        f'update {qodd}."T b" set "order" = \'X\' where "ID" = 2',
+    )
     try:
         r = _diff(ADMIN, f"{odd}.T a", ADMIN, f"{odd}.T b", key="id")
         assert [(d.key, d.columns) for d in r.diffs] == [(2, ["order"])]
     finally:
         _exec(ADMIN, f"drop schema {qodd} cascade")
-    _exec(ADMIN,
-          *[f"create table {s}.h{t} (id int primary key, v text)" for t in "ab"],
-          *[f"insert into {s}.h{t} values (1, repeat('abcdefgh', 1250000)), (2, 'x')" for t in "ab"],
-          f"update {s}.hb set v = overlay(v placing 'Z' from 9999990) where id = 1")
+    _exec(
+        ADMIN,
+        *[f"create table {s}.h{t} (id int primary key, v text)" for t in "ab"],
+        *[
+            f"insert into {s}.h{t} values (1, repeat('abcdefgh', 1250000)), (2, 'x')"
+            for t in "ab"
+        ],
+        f"update {s}.hb set v = overlay(v placing 'Z' from 9999990) where id = 1",
+    )
     r = _diff(ADMIN, f"{s}.ha", ADMIN, f"{s}.hb")
     assert [(d.key, d.columns) for d in r.diffs] == [(1, ["v"])] and not r.unexplained
 
@@ -549,7 +734,9 @@ def test_partitions_generated_columns_and_missing_grants(schema):
     assert [(d.key, d.columns) for d in r.diffs] == [(50, ["v"])]
     url = _role(f"rth_postgres_np_{RUN}")
     try:
-        with pytest.raises(ValueError, match=r"side A.*exists but this role cannot read it"):
+        with pytest.raises(
+            ValueError, match=r"side A.*exists but this role cannot read it"
+        ):
             _diff(url, f"{s}.pa", ADMIN, f"{s}.pb", key=["id", "r"])
     finally:
         _exec(ADMIN, f"drop role rth_postgres_np_{RUN}")
@@ -568,24 +755,44 @@ def test_cli_connection_errors_never_print_the_password(url, schema):
     import sys
 
     pg_connect(ADMIN).close()
-    cmd = [sys.executable, "-c", "import sys; from parity.cli import main; sys.exit(main())",
-           "diff", "--a", url, "--a-table", f"{schema}.t", "--b", ADMIN,
-           "--b-table", f"{schema}.t", "--key", "id"]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; from parity.cli import main; sys.exit(main())",
+        "diff",
+        "--a",
+        url,
+        "--a-table",
+        f"{schema}.t",
+        "--b",
+        ADMIN,
+        "--b-table",
+        f"{schema}.t",
+        "--key",
+        "id",
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)  # noqa: S603 - our own CLI
     assert p.returncode == 2
     assert "side A" in p.stderr and "S3cr3t" not in p.stdout + p.stderr
 
 
 def test_live_writer_mid_walk_is_invisible_then_seen(schema):
     s = schema
-    _exec(ADMIN,
-          f"create table {s}.a (id bigint primary key, x text, n numeric(12,2))",
-          f"insert into {s}.a select g, md5(g::text), g / 100.0 from generate_series(1, 200000) g",
-          f"create table {s}.b as select * from {s}.a", f"alter table {s}.b add primary key (id)",
-          f"update {s}.b set x = 'first' where id = 1",
-          f"update {s}.b set n = n + 0.01 where id = 200000",
-          f"insert into {s}.b values (9223372036854775807, 'max', 0)")
-    planted = [(1, "different"), (200000, "different"), (9223372036854775807, "only_in_b")]
+    _exec(
+        ADMIN,
+        f"create table {s}.a (id bigint primary key, x text, n numeric(12,2))",
+        f"insert into {s}.a select g, md5(g::text), g / 100.0 from generate_series(1, 200000) g",
+        f"create table {s}.b as select * from {s}.a",
+        f"alter table {s}.b add primary key (id)",
+        f"update {s}.b set x = 'first' where id = 1",
+        f"update {s}.b set n = n + 0.01 where id = 200000",
+        f"insert into {s}.b values (9223372036854775807, 'max', 0)",
+    )
+    planted = [
+        (1, "different"),
+        (200000, "different"),
+        (9223372036854775807, "only_in_b"),
+    ]
     a, b = get_dialect(ADMIN, side="A"), get_dialect(ADMIN, side="B")
     original, fired = b.segment_checksums, []
 
@@ -593,8 +800,12 @@ def test_live_writer_mid_walk_is_invisible_then_seen(schema):
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
-            _exec(ADMIN, f"update {s}.b set x = 'LIVE' where id = 2",
-                  f"delete from {s}.b where id = 3", f"insert into {s}.b values (-5, 'new', 0)")
+            _exec(
+                ADMIN,
+                f"update {s}.b set x = 'LIVE' where id = 2",
+                f"delete from {s}.b where id = 3",
+                f"insert into {s}.b values (-5, 'new', 0)",
+            )
         return out
 
     b.segment_checksums = wrapped
@@ -603,10 +814,15 @@ def test_live_writer_mid_walk_is_invisible_then_seen(schema):
     finally:
         a.close()
         b.close()
-    assert fired and sorted((d.key, d.kind) for d in r.diffs) == planted and not r.unexplained
+    assert (
+        fired
+        and sorted((d.key, d.kind) for d in r.diffs) == planted
+        and not r.unexplained
+    )
     r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b")
     assert sorted((d.key, d.kind) for d in r.diffs) == sorted(
-        [*planted, (-5, "only_in_b"), (2, "different"), (3, "only_in_a")])
+        [*planted, (-5, "only_in_b"), (2, "different"), (3, "only_in_a")]
+    )
     r = _diff(ADMIN, f"{s}.a", ADMIN, f"{s}.b", max_diffs=2)
     assert r.truncated and not r.identical and len(r.diffs) == 2
 
@@ -618,7 +834,8 @@ def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
     missing on that side, never silently equal."""
     import duckdb
 
-    vals = ["日本語", "ｶﾀｶﾅ", "①", "髙", "～", "∥", "−", "\\", "é", "abc"]
+    # Fullwidth tilde, parallel and minus sign are deliberate: EUC_JP maps them specially.
+    vals = ["日本語", "ｶﾀｶﾅ", "①", "髙", "～", "∥", "−", "\\", "é", "abc"]  # noqa: RUF001
     path = (tmp_path / "enc.duckdb").as_posix()
     con = duckdb.connect(path)
     con.execute("create table t (id int primary key, v varchar)")
@@ -626,8 +843,11 @@ def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
         con.execute("insert into t values (?, ?)", [i, v + ("X" if i == 3 else "")])
     con.close()
     db = f"rth_postgres_{encoding.lower()}_{RUN}"
-    _exec(ADMIN, f"create database {db} encoding '{encoding}' lc_collate 'C' "
-          "lc_ctype 'C' template template0")
+    _exec(
+        ADMIN,
+        f"create database {db} encoding '{encoding}' lc_collate 'C' "
+        "lc_ctype 'C' template template0",
+    )
     url = ADMIN.rsplit("/", 1)[0] + "/" + db
     try:
         _exec(url, "create table t (id int primary key, v text)")
@@ -639,13 +859,15 @@ def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
                 try:
                     conn.execute("insert into t values (%s, %s)", (i, v))
                     stored.add(i)
-                except Exception:  # noqa: BLE001 - not representable here
+                except Exception:  # noqa: S110 - not representable in this encoding
                     pass
         finally:
             conn.close()
         assert 3 in stored
         r = _diff(url, "public.t", f"duckdb:///{path}", "main.t")
-        expected = {(3, "different")} | {(i, "only_in_b") for i in range(1, 11) if i not in stored}
+        expected = {(3, "different")} | {
+            (i, "only_in_b") for i in range(1, 11) if i not in stored
+        }
         assert {(d.key, d.kind) for d in r.diffs} == expected
         assert not r.unexplained
     finally:
@@ -662,15 +884,21 @@ def test_gin_fuzzy_search_limit_under_a_filter_is_never_identical(schema):
     """A role default `gin_fuzzy_search_limit` makes GIN scans return a random
     subset; the per-level row-count check must refuse to call it identical."""
     for t in "ab":
-        _exec(ADMIN, f"create table {schema}.{t} (id int primary key, tags int[], x text)",
-              f"insert into {schema}.{t} select g, array[1, g % 7], 'v'||g "
-              "from generate_series(1, 20000) g",
-              f"create index on {schema}.{t} using gin (tags)", f"analyze {schema}.{t}")
+        _exec(
+            ADMIN,
+            f"create table {schema}.{t} (id int primary key, tags int[], x text)",
+            f"insert into {schema}.{t} select g, array[1, g % 7], 'v'||g "
+            "from generate_series(1, 20000) g",
+            f"create index on {schema}.{t} using gin (tags)",
+            f"analyze {schema}.{t}",
+        )
     _exec(ADMIN, f"update {schema}.b set x = 'CHANGED' where id = 5000")
     opts = quote("-c gin_fuzzy_search_limit=100 -c enable_seqscan=off")
     url = f"{ADMIN}?options={opts}"
     w = "tags @> '{1}'"
-    r = _diff(url, f"{schema}.a", url, f"{schema}.b", where_a=w, where_b=w, verify_sample=0)
+    r = _diff(
+        url, f"{schema}.a", url, f"{schema}.b", where_a=w, where_b=w, verify_sample=0
+    )
     assert not r.identical and r.unexplained
 
 
@@ -684,8 +912,11 @@ def test_gin_fuzzy_search_limit_under_a_filter_is_never_identical(schema):
         ("char(3)", "'a'", "'a\t'"),
         ("hstore", "'a=>NULL'", "'a=>\"NULL\"'"),
         ("int4range", "'empty'", "NULL"),
-        ("tstzrange", "'[2024-01-01 00:00+00,2024-01-02 00:00+00)'",
-         "'[2024-01-01 00:00+01,2024-01-02 00:00+00)'"),
+        (
+            "tstzrange",
+            "'[2024-01-01 00:00+00,2024-01-02 00:00+00)'",
+            "'[2024-01-01 00:00+01,2024-01-02 00:00+00)'",
+        ),
         ("xml", "'<a/>'", "'<a></a>'"),
         ("point", "'(0,0)'", "'(-0,0)'"),
         ("inet", "'::ffff:1.2.3.4'", "'1.2.3.4'"),
@@ -703,13 +934,19 @@ def test_gin_fuzzy_search_limit_under_a_filter_is_never_identical(schema):
 )
 def test_distinct_values_of_exotic_types_are_found(schema, typ, v1, v2):
     """Two different values of each type: exactly the planted key differs."""
-    _exec(ADMIN, "create extension if not exists hstore",
-          f"create type {schema}.pair as (a text, b float8)")
+    _exec(
+        ADMIN,
+        "create extension if not exists hstore",
+        f"create type {schema}.pair as (a text, b float8)",
+    )
     t = typ.format(s=schema)
-    _exec(ADMIN, f"create table {schema}.a (id int primary key, v {t})",
-          f"create table {schema}.b (id int primary key, v {t})",
-          f"insert into {schema}.a values (1, {v1}), (2, {v1})",
-          f"insert into {schema}.b values (1, {v1}), (2, {v2})")
+    _exec(
+        ADMIN,
+        f"create table {schema}.a (id int primary key, v {t})",
+        f"create table {schema}.b (id int primary key, v {t})",
+        f"insert into {schema}.a values (1, {v1}), (2, {v1})",
+        f"insert into {schema}.b values (1, {v1}), (2, {v2})",
+    )
     r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
     assert [d.key for d in r.diffs] == [2]
     assert not r.unexplained
@@ -733,9 +970,12 @@ def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
                 conn.execute(f"set lc_monetary = '{name}'")
                 locale = name
                 break
-            except Exception:  # noqa: BLE001 - locale not installed here
+            except Exception:  # noqa: S112 - locale not installed here
                 continue
-        if locale is None or conn.execute("select '1.5'::money::numeric").fetchone()[0] != 2:
+        if (
+            locale is None
+            or conn.execute("select '1.5'::money::numeric").fetchone()[0] != 2
+        ):
             pytest.skip("no 0-decimal monetary locale on this server")
         conn.execute(f"create table public.{table} (id int primary key, m money)")
         conn.execute(f"insert into public.{table} values (1, '12345'), (2, '100')")
