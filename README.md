@@ -617,7 +617,10 @@ way it is. `ROADMAP.md` is what is done and what comes next.
 
 ## Changelog
 
-Latest release **0.4.0** — SQL Server support, and the fixes from a red-team
+Latest release **0.5.0** — Oracle support, an independent sample check on every
+run (10,000 rows, 99.9% confidence), `--where`, `--map` and `parity run` for
+many tables, and every false match found by red-team round H fixed; see
+"Upgrading from 0.4.0" in `CHANGELOG.md`. 0.4.0 added SQL Server support, and the fixes from a red-team
 campaign that found inputs on which earlier versions reported identical tables
 that were not (a text value `\N` against NULL, a separator character inside
 text, a column dropped on one side, PostgreSQL `infinity` dates, MySQL binary

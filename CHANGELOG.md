@@ -3,7 +3,7 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org/),
 with the caveat that 0.x means the CLI surface may still move.
 
-## Unreleased
+## 0.5.0 — 2026-11-04
 
 ### Upgrading from 0.4.0 — what you will notice
 

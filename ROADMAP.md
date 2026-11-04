@@ -11,6 +11,11 @@ document, because it makes a reader distrust the accurate ones.
 
 ## Where it is
 
+**v0.5.0 released** (2026-11-04): adds **Oracle**, the independent sample
+check, `--where`, `--map`, `parity run`, Snowflake key-pair sign-in, the
+coverage map and `docs/risk.md`, and the round G and H red-team fixes. Details
+below under "0.5.0" and in `CHANGELOG.md`.
+
 **v0.4.0 released** (2026-11-03): adds **SQL Server / Azure SQL**, and fixes
 every false match a seven-angle red-team campaign found (`tests/redteam/`,
 CLAUDE.md §4.11): text escaping, exact keys, schema differences in the verdict,
@@ -27,7 +32,7 @@ moving FLOAT onto one canonical form every engine computes identically.
 | | |
 |---|---|
 | Tests | 490; run against live PostgreSQL, DuckDB and MySQL. The 5 Snowflake tests and the 15 live BigQuery tests skip unless `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY` point at a real account, so they never run in CI — verified live by hand instead. The identical check — a false match being the one unforgivable failure — carries a dedicated stress campaign (offline logic, every live engine pair, all key types, edge values, representation changes, CLI, timezone, snapshot isolation) with no abnormality found |
-| Coverage | 96%, with a 95% floor enforced in CI (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
+| Coverage | 91% in CI, with a 90% floor (95% before 0.5.0: the Oracle and SQL Server dialects are verified by live suites CI does not run) (the Snowflake dialect is covered offline; only its live-driver methods are exempt) |
 | CI | ruff, `mypy --strict`, PostgreSQL 16 and 18 + MySQL 8 service containers, Python 3.10 and 3.13, Windows, a DuckDB-only install |
 | Proven | 10M rows per side: identical in 4 queries and 0 rows downloaded; five planted differences found exactly, moving 0.0381% of the data. Snowflake verified live: hash constant, a 5,000-row full-table checksum matching DuckDB byte-for-byte, and every planted-difference check |
 
@@ -35,7 +40,7 @@ Every test plants a difference and asserts the tool finds exactly it. That rule
 is the reason this project can be trusted at all, and it is not negotiable — see
 `CONTRIBUTING.md`.
 
-## Since 0.4.0 (unreleased, branch `snowflake-live`)
+## 0.5.0 (released 2026-11-04)
 
 Snowflake verified live and its FLOAT fixed; the independent sample check
 (default 10,000 rows, 99.9% confidence) and per-run risk figures; the coverage

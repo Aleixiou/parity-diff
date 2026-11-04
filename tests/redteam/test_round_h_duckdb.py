@@ -1511,6 +1511,9 @@ def _windows_spellings(path: str) -> list[str]:
     return out
 
 
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows spellings; on POSIX duckdb://+abs is relative"
+)
 def test_every_windows_spelling_of_the_path_finds_the_change(two_files):
     """Drive letters, backslashes, forward slashes, two or three slashes,
     UNC and \\\\?\\ prefixes: each opens the same file and finds row 5."""
@@ -1605,7 +1608,19 @@ def test_an_in_memory_side_is_an_empty_database(two_files, url):
     assert code == 2 and "[side B: duckdb] table not found" in err
 
 
-@pytest.mark.parametrize("prefix", ["duckdb:", "duckdb:/"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "duckdb:",
+        pytest.param(
+            "duckdb:/",
+            marks=pytest.mark.skipif(
+                os.name != "nt",
+                reason="on POSIX duckdb:/ + /abs is duckdb://abs, a relative path",
+            ),
+        ),
+    ],
+)
 def test_a_url_without_the_double_slash_gets_a_clear_error(two_files, prefix):
     """Refused, naming the expected grammar - not an IndexError's text."""
     base, chg = two_files

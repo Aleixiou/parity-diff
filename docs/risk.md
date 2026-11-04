@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: bee758f7ab3d47b3`
+Source fingerprint: `src-sha256: 7ad1941e18d10fdd`
 
 ## Summary
 
