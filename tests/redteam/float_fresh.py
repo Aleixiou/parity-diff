@@ -47,9 +47,9 @@ def fresh_doubles(rng: random.Random, n: int, subnormal: bool) -> list[float]:
             ip = rng.choice([0, 1, 7, rng.randint(0, 10**6), rng.randint(0, 10**12)])
             x = float(f"{ip}.{rng.randint(0, 10**s - 1) if s else 0:0{s}d}5")
         elif r < 0.7:
-            x = float(f"{rng.random():.{rng.choice([15, 16, 17])}g}") * 10.0 ** rng.randint(
-                -12, 34
-            )
+            x = float(
+                f"{rng.random():.{rng.choice([15, 16, 17])}g}"
+            ) * 10.0 ** rng.randint(-12, 34)
         elif r < 0.8:
             base = rng.choice([2.0**53, 2.0**54, 2.0**60, 1e15, 1e16, 1e17, 2.0**100])
             x = math.nextafter(base, rng.choice([0.0, math.inf]))
@@ -74,7 +74,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100_000)
     ap.add_argument("--seed", type=int, default=11)
-    ap.add_argument("--engines", nargs="*", default=["postgres", "duckdb", "mysql", "mssql"])
+    ap.add_argument(
+        "--engines", nargs="*", default=["postgres", "duckdb", "mysql", "mssql"]
+    )
     ap.add_argument("--scales", nargs="*", type=int, default=[6])
     args = ap.parse_args()
     u = urls()

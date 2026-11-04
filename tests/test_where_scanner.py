@@ -17,6 +17,7 @@ from parity.dialects.bigquery_dialect import BigQueryDialect
 from parity.dialects.duckdb_dialect import DuckDBDialect
 from parity.dialects.mssql_dialect import SQLServerDialect
 from parity.dialects.mysql_dialect import MySQLDialect
+from parity.dialects.oracle_dialect import OracleDialect
 from parity.dialects.postgres_dialect import PostgresDialect
 from parity.dialects.snowflake_dialect import SnowflakeDialect
 
@@ -27,6 +28,7 @@ DIALECTS = [
     MySQLDialect,
     SQLServerDialect,
     SnowflakeDialect,
+    OracleDialect,
 ]
 
 #: Each of these escapes its parentheses on at least one engine.

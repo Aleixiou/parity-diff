@@ -27,13 +27,13 @@ For one run that reports **identical**, on columns the rules cover:
 |---|---|---|
 | A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
 | A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.001^(1/n)** of the rows, at 99.9% confidence, for n rows sampled — **0.069%** at the default n = 10,000 (about 1 row in 1,450); **0** when every row was compared | Proven bound |
-| An engine renders a value differently from the rules | **0 of 4,180** checks at float scale 6 outside the 26 required refusals (4,154 exact), every type with a rule × 6 engines | Measured |
+| An engine renders a value differently from the rules | **0 of 4,962** checks at float scale 6 outside the 31 required refusals (4,931 exact), every type with a rule × 7 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
 | The sample check could not run, and the run reads as checked | **0**: a check that was asked for and failed to fetch its rows makes the run "not proven", never identical (exit 1). Only `--verify-sample 0` rests the verdict on the checksums alone, and the report then says the check was off and computes no risk figure | By design (enforced) |
 | A column on one side only, never compared | **0**: a schema difference is never identical | By design (enforced) |
 | A renamed column (`--map`) compared against the wrong counterpart | **0**: pairing is exact, ambiguous maps are refused | By design (tested) |
-| A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
+| A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all seven dialects | By design (tested) |
 | An "identical" over no rows at all (a mistyped filter, the wrong table) read as a check | **0**: a side that compared 0 rows draws a warning naming it on every run, and when both are empty the headline says `0 rows compared, both sides are empty` | By design (enforced) |
 | A filtered "identical" read as one about the whole table | **0**: the headline, a `filtered:` line, JSON and a caveat state the filter; a filtered run **proves nothing about rows outside it** | By design (enforced) |
 | A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()`/`current_timestamp()` unless the engine evaluates it once per run - BigQuery's snapshot does not pin its clock) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
@@ -96,7 +96,7 @@ line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| One query that reads the table runs unfiltered (a row counted but never checksummed, or sampled but never walked) | **0** — the key stats, every checksum level, every download and the sample all name the table through one builder that adds the predicate; `tests/test_where_sql.py` records every statement on all six dialects | By design (tested) |
+| One query that reads the table runs unfiltered (a row counted but never checksummed, or sampled but never walked) | **0** — the key stats, every checksum level, every download and the sample all name the table through one builder that adds the predicate; `tests/test_where_sql.py` records every statement on all seven dialects | By design (tested) |
 | The predicate escapes its parentheses (`1=1) or (1=1`) or ends the statement | **0** for what the check knows: `;`, comments, MySQL `#`, a backslash before a quote, triple- and dollar-quoted strings and unbalanced quotes, brackets or parentheses are refused before any query; on SQL Server the filter is re-scanned as T-SQL tokenises it (`]]` inside brackets), table and query hints and ODBC escape braces are refused, and the SELECT guard also applies. Not a security boundary: it is the user's own SQL, and the sessions are read-only | By design (tested) |
 | The predicate selects different rows in different queries (`random()`, `clock_timestamp()`; `now()`/`current_date` where an engine gives each query its own snapshot) | a change between the row count and the first level, or between two levels of one range, is **never identical** (unexplained); a row entering the filter beyond the key range measured first is **not compared**; beyond that **not bounded** — every filtered run's caveat says to prefer fixed literals | Not quantifiable |
 | A deterministic predicate inside one snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables; `now()` is stable within PostgreSQL's transaction) | **no new risk**: every query sees the same rows, so the walk is the unfiltered walk over a smaller table | By design (tested) |
@@ -135,7 +135,7 @@ and 4.3. This is where every past false match lived.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Rendering disagrees with the rules, covered types | **0 of 4,180** checks at scale 6 (4,154 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
+| Rendering disagrees with the rules, covered types | **0 of 4,962** checks at scale 6 (4,931 exact, 31 required refusals), same at scale 2, on 7 engines; see `docs/coverage.md` per type and engine (Oracle cannot store the empty string: those 9 cells are not storable there, not checks) | Measured |
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
 | Types outside the rules: BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report. The real risk is not only false alarms: an engine's text for such a type can collide - BigQuery's `FORMAT('%t')` printed `['a, b']` like `['a', 'b']` and a NULL struct field like `'NULL'` (round H, fixed). On BigQuery every one is now injective by construction (STRUCT by `canonical_struct_text`, GEOGRAPHY as WKB, INTERVAL/RANGE components printed exactly); on other engines the fallback is the engine's own text cast, injective only as far as that cast is | Not quantifiable |
 | A PostgreSQL extension type whose text prints two values alike (contrib `seg`) | **0** false matches between PostgreSQL sides: types outside pg_catalog and the known-exact list are compared by their binary send form too, or refused (round H) | By design (tested) |
@@ -257,9 +257,9 @@ walk defect or a table changed mid-run.
 ## 9. What no figure covers
 
 - **Bugs not yet found.** Evidence instead of a number: the coverage map
-  (section 4), the full live test suite, two red-team campaigns (the
-  second on server settings and versions), and the sample check on every
-  run.
+  (section 4), the full live test suite, the red-team campaigns (round G
+  on server settings and versions, round H per engine and with a
+  cross-engine fuzzer), and the sample check on every run.
 - **Tables changing during a run** without one snapshot (section 1).
 - **Rows outside a `--where` filter**: never compared (section 2b).
 - **Data changed since a `--resume`d pair's earlier run** (section 2c).

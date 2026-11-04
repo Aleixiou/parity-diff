@@ -25,19 +25,19 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import float_fresh  # noqa: E402
-import fuzz_cross as fx  # noqa: E402
-import fuzz_harness as fh  # noqa: E402
-from conftest import (  # noqa: E402
+import float_fresh
+import fuzz_cross as fx
+import fuzz_harness as fh
+from conftest import (
     _bigquery_available,
     _mssql_available,
     _mysql_available,
     _pg_available,
     _snowflake_available,
 )
-from test_fuzz import _duck, _found, _run  # noqa: E402
+from test_fuzz import _duck, _found, _run
 
-from parity.dialects.base import canonical_float_text  # noqa: E402
+from parity.dialects.base import canonical_float_text
 
 CASES = int(os.environ.get("PARITY_RTH_CASES", "6"))
 SEED = int(os.environ.get("PARITY_RTH_SEED", "1"))
@@ -60,7 +60,7 @@ def _available(name: str) -> tuple[bool, str]:
     }[name]()
 
 
-PAIRS = fx.all_pairs(list(fx.LOCAL)) + [("bigquery", "duckdb"), ("snowflake", "duckdb")]
+PAIRS = [*fx.all_pairs(list(fx.LOCAL)), ("bigquery", "duckdb"), ("snowflake", "duckdb")]
 
 
 @pytest.mark.parametrize(("a", "b"), PAIRS, ids=lambda x: x)
@@ -138,8 +138,15 @@ def test_a_filter_that_changes_between_queries_is_never_identical(
         b = _duck(tmp_path, f"b{_}", "id int, v int", rows)
         try:
             r = fx.diff(
-                a, b, "t", "t", key="id", where_a=where_a, where_b=where_b,
-                threshold=50, bisection_factor=4,
+                a,
+                b,
+                "t",
+                "t",
+                key="id",
+                where_a=where_a,
+                where_b=where_b,
+                threshold=50,
+                bisection_factor=4,
             )
         finally:
             a.close()
@@ -240,7 +247,9 @@ def test_rt_hx2_snowflake_number_p_0_matches_a_decimal_p_0(snowflake_url, tmp_pa
     w = open_snowflake(snowflake_url, side="A")
     cur = w._conn.cursor()
     try:
-        cur.execute(f"create or replace table {name} (id integer, amount number(14,0), note varchar)")
+        cur.execute(
+            f"create or replace table {name} (id integer, amount number(14,0), note varchar)"
+        )
         cur.execute(f"insert into {name} values (1, 41886, 'x'), (2, 0, 'y')")
         path = str(tmp_path / "b.duckdb")
         con = duckdb_write(path)

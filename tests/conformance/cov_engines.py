@@ -1420,7 +1420,18 @@ class OracleCov(CovEngine):
             finally:
                 c.close()
 
-        return _per_row(one, rows)
+        bad = _per_row(one, rows)
+        # Oracle stores '' (and an empty RAW or BLOB) as NULL, so the value
+        # loaded is not the value held: the row reads back as NULL and renders
+        # the sentinel, correctly, which the cross-engine test would otherwise
+        # read as a split against every engine that holds ''. A property of
+        # the engine, documented in docs/limitations.md - not a rendering.
+        for r in rows:
+            x = r[1] if len(r) > 1 else None
+            x = x.value if isinstance(x, OraBind) else x
+            if isinstance(x, (str, bytes)) and len(x) == 0:
+                bad.setdefault(int(r[0]), "Oracle stores the empty string as NULL")
+        return bad
 
     def ref(self, table):
         """In the login's own schema."""

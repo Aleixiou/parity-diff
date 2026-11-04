@@ -1092,6 +1092,9 @@ def test_mysql_receives_only_reads(mysql_url, mysql_orders, duck_orders, monkeyp
     print("mysql statements:", sorted({x.split()[0] for x in log}), len(log))
     assert log and _non_reads(log) == []
     assert _sets(log) == [
+        # RT-HM10: error texts in English, so the dialect can explain its own
+        # refusals whatever the server's language.
+        "set session lc_messages = 'en_US'",
         "set session sql_mode = '" + SQL_MODE + "'",
         # RT-G1: a server or init_connect row cap must not reach the session.
         "set session sql_select_limit = 18446744073709551615",
