@@ -340,7 +340,7 @@ def test_columns_reads_upper_case_catalog_names_and_precision():
     """Upper case or a case-sensitive database rejects the catalog; datetime2
     precision folds into raw_type; datetimeoffset is marked an instant."""
     rows = [("id", "bigint", None), ("t", "datetime2", 7), ("o", "datetimeoffset", 3)]
-    d = _d(lambda sql: rows)
+    d = _d(lambda sql: rows if "INFORMATION_SCHEMA" in sql else [])
     cols = d.columns("sales.orders")
     sql = d._conn.calls[0]
     assert "from INFORMATION_SCHEMA.COLUMNS where TABLE_SCHEMA = N'sales'" in sql
@@ -362,7 +362,8 @@ def test_a_missing_table_names_near_misses_and_the_grant_hint():
     message = str(exc.value)
     assert "side A: mssql" in message and "dbo.Orders" in message
     assert "GRANT SELECT" in message
-    assert "select distinct TABLE_SCHEMA, TABLE_NAME" in d._conn.calls[1]
+    assert "sys.synonyms" in d._conn.calls[1]  # RT-HS9: a synonym is resolved first
+    assert "select distinct TABLE_SCHEMA, TABLE_NAME" in d._conn.calls[2]
 
     def failing(sql):
         """The near-miss query fails; the lookup itself finds nothing."""
@@ -484,7 +485,15 @@ _BINARY_HEX = (
         # BINARY_PREFIX + lower-case hex (style 2), the rule every engine shares.
         (_col("c", "timestamp"), _BINARY_HEX),
         (_col("c", "varbinary"), _BINARY_HEX),
-        (_col("c", "geography"), _escaped("cast([c].ToString() as nvarchar(max))")),
+        # The SRID and the exact extended WKB (RT-HS3); hierarchyid's path.
+        (
+            _col("c", "geography"),
+            (
+                "N'SRID=' + convert(nvarchar(max), [c].STSrid) + N';' "
+                "+ lower(convert(nvarchar(max), [c].AsBinaryZM(), 2))"
+            ),
+        ),
+        (_col("c", "hierarchyid"), _escaped("cast([c].ToString() as nvarchar(max))")),
         # TIME to the microsecond, the seventh digit truncated.
         (_col("c", "time", 7), "left(convert(nvarchar(max), cast([c] as time(7))), 15)"),
     ],

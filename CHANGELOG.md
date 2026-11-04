@@ -5,6 +5,45 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **SQL Server, red-team round H (RT-HS1-HS11).** Four false matches fixed:
+  - *Dynamic data masking* (RT-HS1): a login without `UNMASK` - the
+    `db_datareader` login the docs recommend - read masked columns as their
+    masks, so tables whose masked values all differed compared identical. A
+    compared column masked for the login is now refused, naming side, table
+    and column (`GRANT UNMASK`, or `--exclude` it); a view reading such a
+    column is refused as a whole.
+  - *Row-level security* (RT-HS2): an enabled filter predicate on the table,
+    or on a table a view reads, now puts a caveat in every run's output, as
+    PostgreSQL RLS does; without `VIEW DEFINITION` on the object the caveat
+    says RLS cannot be ruled out.
+  - *Spatial SRID* (RT-HS3): `geometry`/`geography` rendered through
+    `ToString()`, which has no SRID and rounds coordinates. They now render
+    as `SRID=<n>;` plus the exact extended WKB (`AsBinaryZM`) in hex. **Every
+    spatial checksum moves** (no other engine has these types).
+  - *Invalid double-byte text* (RT-HS4): a `varchar`/`char`/`text` in code
+    page 932, 936, 949 or 950 holding a byte pair that is no character
+    converted to `・` or `?`, so distinct values and a real `?` hashed alike.
+    Such a value now renders as `parity: invalid code page bytes 0x…`; text
+    that round-trips renders exactly as before, so no checksum of valid text
+    moves (verified on every BMP character under cp932).
+  - `--where` (RT-HS5): T-SQL reads `]]` inside brackets as an escaped `]`,
+    which the shared scan did not, so `[a]]'b] = 1) or (1 = 1 ...` escaped
+    its parentheses. SQL Server now re-scans filters as T-SQL tokenises them,
+    and refuses table and query hints (`with (xlock, holdlock)` held its locks
+    for the whole diff) and ODBC escape braces (`{fn ...}` is now refused).
+  - A run where a side compares **0 rows** says so in a warning naming the
+    side, and when both are empty the headline reads `no differences - 0 rows
+    compared, both sides are empty` (RT-HS10, all engines).
+  - Memory-optimized tables are read with `WITH (SNAPSHOT)` - one snapshot -
+    instead of failing on error 41332/41368 (RT-HS6); a `decimal(38,0)` with
+    more than 32 integer digits renders exactly instead of an unexplained
+    "Arithmetic overflow" (RT-HS7; no checksum of a value that rendered
+    before moves); a URL like `mssql://admin@srv:P4ss/w0rd@host` no longer
+    prints the password fragment (RT-HS8); a synonym is read through its base
+    table, or refused naming a target in another database (RT-HS9); a
+    bracketed name holding a dot, `dbo.[orders.2024]`, can be compared
+    (RT-HS11).
+
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)
   and its fetch failed, the result used to stay identical with exit 0 and

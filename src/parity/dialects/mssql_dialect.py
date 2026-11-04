@@ -122,6 +122,18 @@ _URL_PARAMS = {
     "instance": "",  # folded into Server=host\\instance
 }
 
+#: The double-byte code pages SQL Server collations use: Japanese (932),
+#: Simplified Chinese (936), Korean (949), Traditional Chinese (950). In them a
+#: varchar can store a byte pair that is no character, which the conversion
+#: to Unicode turns into U+30FB or '?' - many values into one (RT-HS4). The
+#: single-byte code pages map every byte, and a UTF-8 column refuses invalid
+#: bytes on insert (both verified), so only these need `_dbcs_safe`.
+DBCS_CODE_PAGES = frozenset({932, 936, 949, 950})
+
+#: Leads the canonical text of a varchar value in a double-byte code page
+#: whose bytes are not all characters, followed by those bytes in hex.
+INVALID_DBCS_MARKER = "parity: invalid code page bytes "
+
 #: Leads the text a FLOAT past 2^116 raises with, so `query` can find it.
 _FLOAT_RANGE = re.compile(
     r"'(" + re.escape(FLOAT_OUT_OF_RANGE_MESSAGE) + r".*)' to data type"
@@ -182,6 +194,97 @@ def is_single_select(sql: str) -> bool:
     return _WRITE_WORDS.search(rest) is None
 
 
+#: Table hints and query hints in a row filter (RT-HS5). Not writes, but
+#: `with (xlock, holdlock)` takes locks the dialect's one long transaction
+#: holds until the diff ends - stalling writers on a live legacy system, and
+#: a run reading one table on both sides waits on itself forever - and an
+#: `option (...)` clause changes how the tool's own query runs. Checked on
+#: the skeleton, so the words inside a literal or [identifier] are harmless.
+_FILTER_HINTS = re.compile(r"\b(with|option)\s*\(", re.IGNORECASE)
+
+
+def _tsql_filter_problem(predicate: str) -> str | None:
+    """What T-SQL would read differently from the shared filter scan, or None.
+
+    The shared scan (`row_filter_problem`) closes a `[` at the first `]`, but
+    in T-SQL `]]` inside brackets is an escaped `]`: `[a]]'b]` is one
+    identifier, and the shared scan instead read `'b] = 1) or (1 = 1 or
+    [a]]'` as a string literal - hiding a `)` and a `(` that T-SQL parses as
+    code, so the filter escaped the parentheses it is wrapped in (RT-HS5).
+    This scan tokenises as T-SQL does (`[...]` with `]]`, `'...'` with `''`)
+    and counts the parentheses that remain. It also refuses table and query
+    hints (`_FILTER_HINTS`) and ODBC escape braces: the driver rewrites
+    `{call ...}`, `{fn ...}` and friends *after* this guard has read the
+    text, so what reaches the server is not what was checked.
+    """
+    rest = _skeleton(predicate)
+    if rest is None:
+        return "has an unterminated [identifier] or 'literal'"
+    depth = 0
+    for ch in rest:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return (
+                    "closes a parenthesis it never opened (T-SQL reads `]]` "
+                    "inside [brackets] as an escaped `]`), which would let it "
+                    "escape the parentheses it is wrapped in"
+                )
+    if depth:
+        return "has an unclosed parenthesis"
+    hint = _FILTER_HINTS.search(rest)
+    if hint:
+        return (
+            f"contains a table or query hint ({hint.group(0)!r}...): a locking "
+            "hint would be held for the whole diff in its one transaction, "
+            "blocking writers on the source; filter without hints"
+        )
+    if "{" in rest or "}" in rest:
+        return (
+            "contains an ODBC escape brace outside a literal ({fn ...}, "
+            "{call ...}): the driver rewrites it after this check has read it; "
+            "write the T-SQL function directly"
+        )
+    return None
+
+
+def _split_name(name: str) -> list[str]:
+    """Split a dotted name whose parts may be `[bracketed]` (`]]` is `]`).
+
+    `[dbo].[orders.2024]` -> `['dbo', 'orders.2024']`; `dbo.t` -> `['dbo',
+    't']`. An unterminated bracket is refused rather than guessed at.
+    """
+    parts: list[str] = []
+    i, n = 0, len(name)
+    while True:
+        if i < n and name[i] == "[":
+            j, buf = i + 1, []
+            while True:
+                end = name.find("]", j)
+                if end < 0:
+                    raise ValueError(f"unterminated [ in table name {name!r}")
+                buf.append(name[j:end])
+                if name.startswith("]]", end):
+                    buf.append("]")
+                    j = end + 2
+                    continue
+                i = end + 1
+                break
+            parts.append("".join(buf))
+        else:
+            end = name.find(".", i)
+            end = n if end < 0 else end
+            parts.append(name[i:end])
+            i = end
+        if i >= n:
+            return parts
+        if name[i] != ".":
+            raise ValueError(f"unexpected {name[i]!r} after ] in table name {name!r}")
+        i += 1
+
+
 def _odbc_value(value: str) -> str:
     """Brace an ODBC connection-string value, doubling any `}` inside it.
 
@@ -200,6 +303,18 @@ def parse_mssql_url(connection_string: str) -> tuple[str, str]:
     a URL host, is ``?instance=NAME``.
     """
     url = urlparse(connection_string)
+    try:
+        # Read here, once: `.port` raises a ValueError quoting the "port" -
+        # which, for `admin@srv:P4ss/w0rd@host` (an unencoded `@` and `/`),
+        # is the password (RT-HS8). No part of the netloc is ever echoed.
+        port = url.port
+    except ValueError:
+        raise ValueError(
+            "mssql connection string could not be parsed (the port is not a "
+            "number - often an unencoded '@', ':' or '/' in the user name or "
+            "password; percent-encode them as %40, %3A and %2F): "
+            "mssql://user:password@host[:port]/database"
+        ) from None
     if not url.hostname:
         raise ValueError(
             "mssql connection string needs a host: "
@@ -226,10 +341,10 @@ def parse_mssql_url(connection_string: str) -> tuple[str, str]:
     server = url.hostname
     if "instance" in params:
         server += "\\" + params.pop("instance")
-        if url.port:
-            server += f",{url.port}"
+        if port:
+            server += f",{port}"
     else:
-        server += f",{url.port or 1433}"
+        server += f",{port or 1433}"
     parts = [
         f"Server={_odbc_value(server)}",
         f"Database={_odbc_value(database)}",
@@ -272,6 +387,16 @@ class SQLServerDialect(Dialect):
         #: Whether the walk reads one snapshot. Unconnected (SQL generation in
         #: tests) is assumed pinned, so `caveats` stays quiet there.
         self.snapshot = True
+        #: The session's isolation level, as last set.
+        self.isolation = "snapshot"
+        #: Folded names of compared-table columns this login reads as their
+        #: dynamic-data-masking masks, and the table each belongs to
+        #: (`_check_masking`); `normalize` refuses them.
+        self._masked: dict[str, str] = {}
+        #: Tables read with `WITH (SNAPSHOT)` (`_check_memory_optimized`).
+        self._memory_optimized: set[str] = set()
+        #: Caveats found while introspecting (masking, row-level security).
+        self._notes: list[str] = []
 
     # ---------------------------------------------------------------- setup
 
@@ -313,11 +438,9 @@ class SQLServerDialect(Dialect):
         self.snapshot = snapshot_state == 1
         self.compatibility_level = self._compatibility_level()
         cur = self._conn.cursor()
+        self.isolation = "snapshot" if self.snapshot else "read committed"
         try:
-            cur.execute(
-                "set transaction isolation level "
-                + ("snapshot" if self.snapshot else "read committed")
-            )
+            cur.execute("set transaction isolation level " + self.isolation)
             # ON - a session default, or server-wide through 'user options'
             # 8192 - makes every rounding DECIMAL cast raise error 8115, so
             # the diff could not run (RT-D6, RT-G8). Rounding is what the
@@ -386,19 +509,278 @@ class SQLServerDialect(Dialect):
         is read alongside and folded into `raw_type`.
         """
         schema, name = self.split_table(table, self.default_schema)
-        # Upper case, and it has to be: in a database with a case-sensitive
-        # collation, catalog names are case-sensitive too, and
-        # `information_schema.columns` is "Invalid object name" (verified).
-        rows = self.query(
-            "select COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION "
+        rows = self._column_rows(schema, name)
+        if not rows:
+            # A synonym is no table to INFORMATION_SCHEMA, but it can be read
+            # like one (RT-HS9): its base object's columns stand in for it.
+            target = self._synonym_target(table, schema, name)
+            if target is None:
+                raise self._err(self._not_found(table, schema, name))
+            schema, name = target
+            rows = self._column_rows(schema, name)
+            if not rows:
+                raise self._err(self._not_found(f"{schema}.{name}", schema, name))
+        cols = [_column(*r) for r in rows]
+        self._inspect(table, schema, name, cols)
+        return cols
+
+    def _column_rows(self, schema: str, name: str) -> list[tuple[Any, ...]]:
+        """`(name, type, datetime precision, precision, scale, code page)` rows.
+
+        Upper case, and it has to be: in a database with a case-sensitive
+        collation, catalog names are case-sensitive too, and
+        `information_schema.columns` is "Invalid object name" (verified). The
+        numeric precision and scale decide how a wide DECIMAL renders
+        (RT-HS7), and the code page of a non-Unicode column whether its text
+        can be lossy (RT-HS4).
+        """
+        return self.query(
+            "select COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION, NUMERIC_PRECISION, "
+            "NUMERIC_SCALE, collationproperty(COLLATION_NAME, 'CodePage') "
             f"from {self._columns_catalog(schema)} "
             f"where TABLE_SCHEMA = {self.string_literal(schema)} "
             f"and TABLE_NAME = {self.string_literal(name)} "
             "order by ORDINAL_POSITION"
         )
+
+    def _synonym_target(
+        self, table: str, schema: str, name: str
+    ) -> tuple[str, str] | None:
+        """The `(schema, name)` a synonym in this database stands for, or None.
+
+        A synonym for an object in another database or on another server is
+        refused by name: its columns, masking and security live there, and
+        the one snapshot covers this database only.
+        """
+        try:
+            rows = self.query(
+                "select base_object_name from sys.synonyms "
+                f"where schema_id = schema_id({self.string_literal(schema)}) "
+                f"and name = {self.string_literal(name)}"
+            )
+        except Exception:  # noqa: BLE001 - diagnosing an error must never replace it
+            return None
         if not rows:
-            raise self._err(self._not_found(table, schema, name))
-        return [_column(str(r[0]), str(r[1]), r[2]) for r in rows]
+            return None
+        base = str(rows[0][0])
+        parts = _split_name(base)
+        if len(parts) > 2:
+            raise self._err(
+                f"{table} is a synonym for {base}, in another database or on "
+                "another server; compare the base table itself, connecting to "
+                "its database"
+            )
+        return (
+            (self.default_schema, parts[0]) if len(parts) == 1 else (parts[0], parts[1])
+        )
+
+    def _inspect(self, table: str, schema: str, name: str, cols: list[Column]) -> None:
+        """What this login reads of the table that is not its stored data.
+
+        Three server features change what a SELECT returns without an error:
+        dynamic data masking (RT-HS1), row-level security (RT-HS2) and - not
+        silently, but fatally - In-Memory OLTP's isolation rules (RT-HS6).
+        See `_check_masking`, `_check_row_security`, `_check_memory_optimized`.
+        """
+        obj = self.string_literal(f"{self.quote(schema)}.{self.quote(name)}")
+        rows = self.query(
+            "select o.type, coalesce(t.is_memory_optimized, 0), "
+            f"has_perms_by_name({obj}, 'OBJECT', 'VIEW DEFINITION') "
+            "from sys.objects o left join sys.tables t on t.object_id = o.object_id "
+            f"where o.object_id = object_id({obj})"
+        )
+        if not rows:
+            return
+        kind = str(rows[0][0]).strip().upper()
+        visible = bool(rows[0][2])
+        if rows[0][1]:
+            self._check_memory_optimized(table)
+        self._check_masking(table, obj, kind, visible)
+        self._check_row_security(table, obj, kind, visible)
+
+    def _objects_read(self, obj: str) -> str:
+        """A subquery of the object ids `obj` reads: itself, and for a view the
+        objects it references in this database, through nested views."""
+        return (
+            "(select object_id from (select object_id("
+            + obj
+            + ") as object_id union select d.referenced_id from "
+            "sys.sql_expression_dependencies d where d.referencing_id = object_id("
+            + obj
+            + ") and d.referenced_id is not null union select d2.referenced_id from "
+            "sys.sql_expression_dependencies d join sys.sql_expression_dependencies d2 "
+            "on d2.referencing_id = d.referenced_id where d.referencing_id = object_id("
+            + obj
+            + ") and d2.referenced_id is not null) as r)"
+        )
+
+    def _check_masking(self, table: str, obj: str, kind: str, visible: bool) -> None:
+        """Refuse columns this login reads as their masks (RT-HS1).
+
+        A column under dynamic data masking reads as its mask for a login
+        without UNMASK - `aXXX@XXXX.com`, `0`, `xxxx` - and so does every
+        expression over it, so two tables whose masked values all differ
+        hashed alike: identical, with no warning, for the db_datareader login
+        the docs recommend. Such a column is refused when it is compared (see
+        `normalize`), naming the fix: GRANT UNMASK, or --exclude it. UNMASK is
+        checked per column (SQL Server 2022's granular UNMASK, which answers
+        for grants at any level) and else for the database.
+
+        A view inherits the masks of what it reads, but which view column
+        carries which base column is not in the catalog: a view reading a
+        masked column this login cannot unmask is refused outright. Without
+        VIEW DEFINITION on the view its dependencies are invisible, and then
+        a database holding masked columns draws a caveat instead.
+        """
+        unmask_db = "has_perms_by_name(db_name(), 'DATABASE', 'UNMASK')"
+        if kind == "U":
+            try:
+                rows = self.query(
+                    "select c.name, coalesce(has_perms_by_name("
+                    f"{obj}, 'OBJECT', 'UNMASK', c.name, 'COLUMN'), {unmask_db}, 0) "
+                    "from sys.masked_columns c "
+                    f"where c.object_id = object_id({obj}) and c.is_masked = 1"
+                )
+            except Exception:  # noqa: BLE001 - 2019 has no granular UNMASK
+                rows = self.query(
+                    f"select c.name, coalesce({unmask_db}, 0) from sys.masked_columns c "
+                    f"where c.object_id = object_id({obj}) and c.is_masked = 1"
+                )
+            for col, unmasked in rows:
+                if not unmasked:
+                    self._masked[str(col).casefold()] = table
+            return
+        rows = self.query(
+            f"select object_name(c.object_id) + N'.' + c.name, coalesce({unmask_db}, 0) "
+            "from sys.masked_columns c where c.is_masked = 1 "
+            f"and c.object_id in {self._objects_read(obj)} and c.object_id <> object_id({obj})"
+        )
+        hidden = sorted(str(c) for c, unmasked in rows if not unmasked)
+        if hidden:
+            raise self._err(
+                f"view {table} reads dynamically masked column(s) {hidden}, and "
+                "this login does not hold UNMASK: every value would be compared "
+                "as its mask, so differences there could not be seen. GRANT "
+                "UNMASK to this login, or compare the base tables"
+            )
+        if not visible:
+            masked = self.query(
+                f"select count_big(*), coalesce({unmask_db}, 0) "
+                "from sys.masked_columns where is_masked = 1"
+            )
+            if masked and masked[0][0] and not masked[0][1]:
+                self._notes.append(
+                    f"this login cannot see which tables view {table} reads (it "
+                    "lacks VIEW DEFINITION on it), and the database holds "
+                    "dynamically masked columns it cannot unmask: if the view "
+                    "reads one, its values are compared as their masks. GRANT "
+                    "VIEW DEFINITION on the view (or UNMASK) to rule it out"
+                )
+
+    def _check_row_security(self, table: str, obj: str, kind: str, visible: bool) -> None:
+        """A caveat when a security policy can hide rows (RT-HS2).
+
+        A filter predicate silently removes the rows its function rejects for
+        the reading user: two tables differing only there read identical. As
+        on PostgreSQL it is a caveat in the output, not a refusal - the user
+        may diff deliberately what one user sees - but SQL Server has no
+        BYPASSRLS, so it is said whenever an enabled filter predicate applies
+        to the table or to anything a view reads. The policies are visible
+        only with VIEW DEFINITION on the object; without it RLS cannot be
+        ruled out, and the caveat says that instead.
+        """
+        if not visible:
+            self._notes.append(
+                f"this login cannot see whether a row-level security policy "
+                f"filters {table} (it lacks VIEW DEFINITION on it): rows a "
+                "policy hides would not be compared at all. GRANT VIEW "
+                "DEFINITION on it to let the check run"
+            )
+            return
+        rows = self.query(
+            "select distinct p.name from sys.security_policies p join "
+            "sys.security_predicates s on s.object_id = p.object_id "
+            "where p.is_enabled = 1 and s.predicate_type = 0 "
+            f"and s.target_object_id in {self._objects_read(obj)}"
+        )
+        if rows:
+            names = sorted(str(r[0]) for r in rows)
+            self._notes.append(
+                f"row-level security filters {table} (security policies "
+                f"{names}): rows a filter predicate hides from this login are "
+                "not compared at all, so a difference there cannot be seen. "
+                "Diff as a user the predicates let read every row, or disable "
+                "the policies on a copy, for a complete result"
+            )
+
+    def _check_memory_optimized(self, table: str) -> None:
+        """Read a memory-optimized table in its own snapshot (RT-HS6).
+
+        In-Memory OLTP refuses a session at SNAPSHOT (41332) and READ
+        COMMITTED inside a transaction (41368) unless the database elevates
+        to snapshot - and the dialect runs one or the other inside its one
+        transaction, so such a table could not be diffed at all. The table
+        hint `WITH (SNAPSHOT)` reads it transactionally: every query of the
+        transaction sees the snapshot its first access took, so the walk still
+        reads one version of it. The session goes to READ COMMITTED first (the
+        hint is refused under SNAPSHOT), after a rollback - only metadata has
+        been read in this transaction, so nothing is lost.
+        """
+        self._memory_optimized.add(table)
+        if self.isolation != "read committed":
+            # With autocommit off the SET is taken but the next transaction
+            # still refuses the table as SNAPSHOT (verified, mssql-python); set
+            # with autocommit on, as `connect` does, it holds.
+            self._conn.rollback()
+            self._conn.autocommit = True
+            cur = self._conn.cursor()
+            try:
+                cur.execute("set transaction isolation level read committed")
+            finally:
+                cur.close()
+            self._conn.autocommit = False
+            self.isolation = "read committed"
+        # Whatever ALLOW_SNAPSHOT_ISOLATION says: the hint is In-Memory OLTP's
+        # own snapshot, which that setting does not govern.
+        self.snapshot = True
+
+    def rows_from(self, table: str, where: str | None, *conditions: str) -> str:
+        """The shared clause, with `WITH (SNAPSHOT)` on a memory-optimized
+        table (`_check_memory_optimized`); every other table's SQL is
+        exactly what it was."""
+        sql = super().rows_from(table, where, *conditions)
+        if table in self._memory_optimized:
+            head = f"from {self.qualify(table)}"
+            sql = head + " with (snapshot)" + sql[len(head) :]
+        return sql
+
+    def split_table(self, table: str, default_schema: str) -> tuple[str, str]:
+        """The shared split, plus `[bracketed]` parts that may hold a dot.
+
+        `[dbo].[orders.2024]` is a legal name (common for imported files), and
+        splitting on every dot made it unaddressable (RT-HS11). A name with no
+        `[` splits exactly as before.
+        """
+        if "[" not in table:
+            return super().split_table(table, default_schema)
+        try:
+            parts = _split_name(table)
+        except ValueError as exc:
+            raise self._err(str(exc)) from None
+        if len(parts) == 1:
+            return default_schema, parts[0]
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        raise self._err(
+            f"table name {table!r} has {len(parts)} parts; expected 'table' or "
+            "'schema.table' (bracket a part holding a dot: dbo.[orders.2024])"
+        )
+
+    def qualify(self, table: str) -> str:
+        """Quote the parts `split_table` reads; unchanged without a `[`."""
+        if "[" not in table:
+            return super().qualify(table)
+        return ".".join(self.quote(p) for p in _split_name(table))
 
     def _columns_catalog(self, schema: str) -> str:
         """Upper case: see `columns`."""
@@ -454,6 +836,9 @@ class SQLServerDialect(Dialect):
         first filtered query with the guard's generic refusal.
         """
         super().check_where(where)
+        problem = _tsql_filter_problem(where)
+        if problem:
+            raise self._err(f"row filter {where!r} {problem}")
         if not is_single_select(f"select 1 where ({where})"):
             raise self._err(
                 f"row filter {where!r} is refused by this dialect's SELECT guard: "
@@ -465,7 +850,7 @@ class SQLServerDialect(Dialect):
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """What makes this side's comparison less than exact, for the output."""
-        out: list[str] = []
+        out: list[str] = list(dict.fromkeys(self._notes))
         if not self.snapshot:
             out.append(
                 f"database {self.database!r} has ALLOW_SNAPSHOT_ISOLATION OFF, so "
@@ -613,7 +998,11 @@ class SQLServerDialect(Dialect):
         """
         c = self.quote(column.name)
         if column.logical_type is LogicalType.STRING:
-            return f"convert(varbinary(max), {self._utf8(f'cast({c} as nvarchar(max))')})"
+            # A double-byte code page's invalid bytes arrive as the walk's
+            # marker (`_dbcs_safe`): the driver would decode them to the same
+            # '?' that made them collide. Any other value is its own text.
+            text = self._dbcs_safe(c, column, f"cast({c} as nvarchar(max))")
+            return f"convert(varbinary(max), {self._utf8(text)})"
         if column.logical_type is LogicalType.TIMESTAMP:
             style = 127 if _base_type(column.raw_type) == "datetimeoffset" else 121
             return f"convert(nvarchar(40), {c}, {style})"
@@ -708,6 +1097,14 @@ class SQLServerDialect(Dialect):
         `coalesce`, so NULL is always the sentinel.
         """
         c = self.quote(column.name)
+        masked = self._masked.get(column.name.casefold())
+        if masked is not None:
+            raise self._err(
+                f"column {column.name!r} of {masked} is under dynamic data masking "
+                "and this login does not hold UNMASK: it would be compared as its "
+                "mask, so a difference there could not be seen (RT-HS1). GRANT "
+                "UNMASK to this login, or leave the column out with --exclude"
+            )
         raw = column.raw_type.lower().split("(")[0].strip()
         t = column.logical_type
         text = "nvarchar(max)"
@@ -725,6 +1122,22 @@ class SQLServerDialect(Dialect):
                     "decimal scale is 38"
                 )
             expr = f"convert({text}, cast({c} as decimal(38,{self.float_scale})))"
+            shape = re.fullmatch(
+                r"(?:decimal|numeric)\((\d+),(\d+)\)", column.raw_type.lower()
+            )
+            if shape:
+                p, s, fs = int(shape.group(1)), int(shape.group(2)), self.float_scale
+                if s < fs and p - s > 38 - fs:
+                    # decimal(38,0) holds 38 integer digits and decimal(38,6)
+                    # 32, so the cast overflowed on 10^38 - 1 with a bare
+                    # "Arithmetic overflow" (RT-HS7). With fewer stored places
+                    # than the scale nothing rounds: the value's own exact
+                    # text, padded with zeros to the scale, is the cast's text
+                    # for every value the cast holds - so no checksum moves -
+                    # and renders the rest too. Only for a column the cast
+                    # could overflow; every other DECIMAL's SQL is unchanged.
+                    pad = ("." if s == 0 else "") + "0" * (fs - s)
+                    expr = f"convert({text}, {c}) + N'{pad}'"
         elif t is LogicalType.FLOAT:
             expr = self._float_text(c, self.float_scale_for(column), column)
         elif t is LogicalType.BOOLEAN:
@@ -753,7 +1166,7 @@ class SQLServerDialect(Dialect):
             expr = f"rtrim(cast({c} as {text}))"
             if raw == "nchar":
                 expr = self._utf16_safe(expr)
-            expr = self.escape_text(expr)
+            expr = self.escape_text(self._dbcs_safe(c, column, expr))
         elif raw == "uniqueidentifier":
             # SQL Server prints GUIDs upper-case; PostgreSQL and DuckDB lower.
             expr = f"lower(convert({text}, {c}))"
@@ -761,7 +1174,7 @@ class SQLServerDialect(Dialect):
             expr = f"cast({c} as {text})"
             if raw in ("nvarchar", "ntext", "sysname"):
                 expr = self._utf16_safe(expr)
-            expr = self.escape_text(expr)
+            expr = self.escape_text(self._dbcs_safe(c, column, expr))
         elif t is LogicalType.TIME:
             # time(n) as time(7) prints `hh:mm:ss.fffffff`, seven digits; the
             # first 15 characters are the microseconds, the seventh digit
@@ -783,7 +1196,19 @@ class SQLServerDialect(Dialect):
             # upper-case hex, which matched no other engine's binary.
             hexed = f"lower(convert({text}, convert(varbinary(max), {c}), 2))"
             expr = self.concat_sql(self.binary_prefix_sql(), hexed)
-        elif raw in ("geography", "geometry", "hierarchyid"):
+        elif raw in ("geography", "geometry"):
+            # `SRID=<n>;` and the extended WKB in hex (RT-HS3). ToString() is
+            # WKT, which has no SRID - the same coordinates in two reference
+            # systems rendered alike, a false match - and prints rounded
+            # coordinates. AsBinaryZM() carries every coordinate's exact
+            # double and the Z and M values; FULLGLOBE, curves, empty and
+            # invalid instances all render (verified). Moves every spatial
+            # checksum; no other engine has these types.
+            expr = (
+                f"N'SRID=' + convert({text}, {c}.STSrid) + N';' "
+                f"+ lower(convert({text}, {c}.AsBinaryZM(), 2))"
+            )
+        elif raw == "hierarchyid":
             expr = self.escape_text(f"cast({c}.ToString() as {text})")
         elif t is LogicalType.VARIANT:
             expr = self._variant_text(c)
@@ -1071,6 +1496,35 @@ class SQLServerDialect(Dialect):
             f"+ convert(nvarchar(max), {bytes16}, 1) end"
         )
 
+    def _dbcs_safe(self, c: str, column: Column, expr: str) -> str:
+        """`expr` for a varchar whose bytes are characters, else a marker.
+
+        In a double-byte code page (`DBCS_CODE_PAGES`; `_column` tags the
+        column `varchar(cp932)`) a varchar stores whatever bytes it is given,
+        and a lead byte with an invalid trail - 0x8120, 0x8121 under cp932,
+        0x8101 under cp949 - converts to Unicode as U+30FB or '?'. Distinct
+        values, and a real '?', then hashed alike: a false match (RT-HS4,
+        the class of RT-E9). A value is text exactly when converting it to
+        nvarchar and back gives its own bytes (the conversion back uses the
+        column's own collation, which the expression keeps), lengths compared
+        too since SQL Server pads the shorter binary with zeros. Such a value
+        renders as `expr` always did, so no checksum moves; any other renders
+        as `INVALID_DBCS_MARKER` and its bytes in hex - distinct for distinct
+        bytes, and never the text of a valid value unless it spells the
+        marker. Every other column returns `expr` untouched.
+        """
+        page = column.raw_type.lower().partition("(cp")[2].rstrip(")")
+        if not page.isdigit() or int(page) not in DBCS_CODE_PAGES:
+            return expr
+        stored = f"cast({c} as varchar(max))"
+        orig = f"convert(varbinary(max), {stored})"
+        back = f"convert(varbinary(max), cast(cast({stored} as nvarchar(max)) as varchar(max)))"
+        return (
+            f"case when {back} = {orig} and datalength({back}) = datalength({orig}) "
+            f"then {expr} when {c} is not null then N'{INVALID_DBCS_MARKER}' "
+            f"+ convert(nvarchar(max), {orig}, 1) end"
+        )
+
     def _utf8(self, text_expr: str) -> str:
         """The UTF-8 bytes of a text expression, as `varchar(max)`.
 
@@ -1116,13 +1570,32 @@ class SQLServerDialect(Dialect):
         return f"coalesce(sum(cast(({expr}) as decimal(38,0))), 0)"
 
 
-def _column(name: str, data_type: str, precision: Any) -> Column:
-    """Build a Column, marking datetimeoffset as an instant and folding the
-    fractional-second precision into `raw_type`."""
+def _column(
+    name: Any,
+    data_type: Any,
+    precision: Any,
+    num_precision: Any = None,
+    num_scale: Any = None,
+    code_page: Any = None,
+) -> Column:
+    """Build a Column, marking datetimeoffset as an instant and folding into
+    `raw_type` the fractional-second precision, a decimal's precision and
+    scale (`decimal(38,0)`, RT-HS7), and the code page of a non-Unicode text
+    column in a double-byte code page (`varchar(cp932)`, RT-HS4)."""
+    name, data_type = str(name), str(data_type)
     t = data_type.lower()
     raw = data_type
     if t in ("datetime2", "datetimeoffset", "time") and precision is not None:
         raw = f"{data_type}({int(precision)})"
+    elif (
+        t in ("decimal", "numeric")
+        and num_precision is not None
+        and num_scale is not None
+    ):
+        raw = f"{data_type}({int(num_precision)},{int(num_scale)})"
+    elif t in ("char", "varchar", "text") and code_page is not None:
+        if int(code_page) in DBCS_CODE_PAGES:
+            raw = f"{data_type}(cp{int(code_page)})"
     tz: bool | None = None
     if t == "datetimeoffset":
         tz = True
