@@ -744,6 +744,30 @@ def diff(
         shared, schema_differences = _select_columns(
             cols_a, cols_b, key_folds, columns, exclude, warnings
         )
+        # A column the login cannot read is missing from `columns` itself
+        # (PostgreSQL column-level grants), so the one-sided check above never
+        # saw it: never compared, and never a pass (RT-HP1) - unless the user
+        # set it aside with --exclude or --columns.
+        excluded = {n.casefold() for n in exclude}
+        wanted = {n.casefold() for n in columns} if columns else None
+        for side, dialect, table in (("A", a, a_table), ("B", b, b_table)):
+            hidden = sorted(dialect.unreadable_columns(table))
+            unread = [
+                h
+                for h in hidden
+                if h.casefold() not in excluded
+                and (wanted is None or h.casefold() in wanted)
+            ]
+            for names, out in (
+                (unread, schema_differences),
+                ([h for h in hidden if h not in unread], warnings),
+            ):
+                if names:
+                    out.append(
+                        f"not compared, side {side} cannot read {names} of {table}: "
+                        "this login lacks SELECT on those columns (column-level "
+                        "privileges)"
+                    )
         a_cols = [cols_a[f] for f in shared]
         b_cols = [cols_b[f] for f in shared]
         # Sub-microsecond digits are compared exactly when both sides hold
@@ -1061,6 +1085,16 @@ def diff(
             finally:
                 stats.queries -= 2
                 stats.sample_queries += 2
+
+    # The pins a dialect set at connect decide the canonical text; a row
+    # filter or a view's function that changed one mid-walk changed the text
+    # (RT-HP6). Checked once, after everything else, outside the query count.
+    for side, dialect in (("A", a), ("B", b)):
+        try:
+            drift = dialect.session_drift()
+        except Exception as exc:  # noqa: BLE001 - the verdict must say so, not crash
+            drift = [f"session settings could not be re-checked after the walk: {exc}"]
+        unexplained.extend(f"side {side} ({dialect.name}): {d}" for d in drift)
 
     diffs.sort(key=lambda d: _key_order(d.key))
     if max_diffs is not None and len(diffs) > max_diffs:

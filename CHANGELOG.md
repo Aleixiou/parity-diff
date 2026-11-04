@@ -110,6 +110,46 @@ with the caveat that 0.x means the CLI surface may still move.
     table, or refused naming a target in another database (RT-HS9); a
     bracketed name holding a dot, `dbo.[orders.2024]`, can be compared
     (RT-HS11).
+- **PostgreSQL red-team round H fixes** (five false matches, a crash, a hang
+  and an unclear error):
+  - *False match, column-level grants (RT-HP1)*: information_schema lists
+    only the columns a login may read, so a differing column under
+    `GRANT SELECT (a, b)` was silently left out. Such columns are now a
+    schema difference (not identical, exit 1) naming side, table and
+    columns; `--exclude` turns it into a note.
+  - *False match, views over RLS tables (RT-HP4)*: a `security_invoker` view,
+    or one owned by a role the policies apply to, hid rows with no caveat.
+    The tables a view reads are followed at any depth and the RLS caveat
+    fires when the policies may apply to the reader or a view owner.
+  - *False match, money (RT-HP2)*: money was read under the pinned
+    `lc_monetary` C, two decimals, so 12345 yen read 123.45. It is now read
+    at the frac_digits of the login's own lc_monetary (a caveat says which
+    when it is not two). **Checksums move** only for money columns of a
+    login whose default locale has other than two decimals.
+  - *False match on PostgreSQL 9.6-11 (RT-HP5)*: `extra_float_digits = 1`
+    printed 16/7 digits there, so floats inside point, circle or composites
+    that differed past them read identical. It is pinned to 3 before 12
+    (17/9 digits). **Checksums move** for those unmapped types on 9.6-11
+    only; 12+ is unchanged.
+  - *False match, `--where` calling `set_config()` (RT-HP6)*: the filter
+    reset a pin mid-walk. PostgreSQL filters calling session-changing or
+    side-effecting functions are refused, and every pin is re-read after the
+    walk - a moved one (a user function in a filter or a view) makes the run
+    unexplained.
+  - *False match, lossy extension type text (RT-HP9)*: contrib `seg` prints
+    123456789 and 123456788 alike. Unmapped base types outside pg_catalog
+    and outside a list known exact (citext, hstore, ltree, isn, cube,
+    PostGIS, pgvector) are compared by text plus their binary send form, or
+    refused when there is none or they are nested. **Checksums move** for
+    columns of such types (never compared exactly before).
+  - *Crash (RT-HP3)*: a DATE past 294276-12-31 went through timestamptz in
+    `to_char`; it now renders as its own ISO text. Earlier dates render the
+    same text as before (the SQL changed, no checksum moved).
+  - *Hang (RT-HP7)*: no connect timeout; now 30 s unless the URL sets
+    `connect_timeout`.
+  - *Unclear error (RT-HP8)*: a composite key `row(1, NULL)` was refused as
+    NULL (row `IS NOT NULL` semantics); NULL now means the value is NULL.
+  - Inheritance children of a compared parent table are named in a caveat.
 
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)

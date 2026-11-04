@@ -901,6 +901,15 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   hashes `convert_to(text, 'UTF8')`; FLOAT is refused on SQL Server below
   compatibility level 130 and on PostgreSQL below 12; PostgreSQL < 9.6 and
   DuckDB < 1.3 are refused outright; RLS is a caveat.
+- **PostgreSQL, round H:** `extra_float_digits` is 3 before 12; every pin is
+  re-read after the walk (`session_drift`) and session-changing functions are
+  refused in filters; columns the login lacks SELECT on are a schema
+  difference (`unreadable_columns`); views are followed through pg_depend for
+  the RLS caveat; money renders at the login's own `lc_monetary` frac_digits;
+  unmapped base types outside pg_catalog and `TRUSTED_EXTENSION_TYPES` compare
+  as text + `` + their send hex, or are refused (no send function, or
+  nested); dates past 294276-12-31 render via `::text`; a hashed key's NULL
+  check uses `num_nulls`; `connect_timeout` defaults to 30 s.
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,

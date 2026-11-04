@@ -53,6 +53,7 @@ def _exec(url: str, *stmts: str) -> list:
 
 
 def _diff(url_a: str, ta: str, url_b: str, tb: str, key: str = "id", **kw):
+    """Diff two tables, closing both dialects whatever happens."""
     a = get_dialect(url_a, side="A")
     try:
         b = get_dialect(url_b, side="B")
@@ -90,13 +91,8 @@ def _role(name: str) -> str:
 # ------------------------------------------------------------- findings
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP1: column-level SELECT grants hide columns from "
-    "information_schema; the unreadable column is silently left out and the "
-    "verdict is identical with no caveat (FALSE MATCH)",
-)
 def test_rt_hp1_column_grant_hides_a_differing_column(schema):
+    """A column hidden by column-level grants is never silently left out."""
     role = _role(f"rth_postgres_cg_{RUN}")
     _exec(
         ADMIN,
@@ -127,13 +123,9 @@ def test_rt_hp1_column_grant_hides_a_differing_column(schema):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP4: a view over a row-level-security table (security_invoker, "
-    "or owned by a role RLS applies to) hides rows with no caveat (FALSE MATCH)",
-)
 @pytest.mark.parametrize("kind", ["security_invoker", "owner_subject_to_rls"])
 def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
+    """A view over an RLS table draws the row-level security caveat."""
     reader = f"rth_postgres_vr_{RUN}"
     owner = f"rth_postgres_vo_{RUN}"
     url = _role(reader)
@@ -183,12 +175,8 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP3: a DATE past 294276-12-31 (valid in PostgreSQL and DuckDB) "
-    "kills the whole diff: to_char casts it to timestamptz (crash)",
-)
 def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
+    """A DATE past the timestamp range is compared, not a crash."""
     for t in "ab":
         _exec(
             ADMIN,
@@ -200,12 +188,6 @@ def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP5: on PostgreSQL 9.6-11 the pinned extra_float_digits = 1 prints "
-    "doubles to 16 and reals to 7 digits, so floats inside unmapped types "
-    "(point, circle, composites) that differ past them read identical (FALSE MATCH)",
-)
 @pytest.mark.parametrize(
     ("typ", "v1", "v2"),
     [
@@ -216,6 +198,7 @@ def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     ],
 )
 def test_rt_hp5_pg11_floats_inside_unmapped_types(typ, v1, v2):
+    """On PostgreSQL 11 floats inside unmapped types are told apart."""
     s = f"rth_postgres_{RUN}_f11"
     _exec(
         PG11,
@@ -250,13 +233,8 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
     assert [d.key for d in r.diffs] == [2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP6: a --where calling set_config() rewrites a session pin "
-    "(extra_float_digits) mid-walk, after connect, so floats render at 2 digits "
-    "and a planted FLOAT difference reads identical (FALSE MATCH)",
-)
 def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
+    """A --where calling set_config() is refused or cannot move the verdict."""
     for t in "ab":
         _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
     _exec(
@@ -271,6 +249,93 @@ def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
         assert "row filter" in str(exc)
         return
     assert [d.key for d in r.diffs] == [2]
+
+
+@pytest.mark.parametrize(
+    "w",
+    [
+        "pg_catalog.set_config('extra_float_digits', '-15', false) is not null",
+        "\"set_config\"('extra_float_digits', '-15', false) is not null",
+        "U&\"\\0073et_config\"('extra_float_digits', '-15', false) is not null",
+        "pg_sleep(1) is not null",
+        "pg_advisory_lock(1) is not null",
+        "query_to_xml('select 1', true, true, '') is not null",
+    ],
+)
+def test_rt_hp6_session_changing_filters_are_refused(schema, w):
+    """Filters calling session-changing functions are refused, however spelled."""
+    _exec(ADMIN, f"create table {schema}.a (id int primary key)")
+    with pytest.raises(ValueError, match="row filter"):
+        _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.a", where_a=w, where_b=w)
+
+
+def test_rt_hp6_set_config_out_of_sight_is_never_identical(schema):
+    """A user function - which no name check can see into - that rewrites a
+    pin from inside the filter: the post-walk check makes it unexplained."""
+    for t in "ab":
+        _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
+    _exec(
+        ADMIN,
+        f"insert into {schema}.a values (1, 0.1), (2, 1e15 + 0.5)",
+        f"insert into {schema}.b values (1, 0.1), (2, 1e15)",
+        f"create function {schema}.f() returns bool language sql as "
+        "$$ select set_config('extra_float_digits', '-15', false) is not null $$",
+    )
+    w = f"{schema}.f()"
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", where_a=w, where_b=w)
+    assert not r.identical
+    assert any("extra_float_digits" in u for u in r.unexplained)
+    # Without it, the planted difference is found and nothing is unexplained.
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    assert [d.key for d in r.diffs] == [2] and not r.unexplained
+
+
+def test_rt_hp1_excluded_unreadable_column_is_a_note(schema):
+    """An unreadable column set aside with --exclude is a note, not a difference."""
+    role = _role(f"rth_postgres_cx_{RUN}")
+    _exec(
+        ADMIN,
+        f"grant usage on schema {schema} to rth_postgres_cx_{RUN}",
+        *[
+            f"create table {schema}.{t} (id int primary key, x text, secret text)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {schema}.{t} select g, 'v'||g, 's' from generate_series(1,50) g"
+            for t in "ab"
+        ],
+        f"update {schema}.b set x = 'D' where id = 3",
+        *[f"grant select (id, x) on {schema}.{t} to rth_postgres_cx_{RUN}" for t in "ab"],
+    )
+    try:
+        r = _diff(role, f"{schema}.a", role, f"{schema}.b")
+        assert [d.key for d in r.diffs] == [3]
+        assert any("cannot read ['secret']" in s for s in r.schema_differences)
+        r = _diff(role, f"{schema}.a", role, f"{schema}.b", exclude=["secret"])
+        assert [d.key for d in r.diffs] == [3] and not r.schema_differences
+        assert any("secret" in w for w in r.warnings)
+    finally:
+        _exec(
+            ADMIN,
+            f"drop owned by rth_postgres_cx_{RUN}",
+            f"drop role rth_postgres_cx_{RUN}",
+        )
+
+
+def test_inheritance_children_draw_a_caveat(schema):
+    """A parent table's inheritance children are named in a caveat."""
+    _exec(
+        ADMIN,
+        f"create table {schema}.p (id int primary key, x text)",
+        f"create table {schema}.ch (check (id > 100)) inherits ({schema}.p)",
+        f"create table {schema}.b (id int primary key, x text)",
+        f"insert into {schema}.p values (1, 'a')",
+        f"insert into {schema}.ch values (101, 'b')",
+        f"insert into {schema}.b values (1, 'a')",
+    )
+    r = _diff(ADMIN, f"{schema}.p", ADMIN, f"{schema}.b")
+    assert [(d.key, d.kind) for d in r.diffs] == [(101, "only_in_a")]
+    assert any("inheritance children" in w and ".ch" in w for w in r.warnings)
 
 
 def test_where_and_map_postgres_quoting(schema):
@@ -314,12 +379,8 @@ def test_where_and_map_postgres_quoting(schema):
         _diff(ADMIN, a, ADMIN, f"{schema}.m", column_map={"Name": "nm", "amt": "nm"})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP7: no connect_timeout is set, so a URL whose port has no listener "
-    "(on Windows psycopg retries a refused connect) hangs with no output (hang)",
-)
 def test_rt_hp7_unreachable_server_fails_within_a_minute():
+    """An unreachable server fails within a minute, naming the side."""
     import subprocess
     import sys
 
@@ -346,13 +407,8 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
     assert p.returncode == 2 and "side A" in p.stderr
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP8: a composite-type key with a NULL field, row(1, NULL), is "
-    "refused as 'contains 1 NULL value(s)': PostgreSQL's row IS NOT NULL is "
-    "false when any field is NULL, though the key itself is not NULL (unclear error)",
-)
 def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
+    """row(1, NULL) is a valid composite key."""
     _exec(
         ADMIN,
         f"create type {schema}.c as (a int, b text)",
@@ -364,13 +420,50 @@ def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
     assert [(d.key, d.kind) for d in r.diffs] == [('(1,"")', "only_in_a")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP9: unmapped types are compared by ::text, which is not always "
-    "injective - contrib seg prints 123456789 and 123456788 alike "
-    "('1.23457e+08') though PostgreSQL's own = calls them different (FALSE MATCH)",
-)
+def test_rt_hp9_untrusted_type_is_compared_by_its_send_bytes(schema, monkeypatch):
+    """A base type outside the trusted list, with a send function, compares by
+    its bytes too (cube, taken off the list for the test); nested in an array
+    it is refused, naming the column."""
+    from parity.dialects import postgres_dialect
+
+    monkeypatch.setattr(
+        postgres_dialect,
+        "TRUSTED_EXTENSION_TYPES",
+        postgres_dialect.TRUSTED_EXTENSION_TYPES - {"cube"},
+    )
+    _exec(
+        ADMIN,
+        "create extension if not exists cube",
+        *[
+            f"create table {schema}.{t} (id int primary key, v cube, w text)"
+            for t in "ab"
+        ],
+        *[
+            f"insert into {schema}.{t} values (1, cube(1.5), 'x'), (2, cube(2), 'x'), "
+            "(3, NULL, 'x')"
+            for t in "ab"
+        ],
+        f"update {schema}.b set v = cube(2.0000001) where id = 2",
+        f"update {schema}.b set w = 'y' where id = 1",
+    )
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [
+        (1, ("w",)),
+        (2, ("v",)),
+    ]
+    _exec(
+        ADMIN,
+        *[f"create table {schema}.n{t} (id int primary key, v cube[])" for t in "ab"],
+        *[f"insert into {schema}.n{t} values (1, array[cube(1)])" for t in "ab"],
+    )
+    with pytest.raises(ValueError, match=r"column 'v' holds .*cube.*--exclude"):
+        _diff(ADMIN, f"{schema}.na", ADMIN, f"{schema}.nb")
+    r = _diff(ADMIN, f"{schema}.na", ADMIN, f"{schema}.nb", exclude=["v"])
+    assert r.identical
+
+
 def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
+    """Two seg values that print alike are found or refused, never equal."""
     _exec(
         ADMIN,
         "create extension if not exists seg",
@@ -382,7 +475,11 @@ def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
         ADMIN,
         f"select a.v = b.v from {schema}.a a join {schema}.b b using (id) where id = 2",
     )[0][0]
-    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    try:
+        r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b")
+    except ValueError as exc:  # refusing a type it cannot compare exactly is a fix too
+        assert "seg" in str(exc) and "--exclude" in str(exc)
+        return
     assert [d.key for d in r.diffs] == [2]
 
 
@@ -630,6 +727,7 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
     original, fired = b.segment_checksums, []
 
     def wrapped(*args, **kw):
+        """Run the real checksum query, then write to the table once."""
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
@@ -653,6 +751,7 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
 
 
 def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
+    """600 columns, odd identifiers and a 10 MB value find their planted changes."""
     s = schema
     cols = ", ".join(f"c{i} int" for i in range(600))
     names = ", ".join(f"c{i}" for i in range(600))
@@ -708,6 +807,7 @@ def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
 
 
 def test_partitions_generated_columns_and_missing_grants(schema):
+    """Partitions, generated columns and a missing grant behave."""
     s = schema
     _exec(
         ADMIN,
@@ -751,6 +851,7 @@ def test_partitions_generated_columns_and_missing_grants(schema):
     ],
 )
 def test_cli_connection_errors_never_print_the_password(url, schema):
+    """Connection errors from the CLI never print the password."""
     import subprocess
     import sys
 
@@ -777,6 +878,7 @@ def test_cli_connection_errors_never_print_the_password(url, schema):
 
 
 def test_live_writer_mid_walk_is_invisible_then_seen(schema):
+    """A writer mid-walk is invisible to the snapshot, then seen by a new run."""
     s = schema
     _exec(
         ADMIN,
@@ -797,6 +899,7 @@ def test_live_writer_mid_walk_is_invisible_then_seen(schema):
     original, fired = b.segment_checksums, []
 
     def wrapped(*args, **kw):
+        """Run the real checksum query, then write to the table once."""
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
@@ -875,6 +978,7 @@ def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
 
 
 def test_pg95_is_refused_naming_the_version():
+    """PostgreSQL 9.5 is refused, naming the version."""
     pg_connect(PG95).close()
     with pytest.raises(ValueError, match=r"side A.*9\.5.*not supported"):
         get_dialect(PG95, side="A")
@@ -952,13 +1056,8 @@ def test_distinct_values_of_exotic_types_are_found(schema, typ, v1, v2):
     assert not r.unexplained
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HP2: money is read under the pinned lc_monetary 'C' (2 decimals), "
-    "so yen entered under a 0-decimal locale (12345 yen) renders 123.45 and "
-    "matches a DuckDB decimal 123.45 (FALSE MATCH; the true 12345 is a false alarm)",
-)
 def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
+    """Yen money is read at the login's own frac_digits."""
     import duckdb
 
     table = f"rth_postgres_money_{RUN}"
@@ -986,8 +1085,11 @@ def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
     con.execute("create table m (id int primary key, m decimal(18,2))")
     con.execute("insert into m values (1, 12345), (2, 1.00)")  # key 2 really differs
     con.close()
+    sep = "&" if "?" in pg_url else "?"
+    url = f"{pg_url}{sep}options={quote(f'-c lc_monetary={locale}')}"
     try:
-        r = _diff(pg_url, f"public.{table}", f"duckdb:///{path}", "main.m")
+        r = _diff(url, f"public.{table}", f"duckdb:///{path}", "main.m")
         assert [d.key for d in r.diffs] == [2]
+        assert any("lc_monetary" in w for w in r.warnings)
     finally:
         _exec(pg_url, f"drop table if exists public.{table}")

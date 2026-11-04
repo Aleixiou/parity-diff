@@ -172,7 +172,7 @@ that text is injective by construction (a STRUCT is each field by its own
 rule, named; GEOGRAPHY its WKB; INTERVAL and RANGE print every component),
 so two different stored values never render alike there; it used to be
 `FORMAT('%t')`, which printed strings unquoted and NULL fields as `NULL` -
-false matches (RT-HB1..HB3). DuckDB `UNION`/`VARIANT` and Snowflake `VARIANT` keep their
+false matches (RT-HB1..HB3). On PostgreSQL, an extension type whose text is not known to be exact (contrib `seg` prints two values alike) is compared by its binary send form as well, or refused when it has none. DuckDB `UNION`/`VARIANT` and Snowflake `VARIANT` keep their
 type tag, so `1` and `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds
 when it has any.
 
@@ -241,12 +241,16 @@ The per-type, per-engine evidence is [`coverage.md`](coverage.md).
 ## What the reading login cannot see
 
 - **What the reading login cannot see is not compared.** PostgreSQL row-level
-  security that filters the reading role is named in the output as a caveat;
-  diff as a role with BYPASSRLS for a complete result. SQL Server security
-  policies with an enabled filter predicate get the same caveat (and, when
-  the login lacks `VIEW DEFINITION` to see the policies, a caveat that RLS
-  cannot be ruled out). SQL Server has no bypass: diff as a user the
-  predicates let read every row.
+  security that filters the reading role - directly, or under a view, at any
+  depth - is named in the output as a caveat; diff as a role with BYPASSRLS
+  for a complete result. A PostgreSQL column the login lacks SELECT on
+  (column-level grants) is never compared and makes the run not identical.
+  SQL Server security policies with an enabled filter predicate get the same
+  caveat (and, when the login lacks `VIEW DEFINITION` to see the policies, a
+  caveat that RLS cannot be ruled out). SQL Server has no bypass: diff as a
+  user the predicates let read every row.
+- A PostgreSQL parent table's rows include its inheritance children's; the
+  run names the children.
 - **Masked values are never compared as masks.** A SQL Server column under
   dynamic data masking reads as its mask for a login without `UNMASK`, so
   such a compared column is refused (naming it; `GRANT UNMASK` or
@@ -262,7 +266,7 @@ value renders, or which rows a query returns, is pinned at connect:
 
 | Engine | Pinned at connect |
 |---|---|
-| PostgreSQL | `TimeZone` UTC, `extra_float_digits = 1`, `standard_conforming_strings`, `IntervalStyle`, `DateStyle`, `bytea_output`, `lc_monetary`, `client_encoding` UTF8, `search_path = pg_catalog` (so no user function can shadow a built-in), `quote_all_identifiers` off, and `idle_in_transaction_session_timeout` / (17+) `transaction_timeout` off so a role default cannot kill the held snapshot mid-run; then a read-only REPEATABLE READ transaction |
+| PostgreSQL | `TimeZone` UTC, `extra_float_digits = 1` (3 before 12), `standard_conforming_strings`, `IntervalStyle`, `DateStyle`, `bytea_output`, `lc_monetary` (money still read at the login's own decimal places), `client_encoding` UTF8, `search_path = pg_catalog` (so no user function can shadow a built-in), `quote_all_identifiers` off, and `idle_in_transaction_session_timeout` / (17+) `transaction_timeout` off so a role default cannot kill the held snapshot mid-run; then a read-only REPEATABLE READ transaction. Every pin is re-read after the walk: one a filter or a view's function moved makes the run unexplained |
 | MySQL | `time_zone` UTC, `sql_mode`, `sql_select_limit` (reset to no limit), then REPEATABLE READ, READ ONLY |
 | SQL Server | isolation (SNAPSHOT where allowed, else READ COMMITTED; a memory-optimized table is read `WITH (SNAPSHOT)` at READ COMMITTED), `NUMERIC_ROUNDABORT` off; never commits |
 | Snowflake | `TIMEZONE` UTC, `ROWS_PER_RESULTSET = 0` (no limit) |

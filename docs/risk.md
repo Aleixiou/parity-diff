@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 433ec7f5535660c5`
+Source fingerprint: `src-sha256: 122e904e899ae485`
 
 ## Summary
 
@@ -44,6 +44,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
 | Row-level security hides rows from the reading role (PostgreSQL; SQL Server security policies) | **not bounded**: those rows are not compared; every run names the table in a caveat (on SQL Server, without VIEW DEFINITION on the database, a caveat that RLS cannot be ruled out) | Not quantifiable |
 | Dynamic data masking hands the login masks instead of values (SQL Server) | **0** for a table: a compared column masked for the login is refused; a view reading one is refused, and so is any view whose dependencies the login cannot see (no VIEW DEFINITION) in a database holding masked columns it cannot unmask | By design (tested live) |
+| Column-level grants hide a column from the reading login (PostgreSQL) | **0**: a column the login lacks SELECT on is a schema difference, never identical, unless `--exclude`d (round H) | By design (tested) |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
 | Columns of types outside the rules (BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, ranges, geometry, XML; listed per run) | **no bound**; named in the report as not covered. Not only false alarms: until round H, BigQuery's text for ARRAY/STRUCT/GEOGRAPHY collided (false matches). Now injective on BigQuery; elsewhere a raw text cast whose injectivity is per engine | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
@@ -62,7 +63,9 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Risk | Odds | Kind |
 |---|---|---|
 | Session settings change how values render | **0** for every pinned setting; round G set every user-settable PostgreSQL setting at each value, MySQL sql_mode, charset, time_zone and init_connect variants, SQL Server collations, ANSI options and 'user options', Snowflake output formats and BigQuery `und:ci`: the 6 that changed anything are now pinned or refused | Measured |
-| Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
+| A pinned setting changed mid-walk by the queries themselves (`set_config()` in a `--where` or a view's function, PostgreSQL) | **0**: such filters are refused by name, and every pin is re-read after the walk - one that moved makes the run unexplained, never identical (round H) | By design (tested) |
+| PostgreSQL money written under a locale with other decimals than the login's default lc_monetary | **not bounded**: money is an integer of minor units and read at the login's own frac_digits (a caveat names them when not two); a session-only write locale cannot be detected | Not quantifiable |
+| Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT, with `extra_float_digits = 3` there so floats inside unmapped types print exactly - round H), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
 | Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
@@ -131,6 +134,7 @@ and 4.3. This is where every past false match lived.
 | Rendering disagrees with the rules, covered types | **0 of 4,180** checks at scale 6 (4,154 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
 | Types outside the rules: BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report. The real risk is not only false alarms: an engine's text for such a type can collide - BigQuery's `FORMAT('%t')` printed `['a, b']` like `['a', 'b']` and a NULL struct field like `'NULL'` (round H, fixed). On BigQuery every one is now injective by construction (STRUCT by `canonical_struct_text`, GEOGRAPHY as WKB, INTERVAL/RANGE components printed exactly); on other engines the fallback is the engine's own text cast, injective only as far as that cast is | Not quantifiable |
+| A PostgreSQL extension type whose text prints two values alike (contrib `seg`) | **0** false matches between PostgreSQL sides: types outside pg_catalog and the known-exact list are compared by their binary send form too, or refused (round H) | By design (tested) |
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
 | A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |

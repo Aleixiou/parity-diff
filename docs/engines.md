@@ -68,7 +68,29 @@ so a role default cannot kill it mid-run.
 **Caveats.**
 
 - **Row-level security**: rows the role's policies hide are not compared; the
-  run names the table. Diff as a role with `BYPASSRLS` for a complete result.
+  run names the table - or the view, and the RLS tables it reads at any
+  depth, when the policies apply to the reader or to a view's owner. Diff as
+  a role with `BYPASSRLS` for a complete result.
+- **Column-level grants**: a column the login lacks SELECT on is not compared
+  and the run is not identical (exit 1), naming it; `--exclude` it to make
+  the gap deliberate.
+- **Inheritance**: a parent table's rows include its children's (as any
+  query on it reads them); the run names the children.
+- **money** is read with the decimal places of the login's own `lc_monetary`
+  (its role, database or server default, before parity pins `C`): `12345`
+  stored under a yen locale is 12345, not 123.45. A locale with other than
+  two places draws a caveat; money written under a session-only locale that
+  differs from the login's default cannot be detected.
+- **Extension types** are compared by their text where it is known exact
+  (citext, hstore, ltree, isn, cube, PostGIS, pgvector), others by their text
+  and their binary send form - or refused, naming the column, when they have
+  none or sit inside an array, composite or range.
+- **Connecting** gives up after 30 seconds unless the URL sets
+  `connect_timeout`.
+- **`--where`** may not call functions that change the session or act outside
+  the read (`set_config`, advisory locks, `pg_sleep`, sequences, large
+  objects, `dblink`, `query_to_xml`, ...). Every pinned setting is re-read
+  after the walk; one that moved makes the run unexplained, never identical.
 - The database should be UTF-8; text in a `LATIN1`/`WIN1252` database is
   hashed as UTF-8, and a `SQL_ASCII` database holding non-UTF-8 bytes is
   refused.
