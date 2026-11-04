@@ -1080,15 +1080,17 @@ def qualifiers(outcome: PairOutcome) -> list[tuple[str, str]]:
         out.append(("bad", f"unverified {note}"))
     v = result.get("verification")
     if v is None:
-        out.append(
-            (
-                "warn",
-                "no independent sample check ran (skipped, or the walk stopped early)",
-            )
+        reason = (
+            "off (--verify-sample 0): the verdict rests on the checksums alone"
+            if result.get("verify_sample") == 0
+            else "did not run (the walk stopped early, or both tables are empty)"
         )
+        out.append(("warn", f"no independent sample check: {reason}"))
     else:
         if v.get("error"):
-            out.append(("warn", f"independent sample check could not run: {v['error']}"))
+            # A check asked for that could not run leaves the pair unproven,
+            # never identical (as in the single-pair report).
+            out.append(("bad", f"independent sample check could not run: {v['error']}"))
         for failure in v.get("failures", []):
             out.append(("bad", f"sample check contradicts the checksums: {failure}"))
         if v.get("unchecked"):
@@ -1152,6 +1154,8 @@ def _headline(outcome: PairOutcome) -> str:
         text = f"{n:,} difference{'s' if n != 1 else ''}"
     elif (result.get("verification") or {}).get("failures"):
         text = "not verified (sample check failed)"
+    elif (result.get("verification") or {}).get("error"):
+        text = "not proven (sample check could not run)"
     elif result.get("unexplained"):
         text = "not verified (unexplained checksums)"
     elif result.get("schema_differences"):

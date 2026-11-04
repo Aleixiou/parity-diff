@@ -556,9 +556,13 @@ QUALIFIED = {
     "caveat": ({"warnings": ["side A (x): CAVEAT-TEXT-42"]}, "CAVEAT-TEXT-42", True),
     "uncovered": ({"verification__unchecked": ["geom_col"]}, "geom_col", True),
     "sample_error": (
-        {"verification__error": "SAMPLE-ERR-7", "risk__max_hidden_fraction": None},
+        {
+            "verification__error": "SAMPLE-ERR-7",
+            "risk__max_hidden_fraction": None,
+            "identical": False,
+        },
         "sample check could not run",
-        True,
+        False,
     ),
     "no_sample": (
         {"verification": None, "risk__max_hidden_fraction": None},
@@ -686,8 +690,8 @@ def test_every_format_shows_every_qualifier_on_the_pair_it_applies_to():
         case = cases[name]
         assert text in case.find("system-out").text, name
         assert (case.find("failure") is None) == still
-    assert data["totals"]["identical_with_qualifiers"] == 6
-    assert "6 identical pair(s) carry qualifiers" in human
+    assert data["totals"]["identical_with_qualifiers"] == 5
+    assert "5 identical pair(s) carry qualifiers" in human
 
 
 def test_the_summary_is_never_stronger_than_its_weakest_pair():
@@ -697,7 +701,7 @@ def test_the_summary_is_never_stronger_than_its_weakest_pair():
     assert not run.identical and run.exit_code == EXIT_DIFFERENCES
     assert run_to_dict(run)["identical"] is False
     assert "**Verdict: NOT IDENTICAL**" in render_markdown(run)
-    assert "weakest identical pair (sample_error)" in _human(run)
+    assert "weakest identical pair (no_sample)" in _human(run)
 
 
 def test_markdown_header_and_differences(tmp_path):

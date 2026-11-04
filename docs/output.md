@@ -313,13 +313,14 @@ One block per pair, printed as each finishes, then the totals:
 - The mark is `✓` identical, `✗` not identical, `!` error, `-` not run.
 - The words after the row count are the single-pair headline: `no
   differences`, `N differences`, `at least N differences (stopped early)`,
-  `not verified (sample check failed)`, `not verified (unexplained
-  checksums)`, `schemas differ`, each with `(filtered rows only)` when a
-  filter applied.
+  `not verified (sample check failed)`, `not proven (sample check could not
+  run)`, `not verified (unexplained checksums)`, `schemas differ`, each with
+  `(filtered rows only)` when a filter applied.
 - Under the line, indented, come **every** qualifying line the single-pair
   report would print before its rows: `✗` lines (schema, unverified ranges,
-  sample-check contradictions, stopped early) and `!` lines (the filter, a
-  sample check that could not run or did not run, columns the sample check
+  sample-check contradictions, a sample check that could not run, stopped
+  early) and `!` lines (the filter, a sample check that was off or did not
+  run, columns the sample check
   does not cover, sample notes, and every warning and caveat). The rows
   themselves are in `--json` and `--markdown`.
 - `from an earlier run (<time>)`: carried over by `--resume`, not re-checked.
