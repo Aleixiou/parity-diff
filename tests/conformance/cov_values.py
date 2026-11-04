@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -58,6 +59,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from float_sample import adversarial_doubles
 
 from parity.dialects.base import ShapedList
+
+
+def iso_compat(text: str) -> str:
+    """Pad an ISO time's fraction to 6 digits: Python 3.10's fromisoformat
+    accepts only 3 or 6 fractional digits (3.11 takes any), and the supported
+    range starts at 3.10."""
+    return re.sub(
+        r"(\d{2}:\d{2}:\d{2})\.(\d{1,6})(?!\d)",
+        lambda m: f"{m[1]}.{m[2].ljust(6, '0')}",
+        text,
+    )
 
 
 @dataclass(frozen=True)
@@ -373,12 +385,12 @@ def _instants() -> list[Val]:
     ]
     out = [Val("tz:<NULL>", None)]
     for t in texts:
-        out.append(Val(f"tz:{t}", dt.datetime.fromisoformat(t)))
+        out.append(Val(f"tz:{t}", dt.datetime.fromisoformat(iso_compat(t))))
     return out
 
 
 TIMES = [Val("tm:<NULL>", None)] + [
-    Val(f"tm:{t}", dt.time.fromisoformat(t))
+    Val(f"tm:{t}", dt.time.fromisoformat(iso_compat(t)))
     for t in (
         "00:00:00",
         "00:00:01",

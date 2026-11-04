@@ -151,7 +151,9 @@ class Snowflake(fh.Engine):
             r = list(r)
             for i, c in enumerate(cols):
                 if c.kind == "tstz" and r[i] is not None:
-                    r[i] = dt.datetime.fromisoformat(r[i]).replace(tzinfo=fh.UTC)
+                    r[i] = dt.datetime.fromisoformat(fh.iso_compat(r[i])).replace(
+                        tzinfo=fh.UTC
+                    )
             out.append(tuple(r))
         return out
 

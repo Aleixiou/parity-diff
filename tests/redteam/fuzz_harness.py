@@ -35,6 +35,7 @@ import datetime as dt
 import math
 import os
 import random
+import re
 import struct
 import tempfile
 import unicodedata
@@ -46,6 +47,18 @@ from typing import Any
 
 from parity.dialects.base import get_dialect
 from parity.engine import diff
+
+
+def iso_compat(text: str) -> str:
+    """Pad an ISO time's fraction to 6 digits: Python 3.10's fromisoformat
+    accepts only 3 or 6 fractional digits (3.11 takes any), and the supported
+    range starts at 3.10."""
+    return re.sub(
+        r"(\d{2}:\d{2}:\d{2})\.(\d{1,6})(?!\d)",
+        lambda m: f"{m[1]}.{m[2].ljust(6, '0')}",
+        text,
+    )
+
 
 UTC = dt.timezone.utc
 
@@ -1120,7 +1133,7 @@ def logical(v: Any, kind: str, fs: int) -> Any:
         return bool(v)
     if kind == "tstz":
         if isinstance(v, str):
-            v = dt.datetime.fromisoformat(v)
+            v = dt.datetime.fromisoformat(iso_compat(v))
         if v.tzinfo is not None:
             v = v.astimezone(UTC).replace(tzinfo=None)
         return v
@@ -1138,7 +1151,7 @@ def logical(v: Any, kind: str, fs: int) -> Any:
                 us % 1_000_000,
             )
         if isinstance(v, str):
-            return dt.time.fromisoformat(v)
+            return dt.time.fromisoformat(iso_compat(v))
         return v
     if kind == "binary":
         return bytes(v)
@@ -1655,13 +1668,15 @@ class MSSQL(Engine):
                 if r[i] is None:
                     continue
                 if c.kind == "tstz":
-                    r[i] = dt.datetime.fromisoformat(r[i].replace("Z", "+00:00"))
+                    r[i] = dt.datetime.fromisoformat(
+                        iso_compat(r[i].replace("Z", "+00:00"))
+                    )
                 elif c.kind in ("ts", "ts3"):
-                    r[i] = dt.datetime.fromisoformat(r[i])
+                    r[i] = dt.datetime.fromisoformat(iso_compat(r[i]))
                 elif c.kind in ("dec", "money"):
                     r[i] = Decimal(r[i])
                 elif c.kind == "time" and isinstance(r[i], str):
-                    r[i] = dt.time.fromisoformat(r[i])
+                    r[i] = dt.time.fromisoformat(iso_compat(r[i]))
             out.append(tuple(r))
         return out
 
