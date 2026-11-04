@@ -315,6 +315,54 @@ def test_distinct_keys_of_every_type_stay_distinct(schema, typ, k1, k2):
     assert [d.kind for d in r.diffs] == ["only_in_a"]
 
 
+#: A hot standby of ADMIN (container `rth-pg-18r`, `pg_basebackup -R`, port 15619).
+STANDBY = os.environ.get("PARITY_RTH_PG_STANDBY", "postgres://rth:rth@127.0.0.1:15619/rth")
+
+
+def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
+    """On a read replica the walk keeps one snapshot even while the primary's
+    writes and a VACUUM replay underneath it; the planted row is found."""
+    import time
+
+    conn = pg_connect(STANDBY)
+    try:
+        if not conn.execute("select pg_is_in_recovery()").fetchone()[0]:
+            pytest.skip("not a standby")
+    finally:
+        conn.close()
+    s = schema
+    _exec(ADMIN, *[f"create table {s}.{t} (id int primary key, x text)" for t in "ab"],
+          *[f"insert into {s}.{t} select g, 'v'||g from generate_series(1, 50000) g" for t in "ab"],
+          f"update {s}.b set x = 'D' where id = 777")
+    for _ in range(60):
+        try:
+            if _exec(STANDBY, f"select count(*) from {s}.b where x = 'D'")[0][0] == 1:
+                break
+        except Exception:  # noqa: BLE001 - not replayed yet
+            pass
+        time.sleep(1)
+    a, b = get_dialect(STANDBY, side="A"), get_dialect(STANDBY, side="B")
+    original, fired = b.segment_checksums, []
+
+    def wrapped(*args, **kw):
+        out = original(*args, **kw)
+        if not fired:
+            fired.append(True)
+            _exec(ADMIN, f"update {s}.b set x = 'LIVE' where id = 2",
+                  f"delete from {s}.b where id between 100 and 20000", f"vacuum {s}.b")
+            time.sleep(3)  # let it replay
+        return out
+
+    b.segment_checksums = wrapped
+    try:
+        r = diff(a, b, f"{s}.a", f"{s}.b", "id")
+    finally:
+        a.close()
+        b.close()
+    assert fired and [(d.key, d.kind) for d in r.diffs] == [(777, "different")]
+    assert not r.unexplained
+
+
 def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
     s = schema
     cols = ", ".join(f"c{i} int" for i in range(600))
