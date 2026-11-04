@@ -789,3 +789,340 @@ def test_database_ansi_options_off_do_not_move_the_verdict():
         (1, "different", ("b",)),
         (2, "different", ("d",)),
     ]
+
+
+# ============================================================ --where/--map
+
+#: Escapes its parentheses: `[a]]'b]` is ONE identifier to T-SQL (`]]` is an
+#: escaped `]`), but the shared scan closes the bracket at the first `]` and
+#: then reads `'b] = 1) or (1 = 1 or [a]]'` as a string literal - hiding the
+#: `)` and `(` that T-SQL reads as code. The SQL Server guard's skeleton
+#: blanks both identifiers correctly but never counts parentheses.
+ESCAPING_FILTER = "[a]]'b] = 1) or (1 = 1 or [a]]'b] = 7"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HS5: a row filter with `]]` then a quote inside a bracketed "
+    "identifier passes both checks and escapes its parentheses",
+)
+def test_rt_hs5_a_filter_escaping_its_parentheses_is_refused():
+    """`where (<filter>) and <bucket bounds>` became `where ([a]]'b] = 1) or
+    (1 = 1 or [a]]'b] = 7) and <bounds>`: rows matching the first term are
+    read in every bucket, whatever its bounds. Offline: the check alone."""
+    from parity.dialects.mssql_dialect import SQLServerDialect
+
+    with pytest.raises(ValueError, match="row filter"):
+        SQLServerDialect(side="A").check_where(ESCAPING_FILTER)
+
+
+def test_an_escaping_filter_is_never_read_as_identical(db):
+    """What RT-HS5 costs today: the escaped `or` makes bucket counts
+    inconsistent, which the per-level sum check reports - the planted row is
+    found and the verdict is unverified, never identical."""
+    ex(DB, "drop table if exists esc_a", "drop table if exists esc_b")
+    ddl = "id int primary key, v int, [a]]'b] int"
+    ex(DB, f"create table esc_a ({ddl})", f"create table esc_b ({ddl})")
+    fill = (
+        "select value, value, case when value % 10 = 0 then 1 else 0 end "
+        "from generate_series(1, 2000)"
+    )
+    ex(DB, f"insert esc_a {fill}", f"insert esc_b {fill}", "update esc_b set v = -1 where id = 1500")
+    r = run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=ESCAPING_FILTER, where_b=ESCAPING_FILTER)
+    assert not r.identical
+    assert (1500, "different", ("v",)) in found(r)
+    assert r.unexplained
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "[set] > 0",
+        "{fn ucase('a')} = 'A'",
+        "id in (select value from string_split(N'1,2', N','))",
+        "id > 0 and @@rowcount >= 0",
+        "id > 0 and 1 = (select 1 for xml path(''))",
+        "id >\t0",
+        "id > 0\nand v > 0",
+        "note = N'it''s [not] an ident' or id > 0",
+        "note = 'insert into, drop, exec' or id > 0",
+    ],
+)
+def test_harmless_t_sql_filters_still_find_the_planted_row(db, predicate):
+    """Bracketed reserved words, ODBC escapes, table-valued functions,
+    whitespace, doubled quotes and write words inside literals are accepted
+    and the planted row (key 2) is found."""
+    ta, tb = pair(
+        DB,
+        "id int primary key, v int, [set] int, note nvarchar(40)",
+        ["(1, 1, 1, N'x')", "(2, 2, 2, N'x')"],
+        ["(1, 1, 1, N'x')", "(2, 3, 2, N'x')"],
+        "wh",
+    )
+    r = run(db, db, ta, tb, where_a=predicate, where_b=predicate)
+    assert found(r) == [(2, "different", ("v",))]
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "id > 0; delete from dbo.wh_a",
+        "id > 0 -- comment",
+        "id > 0 /* c */",
+        "id > 0) or (1 = 1",
+        '"id" > 0',
+        "id > 0 and exists (select * from openrowset('SQLNCLI', 'x', 'select 1'))",
+        "id > 0 and 1 = (select 1 from openquery(srv, 'select 1'))",
+        "id > 0 or exec(N'x') = 1",
+        "id > 0 waitfor delay '00:00:05'",
+        "id > 0 and xp_cmdshell('dir') = 0",
+        "id > 0 and dbo.sp_x() = 1",
+        "[a] > 0 and 'unterminated",
+        "[unterminated > 0",
+        "id > 0 \\' or 1 = 1",
+    ],
+)
+def test_filters_that_could_write_or_escape_are_refused_before_any_query(predicate):
+    """Statement separators, comments, an unbalanced parenthesis, double
+    quotes and the write/exec words are refused by the checks, naming the
+    side - before any connection is used."""
+    from parity.dialects.mssql_dialect import SQLServerDialect
+
+    with pytest.raises(ValueError, match=r"\[side A: mssql\] row filter"):
+        SQLServerDialect(side="A").check_where(predicate)
+
+
+def test_a_filter_with_a_lock_hint_is_accepted_and_holds_its_locks():
+    """Not a write, but worth knowing: `with (xlock, holdlock)` inside a
+    filter passes the guard, and in the dialect's one long transaction the
+    locks are held until the diff ends - a second session's locking read of
+    the row times out. (A run using it on both sides of one table waits
+    forever: side B blocks on side A's locks and the driver has no query
+    timeout - seen during the campaign.)"""
+    url = make_db("rth_mssql_lock")
+    ex("rth_mssql_lock", "create table t (id int primary key, v int)", "insert t values (1, 1), (2, 2)")
+    a = get_dialect(url, side="A")
+    try:
+        pred = "id in (select id from dbo.t with (xlock, holdlock))"
+        a.check_where(pred)
+        a.query(f"select count_big(*) from [dbo].[t] where ({pred})")
+        with pytest.raises(Exception, match=r"(?i)lock request time ?out"):
+            ex(
+                "rth_mssql_lock",
+                "set lock_timeout 1000",
+                "select v from dbo.t with (xlock) where id = 1",
+            )
+    finally:
+        a.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HS10: a row filter that selects no row on either side gives "
+    "'identical' with no warning that nothing was compared",
+)
+def test_rt_hs10_a_filter_selecting_nothing_is_not_silently_identical(db):
+    """A filter with a typo (`region = 'EU '`, a stray space, on a
+    binary-collated column) selects nothing on both sides; the verdict is
+    "identical" over zero rows while the tables differ. The filter warning
+    says the verdict covers the filtered rows, not that there were none.
+    Engine-wide, found on SQL Server."""
+    ta, tb = pair(
+        DB,
+        "id int primary key, v int, region varchar(5) collate Latin1_General_BIN2",
+        ["(1, 1, 'EU')", "(2, 2, 'EU')"],
+        ["(1, 1, 'EU')", "(2, 3, 'EU')"],
+        "empty",
+    )
+    p = "region like 'EU _'"
+    r = run(db, db, ta, tb, where_a=p, where_b=p)
+    assert not r.identical or any(
+        "no row" in w.lower() or "0 rows" in w.lower() or "zero rows" in w.lower()
+        for w in r.warnings
+    )
+
+
+def test_column_map_swaps_and_renames_bracketed_names(db):
+    """`--map` on SQL Server: two columns swap names and one is renamed to a
+    name holding `]`, a quote, a space. Only the planted differences are
+    reported, under side A's names."""
+    ex(DB, "drop table if exists map_a", "drop table if exists map_b")
+    ex(
+        DB,
+        "create table map_a (id int primary key, x int, y int, amount decimal(10,2))",
+        "create table map_b (id int primary key, y int, x int, [amt]]'s total] decimal(10,2))",
+        "insert map_a values (1, 10, 20, 1.50), (2, 11, 21, 2.50)",
+        # map_b's columns are (y, x): row 1 holds y=10, x=20 - A's x and y.
+        "insert map_b values (1, 10, 20, 1.50), (2, 11, 22, 2.51)",
+    )
+    r = run(
+        db, db, "dbo.map_a", "dbo.map_b", column_map={"x": "y", "y": "x", "amount": "amt]'s total"}
+    )
+    assert found(r) == [(2, "different", ("amount", "y"))]
+
+
+# ========================================================== keys/collations
+
+#: Keys a collation may call equal or ignore: case, trailing and leading
+#: space, accents (composed and combining), Turkish i's, supplementary
+#: characters, an ideographic space, a unit separator and kana width.
+TRICKY_KEYS = [
+    "a", "A", "a ", " a", "é", "é", "i", "I", "ı", "İ",
+    "\U0001d49c", "\U0001d49d", "　x", "x", "a\x1fb", "ｶ", "カ",
+]  # fmt: skip
+
+COLLATIONS = [
+    ("nvarchar(20)", "Latin1_General_CI_AI"),
+    ("nvarchar(20)", "Latin1_General_100_CI_AS_KS_WS_SC"),
+    ("nvarchar(20)", "SQL_Latin1_General_CP1_CI_AS"),
+    ("nvarchar(20)", "Turkish_CI_AS"),
+    ("nvarchar(20)", "Japanese_XJIS_140_CI_AI_VSS"),
+    ("nvarchar(20)", "Latin1_General_BIN"),
+    ("nvarchar(20)", "Chinese_PRC_CI_AS"),
+    ("varchar(40)", "Latin1_General_100_CI_AI_SC_UTF8"),
+    ("nchar(10)", "Latin1_General_CI_AS"),
+]
+
+
+def _nliteral(text: str) -> str:
+    """`text` as T-SQL built from nchar() of each UTF-16 code unit."""
+    units = text.encode("utf-16-le")
+    codes = [int.from_bytes(units[i : i + 2], "little") for i in range(0, len(units), 2)]
+    return "(" + " + ".join(f"nchar({c})" for c in codes) + ")"
+
+
+@pytest.mark.parametrize(("ctype", "collation"), COLLATIONS)
+def test_text_keys_under_collations_match_duckdb_byte_for_byte(db, tmp_path, ctype, collation):
+    """A heap (no unique index, so the collation cannot refuse a key) keyed
+    on text the collation folds together, against DuckDB holding the same
+    keys. Key 'A' differs in value and key 'a ' is missing on DuckDB; under
+    every collation exactly those two are reported - nothing merged, nothing
+    matched across case, accent, width or Turkish i. (nchar pads, so its
+    'a ' is the key 'a' - a duplicate the tool must refuse.)"""
+    duckdb = pytest.importorskip("duckdb")
+    name = "ck_" + collation.lower()[:20] + "_" + ctype.split("(")[0]
+    ex(DB, f"drop table if exists [{name}]")
+    ex(DB, f"create table [{name}] (k {ctype} collate {collation} not null, v int)")
+    # Literals built from code units: mssql-python's parameter binding
+    # truncates a string at its supplementary characters (verified: '𝒜'
+    # stored as '', '　x' as '　') - a driver bug in loading, not in
+    # parity, which reads text as bytes.
+    ex(DB, *(f"insert [{name}] values ({_nliteral(k)}, {i})" for i, k in enumerate(TRICKY_KEYS)))
+    path = str(tmp_path / "keys.duckdb")
+    con = duckdb.connect(path)
+    try:
+        con.execute("create table t (k varchar, v integer)")
+        for i, k in enumerate(TRICKY_KEYS):
+            if k != "a ":
+                con.execute("insert into t values (?, ?)", [k, -1 if k == "A" else i])
+    finally:
+        con.close()
+    if ctype.startswith("nchar"):
+        with pytest.raises(ValueError, match=r"(?i)side A.*(unique|duplicate)"):
+            run(db, f"duckdb:///{path}", f"dbo.{name}", "main.t", key="k")
+        return
+    r = run(db, f"duckdb:///{path}", f"dbo.{name}", "main.t", key="k")
+    assert found(r) == [("A", "different", ("v",)), ("a ", "only_in_a", ("v",))]
+
+
+# ===================================================================== CLI
+
+
+def _cli(*argv: str) -> tuple[int, str, str]:
+    """Drive the real CLI; (exit code, stdout, stderr)."""
+    import io
+
+    from parity.cli import main
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(list(argv), out=out, err=err)
+    return code, out.getvalue(), err.getvalue()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HS8: an Azure-style user@server URL whose password holds a '/' "
+    "prints the password in the 'Port could not be cast' error",
+)
+def test_rt_hs8_a_malformed_url_never_prints_the_password():
+    """`mssql://admin@srv:P4ss/w0rd@host` - an unencoded `@` in the user
+    (Azure's `user@server` form) and a `/` in the password. urlparse reads
+    `srv:P4ss` as host:port, and the ValueError from `.port` - quoting the
+    "port", i.e. the password - is passed through as the error message.
+    Offline: nothing connects."""
+    secret = "P4ssSecretX"
+    code, out, err = _cli(
+        "diff", "--a", f"mssql://admin@srv:{secret}/w0rd@127.0.0.1",
+        "--a-table", "dbo.t", "--b", "duckdb:///:memory:", "--b-table", "main.t",
+        "--key", "id",
+    )  # fmt: skip
+    assert code == 2
+    assert secret not in out + err
+
+
+def test_the_cli_end_to_end_against_sql_server(db):
+    """Exit 1 with the planted row in human and JSON output, 0 when a filter
+    leaves the row out, 2 on a missing table or a wrong password naming the
+    side - and the password appears in none of the output."""
+    import json
+
+    ta, tb = pair(
+        DB,
+        "id int primary key, v nvarchar(10), d decimal(10,2)",
+        ["(1, N'a', 1.00)", "(2, N'b', 2.00)", "(3, N'c', 3.00)"],
+        ["(1, N'a', 1.00)", "(2, N'b', 2.01)", "(3, N'c', 3.00)"],
+        "cli",
+    )
+    pw = urlparse(MSSQL_URL).password or ""
+    base = ["diff", "--a", db, "--a-table", ta, "--b", db, "--b-table", tb, "--key", "id"]
+    texts = []
+    code, out, err = _cli(*base)
+    texts += [out, err]
+    assert code == 1 and "different" in out
+    code, out, err = _cli(*base, "--json")
+    texts += [out, err]
+    doc = json.loads(out)
+    assert code == 1 and doc["identical"] is False
+    assert [(x["key"], x["kind"], x["columns"]) for x in doc["differences"]] == [
+        (2, "different", ["d"])
+    ]
+    code, out, err = _cli(*base, "--where", "id <> 2")
+    texts += [out, err]
+    assert code == 0
+    code, out, err = _cli(*base, "--quiet")
+    texts += [out, err]
+    assert code == 1
+    missing = ["diff", "--a", db, "--a-table", "dbo.nope", "--b", db, "--b-table", tb]
+    code, out, err = _cli(*missing, "--key", "id")
+    texts += [out, err]
+    assert code == 2 and "side A" in err and "nope" in err
+    wrong = db.replace(":" + pw + "@", ":" + pw + "x@")
+    code, out, err = _cli("diff", "--a", wrong, "--a-table", ta, "--b", db, "--b-table", tb,
+                          "--key", "id")  # fmt: skip
+    texts += [out, err]
+    assert code == 2 and "side A" in err
+    assert not pw or not any(pw in t for t in texts)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "encrypt=yes",  # driver 18: a self-signed certificate must be refused
+        "encrypt=strict&trust_server_certificate=no",
+        "instance=NOPE&trust_server_certificate=yes&login_timeout=3",
+        "aplication_intent=readonly",
+        "login_timeout=abc",
+    ],
+)
+def test_tls_instance_and_parameter_errors_are_clear_and_secret_free(query):
+    """Each bad option fails with exit 2, naming side A, without the
+    password - never a silent fallback to an unencrypted or other server."""
+    u = urlparse(MSSQL_URL)._replace(query=query, path="/master").geturl()
+    pw = urlparse(MSSQL_URL).password or ""
+    code, out, err = _cli(
+        "diff", "--a", u, "--a-table", "dbo.nope", "--b", "duckdb:///:memory:",
+        "--b-table", "main.t", "--key", "id",
+    )  # fmt: skip
+    assert code == 2
+    assert "side A" in err
+    assert not pw or pw not in out + err
