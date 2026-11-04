@@ -5,6 +5,63 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **DuckDB round-H fixes (RT-HD1, HD3-HD14).** False matches fixed:
+  - *Empty lists on DuckDB 1.3-1.4* (RT-HD11): `array_to_string([], '')` is
+    NULL there, so every empty list rendered as the NULL sentinel and `[]`
+    compared equal to NULL. Now `[]` on every version. **Checksums of list
+    columns holding an empty list move on 1.3-1.4 only**; 1.5+ text is
+    byte-identical.
+  - *Macros and types stored in the file* (RT-HD1): a `create macro md5(x)`,
+    `substr`, `replace`, `concat_ws` (or a type named `json`) in the
+    database replaced the built-in in parity's SQL, read-only connection or
+    not - every row hashed alike. A file defining any macro or type named
+    like a DuckDB built-in is now refused at connect, naming the side and the
+    macro. All versions.
+  - *Views over altered tables* (RT-HD13, DuckDB 1.5+): `information_schema`
+    keeps a view's column list and types from its creation, so a retyped
+    column was rendered by the old rule (`'\N'` = NULL) and an added column
+    never compared. Views are now described live (DESCRIBE), with a warning
+    when the catalog disagrees. 1.3-1.4 refuse to bind such a view: a loud
+    error, as before.
+  - *Fixed-size ARRAYs* (RT-HD5, HD8, HD9): `VARCHAR[2]`, `ENUM(...)[2]`,
+    `DECIMAL(p,s)[2]`, `TIMESTAMP[2]` were mapped to their scalar type (a
+    crash) or rendered by a varchar cast that printed strings unquoted before
+    DuckDB 2.0 (`['a, b','c']` = `['a','b, c']`). An ARRAY is now a LIST,
+    each element by its own rule; a `TIMESTAMP_NS[n]` is refused like a
+    `TIMESTAMP_NS[]`, and an ARRAY key like a list key.
+  - *Nested UNION, TIMETZ, VARIANT, ARRAY* (RT-HD6, HD7): a UNION inside a
+    STRUCT, MAP or list lost its tag in the varchar cast (`1::int` = `'1'`,
+    all versions), and a TIMETZ inside a STRUCT, MAP, ARRAY, UNION or VARIANT
+    lost its offset's seconds before 2.0. Such a nested value now renders
+    part by part - STRUCT `{name\=value\,...}` (the layout of BigQuery's
+    struct rule), MAP as its entry structs in stored order, UNION
+    `<tag\=value>`, lists by the list rule, each scalar by its own rule.
+    **Checksums move** for STRUCT/MAP/list/UNION columns holding a UNION,
+    TIMETZ, VARIANT or fixed-size ARRAY, for ARRAY columns, and for VARIANT
+    values holding a TIMETZ (on every version, including 2.0, so files of
+    different versions agree). Nested types without such a part keep their
+    old text.
+  - *Key uniqueness on DuckDB 2.0* (RT-HD14): the count followed the key
+    column's collation (or `default_collation`), so 'a' and 'A' were refused
+    as duplicates; it now counts the UTF-8 bytes (`encode`).
+- **DuckDB never opens a non-DuckDB file** (RT-HD4): a SQLite file given as
+  `duckdb:///...` made `duckdb.connect` download and load `sqlite_scanner`
+  before the extension pins applied - a network call. The header is read
+  first and anything without DuckDB's magic is refused ("not a valid DuckDB
+  database file").
+- **MotherDuck URLs are refused without echoing them** (RT-HD3): `md:` /
+  `motherduck:` paths are unsupported (a network service); error messages
+  cut any `?query` from a path, so a `motherduck_token` is never printed.
+- **DuckDB tables are catalog-qualified** (RT-HD12): a schema named like the
+  file (`warehouse` in `warehouse.duckdb`) or a file named
+  `information_schema.duckdb` made every query ambiguous. No checksum moves.
+- **`duckdb:<path>` / `duckdb:/<path>`** now get an error listing the accepted
+  forms instead of "list index out of range" (RT-HD10).
+- Still open: RT-HD2 (a `]` inside a string inside a DuckDB list literal
+  ends the `--where` scanner's bracket region early); the shared scanner fix
+  lands with the BigQuery round-H work. The walk's count checks already make
+  such a run unexplained, never identical.
+
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)
   and its fetch failed, the result used to stay identical with exit 0 and

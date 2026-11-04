@@ -7,7 +7,9 @@ The other half of a comparison, and the shortest complete example of the
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from parity.dialects.base import (
@@ -16,12 +18,27 @@ from parity.dialects.base import (
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
     Dialect,
+    escape_canonical_text,
     float_range_where,
     float_tiny_sql,
     float_zero_text,
+    map_type,
     sql_literal,
 )
 from parity.types import Column, KeySpec, LogicalType
+
+#: The accepted spellings, for the error that explains them.
+DUCKDB_URL_FORMS = (
+    "duckdb:///relative/path.duckdb, duckdb:////absolute/posix/path.duckdb, "
+    "duckdb:///C:/windows/path.duckdb or duckdb:///:memory:"
+)
+
+
+def _redact(path: str) -> str:
+    """A path for an error message, its query string cut off: a URL's `?...`
+    can carry a token (MotherDuck's `motherduck_token=`, RT-HD3)."""
+    at = path.find("?")
+    return path if at < 0 else path[:at] + "?<redacted>"
 
 
 def duckdb_path(connection_string: str) -> str:
@@ -41,7 +58,14 @@ def duckdb_path(connection_string: str) -> str:
     completely, because its paths start with a drive letter and so carry only
     one leading slash to begin with; it took a Linux CI run to surface.
     """
-    rest = connection_string.split("://", 1)[1]
+    head, sep, rest = connection_string.partition("://")
+    if not sep:
+        # `duckdb:/path` or `duckdb:path` used to die on an IndexError whose
+        # text ("list index out of range") explained nothing (RT-HD10).
+        raise ValueError(
+            f"not a DuckDB connection string: {_redact(connection_string)!r}. "
+            f"Expected {DUCKDB_URL_FORMS}"
+        )
     return rest.removeprefix("/")
 
 
@@ -77,6 +101,119 @@ _TEXT_SAMPLED = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class DuckType:
+    """A DuckDB type name, parsed: `kind` is "list" (a `[]` list or `[n]`
+    ARRAY, `fixed` telling them apart), "struct", "map", "union" or
+    "scalar"; `fields` the (name, type) pairs of a struct or union, the
+    element of a list, the key and value of a map."""
+
+    kind: str
+    raw: str
+    fields: tuple[tuple[str, DuckType], ...] = ()
+    fixed: bool = False
+
+
+def _split_top(text: str) -> list[str]:
+    """Split on the commas outside parentheses and quotes."""
+    parts: list[str] = []
+    depth, quote, start = 0, "", 0
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _field(text: str) -> tuple[str, str]:
+    """`name TYPE`, or a double-quoted name (a quote in it doubled) and
+    its TYPE -> (name, TYPE)."""
+    if text.startswith('"'):
+        i = 1
+        name = ""
+        while i < len(text):
+            if text[i] == '"':
+                if text[i + 1 : i + 2] == '"':
+                    name += '"'
+                    i += 2
+                    continue
+                return name, text[i + 1 :].strip()
+            name += text[i]
+            i += 1
+        raise ValueError(f"unterminated field name in {text!r}")
+    name, _, typ = text.partition(" ")
+    return name, typ.strip()
+
+
+def parse_duckdb_type(raw: str) -> DuckType:
+    """Parse a DuckDB type name as `information_schema` and DESCRIBE spell
+    it: `STRUCT("a, b" INTEGER, c VARCHAR[2])`, `MAP(VARCHAR, TIME WITH TIME
+    ZONE)`, `UNION(n INTEGER, s VARCHAR)`, `ENUM('a, b', 'c')[2]`."""
+    raw = raw.strip()
+    suffix = re.search(r"\[(\d*)\]$", raw)
+    if suffix:
+        inner = parse_duckdb_type(raw[: suffix.start()])
+        return DuckType("list", raw, (("", inner),), fixed=bool(suffix.group(1)))
+    up = raw.upper()
+    for kind in ("struct", "union", "map"):
+        if up.startswith(kind.upper() + "(") and raw.endswith(")"):
+            body = _split_top(raw[len(kind) + 1 : -1])
+            if kind == "map":
+                if len(body) != 2:
+                    break
+                fields: tuple[tuple[str, DuckType], ...] = (
+                    ("key", parse_duckdb_type(body[0])),
+                    ("value", parse_duckdb_type(body[1])),
+                )
+            else:
+                fields = tuple((n, parse_duckdb_type(t)) for n, t in map(_field, body))
+            return DuckType(kind, raw, fields)
+    return DuckType("scalar", raw)
+
+
+#: Scalars whose varchar or JSON cast loses part of the value when nested:
+#: TIMETZ drops an offset's seconds before DuckDB 2.0 (COV-7, RT-HD6), and
+#: VARIANT its type tag.
+_LOSSY_NESTED_SCALARS = frozenset({"TIMETZ", "TIME WITH TIME ZONE", "VARIANT"})
+
+
+def _needs_nested_rule(t: DuckType, *, top: bool) -> bool:
+    """Whether `t` must be rendered part by part (`DuckDBDialect._nested`).
+
+    Nested anywhere: a UNION (its tag), a fixed-size ARRAY (strings unquoted
+    before DuckDB 2.0) and the `_LOSSY_NESTED_SCALARS`. A top-level UNION
+    already renders as JSON, which keeps its own tag, so only what it holds
+    counts; a top-level ARRAY is a LIST (`map_type`) unless its element has
+    no rule.
+    """
+    if t.kind == "scalar":
+        return not top and t.raw.upper() in _LOSSY_NESTED_SCALARS
+    if not top and (t.kind == "union" or (t.kind == "list" and t.fixed)):
+        return True
+    if top and t.kind == "list" and t.fixed:
+        return True
+    if top and t.kind == "union":
+        return any(_holds(f, _LOSSY_NESTED_SCALARS) for _, f in t.fields)
+    return any(_needs_nested_rule(f, top=False) for _, f in t.fields)
+
+
+def _holds(t: DuckType, scalars: frozenset[str]) -> bool:
+    """Whether `t` holds one of `scalars` anywhere inside."""
+    if t.kind == "scalar":
+        return t.raw.upper() in scalars
+    return any(_holds(f, scalars) for _, f in t.fields)
+
+
 class DuckDBDialect(Dialect):
     name = "duckdb"
     default_schema = "main"
@@ -91,6 +228,9 @@ class DuckDBDialect(Dialect):
         """
         import duckdb
 
+        #: Warnings found while introspecting (a view's stale catalog), for
+        #: `caveats`.
+        self._notes: list[str] = []
         # Before 1.3 DuckDB rendered lists unquoted (['NULL'] = [NULL], RT-G10),
         # 1.1 lost pre-epoch nanoseconds (RT-G11) and 1.0 truncated DECIMAL
         # where it must round (RT-G14): verified false matches, so refused.
@@ -101,24 +241,101 @@ class DuckDBDialect(Dialect):
                 "versions render some values differently, which can hide a "
                 "difference). Upgrade with: pip install -U duckdb"
             )
-        path = duckdb_path(connection_string)
+        try:
+            path = duckdb_path(connection_string)
+        except ValueError as exc:
+            raise self._err(str(exc)) from None
+        if path.lower().startswith(("md:", "motherduck:")):
+            # MotherDuck is a network service: duckdb.connect would load its
+            # extension and log in (CLAUDE.md 6), and the query string holds
+            # the token, which an error must never print (RT-HD3).
+            raise self._err(
+                "MotherDuck databases (md:, motherduck:) are not supported: "
+                "parity reads local DuckDB files only. Export the tables to a "
+                "local .duckdb file and compare that"
+            )
         if not path or path == ":memory:":
             # An in-memory database holds no user data to protect, and a
             # read-only in-memory database is empty by definition.
             self._conn = duckdb.connect(":memory:")
             self._no_extension_downloads()
             self._pin_utc()
+            self._catalog = str(self._conn.execute("select current_database()").fetchall()[0][0])
             return
         if not os.path.exists(path):
             # read_only=True on a missing path fails with a driver-level error
             # that does not say which side or which file. Say it ourselves.
-            raise self._err(f"database file not found: {path}")
+            raise self._err(f"database file not found: {_redact(path)}")
+        if os.path.isfile(path):
+            self._refuse_foreign_file(path)
         # CLAUDE.md section 6: read-only by construction. Enforcing it at the
         # connection means no bug in query building can ever write to a user's
         # database. It also lets several parity runs share one file.
         self._conn = duckdb.connect(path, read_only=True)
         self._no_extension_downloads()
         self._pin_utc()
+        self._catalog = str(self._conn.execute("select current_database()").fetchall()[0][0])
+        self._refuse_shadowing()
+
+    def _refuse_foreign_file(self, path: str) -> None:
+        """Refuse a file that is not a DuckDB database before DuckDB opens it.
+
+        `duckdb.connect` sniffs the header itself and opens a SQLite file
+        through the sqlite_scanner extension - installing it from
+        extensions.duckdb.org first if it is missing, inside the connect,
+        before any setting of ours can turn autoinstall off (RT-HD4, a
+        network call; CLAUDE.md 6). Config passed to connect would stop it,
+        but DuckDB refuses a second connection to a file that another one in
+        the process opened with a different config, which a library caller
+        holding the file read-only would then hit. So the header is read
+        here: every DuckDB database file carries the magic `DUCK` at byte 8.
+        """
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(16)
+        except OSError as exc:
+            raise self._err(f"could not connect: cannot read {_redact(path)}: {exc}") from exc
+        if head[8:12] != b"DUCK":
+            what = " (it is a SQLite database)" if head.startswith(b"SQLite format 3") else ""
+            raise self._err(
+                f"{_redact(path)} is not a valid DuckDB database file{what}; "
+                "parity opens DuckDB files only and loads no extension to read "
+                "other formats"
+            )
+
+    def _refuse_shadowing(self) -> None:
+        """Refuse a file whose macros or types carry a built-in's name.
+
+        DuckDB resolves a macro stored in the database before the built-in
+        of the same name - on a read-only connection too - so a file holding
+        `create macro md5(x) as 'd41d...'` rewrote every row hash parity
+        computes into one constant, and a changed row compared identical
+        (RT-HD1); `replace`, `substr` or `concat_ws` did the same to the row
+        text, and a user type named `json` to the UNION rendering. Built-ins
+        can be qualified (`system.main.md5`), but the type cast cannot be on
+        DuckDB < 2.0 and the shared SQL names dozens of functions, so the
+        defence is complete only as a refusal: any non-internal function or
+        type whose name a built-in has, wherever it is defined.
+        """
+        funcs = self._conn.execute(
+            "select distinct function_name from duckdb_functions() where not internal "
+            "and lower(function_name) in (select lower(function_name) "
+            "from duckdb_functions() where internal) order by 1"
+        ).fetchall()
+        types = self._conn.execute(
+            "select distinct type_name from duckdb_types() where not internal "
+            "and lower(type_name) in (select lower(type_name) "
+            "from duckdb_types() where internal) order by 1"
+        ).fetchall()
+        shadows = [f"macro {r[0]}" for r in funcs] + [f"type {r[0]}" for r in types]
+        if shadows:
+            self.close()
+            raise self._err(
+                f"the database defines {', '.join(shadows)}, named like DuckDB "
+                "built-ins. DuckDB calls a stored macro or type before the "
+                "built-in, so parity's SQL would run it and its checksums "
+                "could not be trusted. Compare a copy without them"
+            )
 
     def _no_extension_downloads(self) -> None:
         """Never fetch or load an extension behind the user's back (RT-F13).
@@ -183,16 +400,102 @@ class DuckDBDialect(Dialect):
         """
         return '"' + identifier.replace('"', '""') + '"'
 
+    def qualify(self, table: str) -> str:
+        """`"catalog"."schema"."table"`, always all three parts.
+
+        `"warehouse"."t"` is ambiguous in a file named warehouse.duckdb that
+        also holds a schema `warehouse` - DuckDB cannot tell a catalog from a
+        schema there and every query failed (RT-HD12). The catalog is the
+        attached database's own name, read at connect.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        # A dialect built without a connection (SQL generation in tests)
+        # has no catalog to name.
+        catalog = getattr(self, "_catalog", None)
+        parts = (schema, name) if catalog is None else (catalog, schema, name)
+        return ".".join(self.quote(p) for p in parts)
+
+    def _columns_catalog(self, schema: str) -> str:
+        """The system catalog's `information_schema`: in a file named
+        information_schema.duckdb the bare name is ambiguous (RT-HD12)."""
+        return "system.information_schema.columns"
+
+    def columns(self, table: str) -> list[Column]:
+        r"""The table's columns as the catalog lists them - or, for a view,
+        as the view returns them now.
+
+        `information_schema.columns` keeps a view's column list and types as
+        they were when it was created: after `alter table t alter v type
+        varchar` a `select *` view still reads INTEGER there, so v was
+        rendered by the integer rule and '\N' equalled NULL; a column added
+        to the base table was never compared at all (RT-HD13, false
+        matches). DESCRIBE binds the view afresh. When the two disagree the
+        live description is used, and `caveats` says so.
+        """
+        schema, name = self.split_table(table, self.default_schema)
+        where = (
+            f"where table_catalog = {self.string_literal(self._catalog)} "
+            f"and table_schema = {self.string_literal(schema)} "
+            f"and table_name = {self.string_literal(name)}"
+        )
+        rows = [
+            (str(r[0]), str(r[1]))
+            for r in self.query(
+                f"select column_name, data_type from {self._columns_catalog(schema)} "  # noqa: S608 - names via string_literal
+                f"{where} order by ordinal_position"
+            )
+        ]
+        if not rows:
+            raise self._err(self._not_found(table, schema, name))
+        kind = self.query(f"select table_type from system.information_schema.tables {where}")  # noqa: S608
+        if kind and kind[0][0] == "VIEW":
+            listed = rows
+            live = [
+                (str(r[0]), str(r[1]))
+                for r in self.query(f"describe select * from {self.qualify(table)}")  # noqa: S608
+            ]
+            if live != listed:
+                self._notes.append(
+                    f"view {table}: the catalog lists its columns as "
+                    f"{[f'{n} {t}' for n, t in listed]}, but the view returns "
+                    f"{[f'{n} {t}' for n, t in live]} (a base table was altered "
+                    "after the view was created); compared as the view returns them"
+                )
+                rows = live
+        return [Column(r[0], map_type(r[1]), r[1]) for r in rows]
+
+    def count_distinct_key(self, key: KeySpec, identity: str) -> str:
+        r"""Count distinct key texts by their bytes.
+
+        From DuckDB 2.0 `count(distinct ...)` of the key text follows the key
+        column's collation (NOCASE, NOACCENT, NFC, ICU) or a
+        `default_collation`, so a unique key holding 'a' and 'A' was refused
+        as not unique (RT-HD14; CLAUDE.md 4.11). `encode` is the text's UTF-8
+        bytes as a BLOB, which no collation applies to (a cast to BLOB would
+        read `\x41` escapes). An integer key carries no collation.
+        """
+        if not key.hashed:
+            return super().count_distinct_key(key, identity)
+        return f"count(distinct encode({identity}))"
+
     # ----------------------------------------------------------- rendering
 
     def normalize(self, column: Column) -> str:
         """Render one column as canonical text, null-safe.
 
         The contract: two rows are equal if and only if this text is
-        byte-identical to the other engine's. Every branch ends up inside the
-        `coalesce` at the bottom, so a NULL always becomes the sentinel.
+        byte-identical to the other engine's. Every rule ends up inside this
+        `coalesce`, so a NULL always becomes the sentinel.
         """
-        c = self.quote(column.name)
+        expr = self._render(column, self.quote(column.name))
+        return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _render(self, column: Column, c: str) -> str:
+        """`column`'s rule applied to the SQL expression `c`; NULL for NULL.
+
+        `normalize` applies it to the column itself, the nested rules
+        (`_nested`) to a struct field, a map entry or a union member.
+        """
         t = column.logical_type
         if t is LogicalType.INTEGER:
             expr = f"cast({c} as varchar)"
@@ -333,13 +636,14 @@ class DuckDBDialect(Dialect):
         elif t is LogicalType.LIST:
             # `canonical_list_text`: each element by its own rule, bound to
             # the comprehension variable (which shadows a column of that
-            # name), followed by the terminator, joined. An empty list joins
-            # to '', so `[]`. The varchar cast printed `[a, b]` - the same
-            # text as the one string 'a, b' in a list, a false match.
+            # name), followed by the terminator, joined. The varchar cast
+            # printed `[a, b]` - the same text as the one string 'a, b' in a
+            # list, a false match. A fixed-size ARRAY (`VARCHAR[2]`) is a list
+            # here too: the comprehension reads it as one.
             element = self.list_element_text(column)
             var = self.quote(self.LIST_ELEMENT_NAME)
             each = f"[{element} || {self.list_terminator_sql()} for {var} in {c}]"
-            expr = f"case when {c} is not null then '[' || array_to_string({each}, '') || ']' end"
+            expr = f"case when {c} is not null then '[' || {self._joined(each)} || ']' end"
         elif t is LogicalType.BINARY:
             # The varchar cast prints printable bytes as themselves and the
             # rest as `\xFF`, so b'abc' rendered exactly like the text 'abc'.
@@ -359,6 +663,15 @@ class DuckDBDialect(Dialect):
                 f"{self.spell_sql(chr(92) + '1')}, 'g')"
             )
             expr = self.escape_text(self.json_compact_layout(stripped))
+        elif _needs_nested_rule(parse_duckdb_type(column.raw_type), top=True):
+            # A STRUCT, MAP, UNION or list holding something the varchar (or
+            # JSON) cast renders lossily - a UNION's tag inside a STRUCT
+            # (RT-HD7), a TIMETZ offset's seconds before DuckDB 2.0 (RT-HD6),
+            # a fixed-size ARRAY's unquoted strings before 2.0 (RT-HD5):
+            # rendered part by part, each scalar by its own rule (`_nested`).
+            # Every other nested type keeps the varchar cast it always had,
+            # so its checksum does not move.
+            expr = self._nested(c, parse_duckdb_type(column.raw_type), 0)
         elif column.raw_type.upper().startswith("UNION("):
             # A plain varchar cast prints the member value and drops its tag,
             # so UNION(n int, s varchar) rendered 1::int and '1' alike - a
@@ -366,19 +679,101 @@ class DuckDBDialect(Dialect):
             # `{"s":"1"}`, the tag as a quoted key and a string in quotes.
             expr = f"cast(cast({c} as json) as varchar)"
         elif column.raw_type.upper() == "VARIANT":
-            # The same tag loss: a VARIANT INTEGER 1 and VARCHAR '1' both cast
-            # to `1`. `variant_typeof` names the stored type and JSON keeps a
-            # string's quotes (a DATE and the VARCHAR spelling it print the
-            # same JSON, which the type name tells apart).
-            expr = (
-                f"case when {c} is not null then "
-                f"variant_typeof({c}) || ':' || cast(cast({c} as json) as varchar) end"
-            )
+            expr = self._variant(c)
         else:
             # STRING, and every unmapped type (structs, maps, nested lists,
             # ...) through its varchar cast: arbitrary text, so escaped.
             expr = self.escape_text(f"cast({c} as varchar)")
-        return f"coalesce({expr}, {self.null_sentinel_sql()})"
+        return expr
+
+    # ------------------------------------------------------ nested values
+
+    @staticmethod
+    def _joined(each: str) -> str:
+        """`array_to_string(each, '')`, never NULL for a list.
+
+        DuckDB 1.3 and 1.4 return NULL for an empty list, not '' as 1.5 does,
+        so every empty list rendered as the NULL sentinel - `[]` against
+        NULL compared identical (RT-HD11). `each` is never NULL where this
+        is used (the caller tests the list first), so the coalesce changes
+        nothing else, and nothing at all from 1.5.
+        """
+        return f"coalesce(array_to_string({each}, ''), '')"
+
+    def _text_sql(self, text: str) -> str:
+        """`text` as SQL with every backslash from its code point (RT-D1)."""
+        return " || '''' || ".join(self.spell_sql(piece) for piece in text.split("'"))
+
+    def _variant(self, c: str) -> str:
+        """A VARIANT: its stored type's name, `:`, then its value.
+
+        A VARIANT INTEGER 1 and VARCHAR '1' both cast to `1`; `variant_typeof`
+        names the stored type and JSON keeps a string's quotes (a DATE and the
+        VARCHAR spelling it print the same JSON, which the type name tells
+        apart). A TIMETZ's JSON is its varchar cast, which drops an offset's
+        seconds before DuckDB 2.0 (RT-HD6), so it renders by the TIMETZ rule.
+        """
+        typ = f"variant_typeof({c})"
+        timetz = self._render(Column("", LogicalType.TIMETZ, "TIMETZ"), f"cast({c} as timetz)")
+        return (
+            f"case when {c} is not null then {typ} || ':' || "
+            f"case when {typ} = 'TIME_MICROS_TZ' then {timetz} "
+            f"else cast(cast({c} as json) as varchar) end end"
+        )
+
+    def _part(self, expr: str, t: DuckType, depth: int) -> str:
+        """`_nested`, null-safe: a NULL part renders as the sentinel."""
+        return f"coalesce({self._nested(expr, t, depth)}, {self.null_sentinel_sql()})"
+
+    def _nested(self, expr: str, t: DuckType, depth: int) -> str:
+        r"""A nested value's canonical text, part by part; NULL for NULL.
+
+        - list or ARRAY: `canonical_list_text` - `[` + each element by its
+          own rule + `\,` ... + `]`;
+        - STRUCT: `{` + per field, in declared order, the name escaped as
+          text, `\=`, the value by its rule, `\,` + `}` - the layout of
+          `canonical_struct_text` (BigQuery's STRUCT rule, RT-HB2);
+        - MAP: its entries in stored order (order is part of a DuckDB MAP:
+          `map {'a': 1, 'b': 2} = map {'b': 2, 'a': 1}` is false), as the
+          list of `{key\=..\,value\=..\,}` structs `map_entries` returns;
+        - UNION: `<` + the tag escaped + `\=` + the member by its rule + `>`;
+        - a scalar by its own rule, a TIMESTAMP_NS with every digit it holds.
+
+        Every scalar text is escaped or from an alphabet with no backslash,
+        names are escaped, so no part can forge a mark, and a NULL part is
+        the sentinel while a NULL whole is NULL: `{'a': NULL}` is `{a\=\N\,}`,
+        never NULL. Compared only against DuckDB's own rendering of a nested
+        type (no other engine's nested type maps to the same text).
+        """
+        mark = self.list_dims_mark_sql()
+        term = self.list_terminator_sql()
+        if t.kind == "scalar":
+            column = Column(f"__parity_e{depth}", map_type(t.raw), t.raw, sub_micro=True)
+            if t.raw.upper() == "VARIANT":
+                return self._variant(expr)
+            return self._render(column, expr)
+        if t.kind == "list":
+            var = self.quote(f"__parity_e{depth}")
+            each = f"[{self._part(var, t.fields[0][1], depth + 1)} || {term} for {var} in {expr}]"
+            return f"case when {expr} is not null then '[' || {self._joined(each)} || ']' end"
+        if t.kind == "map":
+            entries = DuckType("list", "", (("", DuckType("struct", "", t.fields)),))
+            return self._nested(f"map_entries({expr})", entries, depth)
+        if t.kind == "struct":
+            body = " || ".join(
+                f"{self._text_sql(escape_canonical_text(name))} || {mark} || "
+                f"{self._part(f'struct_extract({expr}, {sql_literal(name)})', ft, depth + 1)} || {term}"
+                for name, ft in t.fields
+            )
+            return f"case when {expr} is not null then '{{' || {body} || '}}' end"
+        # union
+        arms = " ".join(
+            f"when {sql_literal(name)} then '<' || {self._text_sql(escape_canonical_text(name))} "
+            f"|| {mark} || {self._part(f'union_extract({expr}, {sql_literal(name)})', ft, depth + 1)} "
+            "|| '>'"
+            for name, ft in t.fields
+        )
+        return f"case cast(union_tag({expr}) as varchar) {arms} end"
 
     def holds_sub_micro(self, column: Column) -> bool:
         """TIMESTAMP_NS holds nanoseconds."""
@@ -387,18 +782,20 @@ class DuckDBDialect(Dialect):
         )
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
-        """A TIMESTAMP_NS compared against a microsecond engine is truncated."""
+        """A TIMESTAMP_NS compared against a microsecond engine is truncated;
+        a view whose catalog entry is stale is compared as it returns rows."""
+        notes = list(getattr(self, "_notes", []))
         fine = sorted(
             c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
         )
         if not fine:
-            return []
+            return notes
         note = (
             f"columns {fine} hold nanoseconds and the other side microseconds "
             "only; they are compared at microseconds (the digits past the sixth "
             "are dropped), so a difference below one microsecond is not seen"
         )
-        return [note]
+        return [*notes, note]
 
     def single_precision(self, column: Column) -> bool:
         """DuckDB's FLOAT is float4 (REAL and FLOAT4 are its aliases)."""

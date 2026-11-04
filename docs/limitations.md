@@ -148,6 +148,8 @@ hex), JSON (the engine's normalised document), and:
   decimals, floats, booleans, text, dates, timestamps, times, binary, bit
   strings, intervals, timetz or inet, element by element by each element's
   rule (`[]`, `['']`, `[NULL]` and `['a,b']` against `['a','b']` all differ).
+  A DuckDB fixed-size ARRAY (`VARCHAR[2]`) is a list; a `TIMESTAMP_NS` list
+  or array is refused (it could not carry the nanosecond caveat).
   A PostgreSQL array's dimensions and lower bounds are part of its value (a
   2x2 array is not its four elements). A list cannot be a key;
 - **inet/cidr** (PostgreSQL) as `address/prefix`: `10.0.0.1/32` is not
@@ -161,7 +163,13 @@ listed as not covered by the sample check: two engines may render it
 differently for reasons that have nothing to do with the data, and no risk
 figure covers it. DuckDB `UNION`/`VARIANT` and Snowflake `VARIANT` keep their
 type tag, so `1` and `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds
-when it has any.
+when it has any. A DuckDB STRUCT, MAP, UNION or list that holds a UNION,
+TIMETZ, VARIANT or fixed-size ARRAY is rendered part by part, each scalar by
+its rule (DuckDB's own text drops a nested UNION's tag, and before 2.0 a
+TIMETZ offset's seconds and an ARRAY's string quotes); other nested types are
+DuckDB's text. Still compared only DuckDB against DuckDB. Known gap: a
+VARIANT whose value is a STRUCT or list holding a TIMETZ still loses the
+offset's seconds before DuckDB 2.0 - use DuckDB 2.0 for such data.
 
 **JSON across two engines** is exact only where the engines' normal forms
 coincide (PostgreSQL `jsonb`, MySQL's binary JSON, BigQuery and Snowflake by

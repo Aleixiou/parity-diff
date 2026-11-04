@@ -717,7 +717,23 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   text as `varbinary` UTF-8 bytes; `sql_variant` renders `<BaseType>:<exact>`;
   the SELECT guard accepts one plain SELECT only.
 - **DuckDB:** extension autoinstall/autoload are off (no network, §6);
-  HUGEINT key spans past 2^127 bucket exactly in UHUGEINT.
+  HUGEINT key spans past 2^127 bucket exactly in UHUGEINT. Round H
+  (verified on 1.3.0-2.0.0): a file is refused unless its header carries
+  `DUCK` at byte 8 (`duckdb.connect` would otherwise download
+  sqlite_scanner for a SQLite file, before any pin); a file defining a macro
+  or type named like *any* built-in is refused (stored macros win over
+  built-ins, read-only or not - `md5` as a macro made every row hash alike);
+  tables are `"catalog"."schema"."table"` and the column lookup is
+  `system.information_schema` filtered by catalog; a view is DESCRIBEd live
+  (its catalog entry is stale after an ALTER of its base table); key
+  uniqueness counts `encode(text)` (2.0 applies collations to `count
+  distinct`); `array_to_string([])` is NULL on 1.3-1.4, so lists coalesce
+  it to `''`; a fixed-size ARRAY `T[n]` is a LIST; a STRUCT/MAP/UNION/list
+  holding a UNION, TIMETZ, VARIANT or ARRAY renders part by part
+  (`DuckDBDialect._nested`: struct `{name\=v\,}`, map as entry structs in
+  stored order, union `<tag\=v>`), every other nested type keeps its
+  varchar cast so its checksum did not move; MotherDuck URLs are refused
+  and `?query` parts are cut from path errors.
 - **Snowflake changes are verified live** (2026-11-03, `tests/test_snowflake.py`):
   UTC rendering of `TIMESTAMP_TZ`/`LTZ`, `tz_aware`, the FF6 caveat, FF9 keys,
   exact DECIMAL keys, `VARIANT` type tag, schema-qualified tables, the exact
