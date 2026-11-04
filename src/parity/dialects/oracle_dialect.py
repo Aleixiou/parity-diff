@@ -65,8 +65,6 @@ from parity.dialects.base import (
     Dialect,
     float_key_refusal,
     float_range_where,
-    float_tiny_sql,
-    float_zero_text,
     sql_literal,
 )
 from parity.types import Column, KeySpec, LogicalType
@@ -77,7 +75,7 @@ VARCHAR_LIMIT = 4000
 
 #: The first 15 hex digits of md5(''), as an integer: what an empty row text
 #: hashes to. Oracle's empty text is NULL, and `STANDARD_HASH(NULL)` is NULL.
-EMPTY_HASH = int(hashlib.md5(b"").hexdigest()[:HASH_HEX_CHARS], 16)
+EMPTY_HASH = int(hashlib.md5(b"", usedforsecurity=False).hexdigest()[:HASH_HEX_CHARS], 16)
 
 #: Numbers print with a period and no group separator, whatever the session.
 NLS_NUMBERS = "'NLS_NUMERIC_CHARACTERS=''.,'''"
@@ -333,10 +331,82 @@ begin
 end;
 """
 
+#: The canonical text of a BINARY_DOUBLE (`canonical_float_text`), as an
+#: inline function. The same construction written as one SQL expression
+#: repeats the exact value hundreds of times - 171 kB per column, and a
+#: 500-column checksum query Oracle spent minutes parsing - so it lives here,
+#: where every intermediate is a variable. See `OracleDialect._float_text`.
+PARITY_FLOAT = f"""function parity_float(x binary_double, s pls_integer, col varchar2) return varchar2 is
+  ax binary_double; e number; m number; d number; e10 number;
+  sh number; r number; frac varchar2(40); zero varchar2(41);
+  function cand(n pls_integer, ties boolean) return number is
+    k number := n - 1 - e10; rr number := round(d, k); tt number;
+  begin
+    if not ties then return rr; end if;
+    tt := trunc(d, k);
+    if 2 * d = tt + rr and rr <> tt and mod(tt * power(10, k), 2) = 0 then return tt; end if;
+    return rr;
+  end;
+begin
+  if x is null then return null; end if;
+  if x is nan then return 'NaN'; end if;
+  if x = binary_double_infinity then return 'Infinity'; end if;
+  if x = -binary_double_infinity then return '-Infinity'; end if;
+  if s > 0 then frac := '.' || rpad('0', s, '0'); end if;
+  zero := '0' || frac;
+  ax := abs(x);
+  if ax < to_binary_double(power(10, -(s + 1))) then return zero; end if;
+  e := floor(ln(ax) / ln(2d));
+  if ax >= power(2d, to_binary_double(e + 1)) then e := e + 1;
+  elsif ax < power(2d, to_binary_double(e)) then e := e - 1; end if;
+  m := to_number(ax * power(2d, to_binary_double(52 - e)));
+  if ax < to_binary_double(9007199254740992) then
+    d := m / power(2, 52 - e);
+    e10 := floor(log(10, d));
+    if d >= power(10, e10 + 1) then e10 := e10 + 1;
+    elsif d < power(10, e10) then e10 := e10 - 1; end if;
+    sh := cand(15, false);
+    if to_binary_double(sh) <> ax then
+      sh := cand(16, true);
+      if to_binary_double(sh) <> ax then sh := cand(17, true); end if;
+    end if;
+    r := round(sh, s);
+    if r = 0 then return zero; end if;
+    return case when x < 0 then '-' end || to_char(r, 'FM9999999999999999990' || frac);
+  elsif ax < to_binary_double({FLOAT_MAX_MAGNITUDE_SQL}) then
+    return case when x < 0 then '-' end
+      || to_char(m * power(2, e - 52), 'FM' || rpad('9', 35, '9') || '0') || frac;
+  end if;
+  raise_application_error(-20001, '{FLOAT_OUT_OF_RANGE_MESSAGE}' || to_char(x) || col);
+end;
+"""
+
+#: `round(c, s)` as plain text with exactly `s` places - the DECIMAL rule.
+PARITY_DEC = f"""function parity_dec(c number, s pls_integer, col varchar2) return varchar2 is
+  t varchar2(200);
+begin
+  if c is null then return null; end if;
+  if abs(c) >= 1e38 then
+    raise_application_error(-20001, 'parity: DECIMAL value '
+      || to_char(c, 'TM9', {NLS_NUMBERS}) || ' is too large to compare (10^38 or more)' || col);
+  end if;
+  t := to_char(round(c, s), 'TM9', {NLS_NUMBERS});
+  if substr(t, 1, 1) = '.' then t := '0' || t;
+  elsif substr(t, 1, 2) = '-.' then t := '-0' || substr(t, 2); end if;
+  if s > 0 then
+    if instr(t, '.') = 0 then t := t || '.' || rpad('0', s, '0');
+    else t := rpad(t, instr(t, '.') + s, '0'); end if;
+  end if;
+  return t;
+end;
+"""
+
 _FUNCTIONS = {
     "parity_md5(": PARITY_MD5,
     "parity_refuse(": PARITY_REFUSE,
     "parity_blob_hex(": PARITY_BLOB_HEX,
+    "parity_float(": PARITY_FLOAT,
+    "parity_dec(": PARITY_DEC,
 }
 
 
@@ -421,6 +491,10 @@ class OracleDialect(Dialect):
         #: Tables carrying an enabled VPD policy, found by `columns`.
         self._policies: set[str] = set()
         self.version = ""
+        #: Whether this login may call DBMS_CRYPTO.HASH, found at connect.
+        #: Then long rows are hashed by it, natively; otherwise by
+        #: `parity_md5`. Both are MD5 of the row's UTF-8 bytes.
+        self.crypto = False
 
     # ---------------------------------------------------------------- setup
 
@@ -453,6 +527,18 @@ class OracleDialect(Dialect):
             charset = str(cur.fetchone()[0])
             cur.execute("select sys_context('userenv', 'current_schema') from dual")
             self.default_schema = str(cur.fetchone()[0])
+            try:
+                # 2 is DBMS_CRYPTO.HASH_MD5. A reader without EXECUTE on it
+                # gets ORA-00904 here, which leaves the session usable.
+                cur.execute(
+                    "select rawtohex(dbms_crypto.hash(to_clob('abc'), 2)) from dual"
+                )
+                self.crypto = (
+                    str(cur.fetchone()[0]).lower()
+                    == hashlib.md5(b"abc", usedforsecurity=False).hexdigest()
+                )
+            except Exception:  # noqa: BLE001 - absent is the expected case
+                self.crypto = False
             # The snapshot: a READ ONLY transaction reads the database as of
             # its first statement, for every query that follows, and refuses
             # any write. It has to be the first statement of the transaction,
@@ -470,9 +556,16 @@ class OracleDialect(Dialect):
             )
 
     def close(self) -> None:
-        """End the transaction by rolling back - never committing - and close."""
+        """End the transaction by rolling back - never committing - and close.
+
+        After `cancel` the rollback itself can report the cancelled call
+        (ORA-01013); nothing was ever written, so that is not worth raising
+        over the error that caused the cancel.
+        """
         try:
             self._conn.rollback()
+        except Exception:  # noqa: BLE001, S110 - see the docstring
+            pass
         finally:
             self._conn.close()
 
@@ -492,6 +585,19 @@ class OracleDialect(Dialect):
             cur.execute(text)
             return [tuple(row) for row in cur.fetchall()]
         except Exception as exc:
+            if "ORA-01466" in str(exc):
+                # A READ ONLY transaction cannot read a table whose definition
+                # (creation, ALTER, TRUNCATE, partition maintenance, even the
+                # first insert into a table created without a segment) is
+                # newer than its snapshot, by a coarse clock (verified: a
+                # dialect opened at once after create + insert always fails,
+                # 1.1 s later sometimes, 1.6 s or more later never).
+                raise self._err(
+                    "the table's definition changed after this diff's snapshot "
+                    "began (ORA-01466): it was created, altered or truncated "
+                    "during the diff or within a few seconds before it. "
+                    "Run the diff again"
+                ) from exc
             found = _REFUSAL.search(str(exc))
             if found is None:
                 raise
@@ -522,7 +628,7 @@ class OracleDialect(Dialect):
             )
             if policies and int(policies[0][0]) > 0:
                 self._policies.add(f"{schema}.{name}")
-        except Exception:  # noqa: BLE001 - a caveat probe must never stop the diff
+        except Exception:  # noqa: BLE001, S110 - a caveat probe must never stop the diff
             pass
         return [_column(str(r[0]), str(r[1]), r[2], r[3]) for r in rows]
 
@@ -572,7 +678,9 @@ class OracleDialect(Dialect):
                 "''. That is a real difference on the target, but it may be "
                 "how the migration chose to carry Oracle's NULLs"
             )
-        fine = sorted(c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro)
+        fine = sorted(
+            c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
+        )
         fine += sorted(
             c.name
             for c in columns
@@ -610,8 +718,12 @@ class OracleDialect(Dialect):
     def escape_text(self, expr: str) -> str:
         """The shared escape, under the binary collation whatever the column's
         own: a linguistic collation (MAX_STRING_SIZE=EXTENDED databases can
-        declare one per column) may treat chr(31) as ignorable."""
-        return super().escape_text(f"({expr} collate binary)")
+        declare one per column) may treat chr(31) as ignorable. The result is
+        handed back under USING_NLS_COMP (BINARY, pinned): text carrying an
+        explicit collation cannot be appended to a CLOB (ORA-43912), which
+        the long-row hash path does."""
+        escaped = super().escape_text(f"({expr} collate binary)")
+        return f"({escaped} collate using_nls_comp)"
 
     def _escape_lob(self, expr: str) -> str:
         """The shared escape on a CLOB, which takes no COLLATE clause (ORA-00932)
@@ -635,13 +747,23 @@ class OracleDialect(Dialect):
         For VARCHAR2 text of at most 4,000 bytes; NULL text is the empty text.
         Rows that may be longer go through `hash_parts`.
         """
-        hexed = f"substr(rawtohex(standard_hash({text_expr}, 'MD5')), 1, {HASH_HEX_CHARS})"
+        hexed = (
+            f"substr(rawtohex(standard_hash({text_expr}, 'MD5')), 1, {HASH_HEX_CHARS})"
+        )
         return f"nvl(to_number({hexed}, '{'X' * HASH_HEX_CHARS}'), {EMPTY_HASH})"
 
     def _clob_hash(self, clob_expr: str) -> str:
-        """The same 60 bits, from `parity_md5` of a CLOB."""
-        hexed = f"substr(parity_md5({clob_expr}), 1, {HASH_HEX_CHARS})"
-        return f"to_number({hexed}, '{'X' * HASH_HEX_CHARS}')"
+        """The same 60 bits, of a CLOB: by DBMS_CRYPTO.HASH where the login may
+        call it (it hashes a CLOB as AL32UTF8, natively - verified equal to
+        `parity_md5`), else by `parity_md5`, about 0.5 MB/s."""
+        if self.crypto:
+            digest = f"rawtohex(dbms_crypto.hash({clob_expr}, 2))"
+        else:
+            digest = f"parity_md5({clob_expr})"
+        hexed = f"substr({digest}, 1, {HASH_HEX_CHARS})"
+        # An all-empty row text is a NULL CLOB, whose DBMS_CRYPTO hash is
+        # NULL - and a NULL would drop the row out of the sum.
+        return f"nvl(to_number({hexed}, '{'X' * HASH_HEX_CHARS}'), {EMPTY_HASH})"
 
     def hash_parts(self, parts: list[str]) -> str:
         """Hash a row: STANDARD_HASH when it fits a VARCHAR2, else `parity_md5`.
@@ -652,8 +774,17 @@ class OracleDialect(Dialect):
         down the CLOB path, which is slower and exact.
         """
         infos = [self._parts.get(p, (None, True)) for p in parts]
-        short = self._concat([f"to_char({p})" if lob else p for p, (_, lob) in zip(parts, infos, strict=True)])
-        long = self._concat([f"to_clob({parts[0]})", *parts[1:]]) if len(parts) > 1 else f"to_clob({parts[0]})"
+        short = self._concat(
+            [
+                f"to_char({p})" if lob else p
+                for p, (_, lob) in zip(parts, infos, strict=True)
+            ]
+        )
+        long = (
+            self._concat([f"to_clob({parts[0]})", *parts[1:]])
+            if len(parts) > 1
+            else f"to_clob({parts[0]})"
+        )
         bounds = [b for b, _ in infos]
         if any(b is None for b in bounds):
             return self._clob_hash(long)
@@ -701,7 +832,9 @@ class OracleDialect(Dialect):
         r"""`\N`, the backslash from its code point."""
         return "(chr(92) || 'N')"
 
-    def _part(self, column: Column, expr: str, bound: str | None, lob: bool = False) -> str:
+    def _part(
+        self, column: Column, expr: str, bound: str | None, lob: bool = False
+    ) -> str:
         """Wrap a rendering in the NULL test and record its length bound.
 
         The sentinel is chosen by the *column* being NULL. The rendered text
@@ -739,7 +872,9 @@ class OracleDialect(Dialect):
         t = column.logical_type
         base = _base(column.raw_type)
         if t is LogicalType.INTEGER:
-            return self._part(column, f"to_char({c}, 'TM9', {NLS_NUMBERS})", "130")
+            return self._part(
+                column, f"to_char({c}, 'TM9', {NLS_NUMBERS})", str(_integer_width(column))
+            )
         if t is LogicalType.DECIMAL:
             s = self.float_scale
             if s > 38:
@@ -747,17 +882,21 @@ class OracleDialect(Dialect):
                     f"DECIMAL column {column.name!r} cannot be compared at "
                     f"float_scale {s} on Oracle; the maximum is 38"
                 )
-            return self._part(column, self._decimal_text(c, s, column), str(45 + s))
+            return self._part(
+                column, self._decimal_text(c, s, column), str(_decimal_width(column) + s)
+            )
         if t is LogicalType.FLOAT:
             s = self.float_scale_for(column)
             x = f"cast({c} as binary_double)" if base == "BINARY_FLOAT" else c
-            return self._part(column, self._float_text(x, s, column), str(60 + s))
+            # Sign, at most 35 integer digits (below 2^116), point, places.
+            return self._part(column, self._float_text(x, s, column), str(37 + s))
         if t is LogicalType.BOOLEAN:
             return self._part(
                 column, f"case when {c} then 'true' when not {c} then 'false' end", "5"
             )
         if t is LogicalType.TIMESTAMP:
-            return self._part(column, self._timestamp_text(c, column), "40")
+            # `-4712-01-01 00:00:00.123456789` is 30 characters.
+            return self._part(column, self._timestamp_text(c, column), "30")
         if t is LogicalType.STRING:
             return self._string_part(column, c, base)
         if t is LogicalType.BINARY:
@@ -772,7 +911,7 @@ class OracleDialect(Dialect):
                 bound = f"(3 + 2 * nvl(utl_raw.length({c}), 0))"
             return self._part(column, expr, bound, lob=True)
         if t is LogicalType.INTERVAL:
-            return self._part(column, self._interval_text(c, base), "80")
+            return self._part(column, self._interval_text(c, base), "60")
         return self._unknown_part(column, c, base)
 
     def _string_part(self, column: Column, c: str, base: str) -> str:
@@ -824,31 +963,18 @@ class OracleDialect(Dialect):
         )
 
     def _decimal_text(self, c: str, s: int, column: Column) -> str:
-        """`round(c, s)` as plain text with exactly `s` places.
+        """`round(c, s)` as plain text with exactly `s` places (`parity_dec`).
 
         ROUND on NUMBER is half away from zero. TM9 prints the minimal plain
         form (`.5`, `-.125`, `42`), so the leading zero is restored and the
         fraction padded. Past 10^38 TM9 could switch to exponent notation,
         and no other engine holds such a value exactly, so it is refused.
         """
-        r = f"round({c}, {s})"
-        tm = f"to_char({r}, 'TM9', {NLS_NUMBERS})"
-        fixed = (
-            f"(case when substr({tm}, 1, 1) = '.' then '0' || {tm} "
-            f"when substr({tm}, 1, 2) = '-.' then '-0' || substr({tm}, 2) else {tm} end)"
-        )
-        if s:
-            zeros = "0" * s
-            fixed = (
-                f"(case when instr({fixed}, '.') = 0 then {fixed} || '.{zeros}' "
-                f"else rpad({fixed}, instr({fixed}, '.') + {s}, '0') end)"
-            )
-        where = float_range_where(column).replace("'", "''")
-        return (
-            f"case when abs({c}) >= 1e38 then parity_refuse('parity: DECIMAL value ' "
-            f"|| to_char({c}, 'TM9', {NLS_NUMBERS}) || ' is too large to compare "
-            f"(10^38 or more){where}') else {fixed} end"
-        )
+        return f"parity_dec({c}, {s}, {self._where(column)})"
+
+    def _where(self, column: Column) -> str:
+        """`float_range_where` as an Oracle string literal."""
+        return sql_literal(float_range_where(column))
 
     def decimal_key_text(self, c: str, column: Column) -> str:
         """A DECIMAL key's exact minimal text: TM9 is exact and minimal, once
@@ -885,7 +1011,7 @@ class OracleDialect(Dialect):
             return self._part(column, hexed, f"(3 + 2 * nvl(utl_raw.length({c}), 0))")
         if column.logical_type is LogicalType.TIMESTAMP and self.holds_sub_micro(column):
             nine = dataclasses.replace(column, sub_micro=True)
-            return self._part(column, self._timestamp_text(c, nine), "40")
+            return self._part(column, self._timestamp_text(c, nine), "30")
         return self.normalize(column)
 
     def _timestamp_text(self, c: str, column: Column) -> str:
@@ -962,73 +1088,26 @@ class OracleDialect(Dialect):
         """The canonical text of a BINARY_DOUBLE (`canonical_float_text`).
 
         Oracle prints no shortest repr, and `cast(x as number)` keeps only 17
-        significant digits. The exact value is rebuilt instead: with e the
-        binary exponent (from LN, then corrected by exact power-of-two
-        comparisons), `m = |x| * 2^(52 - e)` is an integer below 2^53 - exact
-        in BINARY_DOUBLE, and exact as NUMBER - and `m / 2^(52 - e)` in NUMBER
-        is the exact value to 38-40 significant digits (2^s is exact in NUMBER
-        up to s = 130, verified). On that, the shortest repr is the first of
-        the 15-, 16- and 17-digit roundings that converts back to the same
-        double (NUMBER -> BINARY_DOUBLE is correctly rounded), ties to even
-        built by hand at 16 and 17 digits as on SQL Server, since ROUND is
-        half away from zero. Then ROUND to the scale.
+        significant digits. The exact value is rebuilt instead (`parity_float`):
+        with e the binary exponent (from LN, then corrected by exact
+        power-of-two comparisons), `m = |x| * 2^(52 - e)` is an integer below
+        2^53 - exact in BINARY_DOUBLE, and exact as NUMBER - and
+        `m / 2^(52 - e)` in NUMBER is the exact value to 38-40 significant
+        digits (2^s is exact in NUMBER up to s = 130, verified). On that, the
+        shortest repr is the first of the 15-, 16- and 17-digit roundings that
+        converts back to the same double (NUMBER -> BINARY_DOUBLE is correctly
+        rounded, verified on 3,000 random decimals), ties to even built by hand
+        at 16 and 17 digits as on SQL Server, since ROUND is half away from
+        zero. Then ROUND to the scale.
 
-        The exponent must be NUMBER: a BINARY_DOUBLE operand anywhere makes
-        the whole expression BINARY_DOUBLE, and then every step above runs in
-        double precision (the first draft did, and disagreed on 593 values).
+        The exponent must stay NUMBER: a BINARY_DOUBLE operand anywhere makes
+        the whole expression BINARY_DOUBLE, and then every step runs in double
+        precision (the first draft did, and disagreed on 593 sample values).
         From 2^53 every double is an integer, `m * 2^(e - 52)` exactly, up to
         2^116; past that it is refused with the value and the column.
+        Infinity and NaN, which BINARY_DOUBLE holds, render as the tokens.
         """
-        ax = f"abs({x})"
-        e0 = f"cast(floor(ln({ax}) / ln(2d)) as number)"
-        e = (
-            f"({e0} + case when {ax} >= power(2d, {e0} + 1) then 1 "
-            f"when {ax} < power(2d, {e0}) then -1 else 0 end)"
-        )
-        m = f"cast({ax} * power(2d, 52 - {e}) as number)"
-        d = f"({m} / power(2, 52 - {e}))"
-        l10 = f"floor(log(10, {d}))"
-        e10 = (
-            f"({l10} + case when {d} >= power(10, {l10} + 1) then 1 "
-            f"when {d} < power(10, {l10}) then -1 else 0 end)"
-        )
-
-        def candidate(n: int, ties: bool) -> str:
-            """The n-significant-digit rounding of d, ties to even if `ties`."""
-            k = f"({n - 1} - {e10})"
-            r = f"round({d}, {k})"
-            if not ties:
-                return r
-            t = f"trunc({d}, {k})"
-            return (
-                f"(case when 2 * {d} = {t} + {r} and {r} <> {t} "
-                f"and mod({t} * power(10, {k}), 2) = 0 then {t} else {r} end)"
-            )
-
-        c15, c16, c17 = candidate(15, False), candidate(16, True), candidate(17, True)
-        short = (
-            f"(case when cast({c15} as binary_double) = {ax} then {c15} "
-            f"when cast({c16} as binary_double) = {ax} then {c16} else {c17} end)"
-        )
-        frac = "." + "0" * s if s else ""
-        zero = float_zero_text(s)
-        sign = f"case when {x} < 0 then '-' end"
-        rounded = f"round({short}, {s})"
-        big = f"({m} * power(2, {e} - 52))"
-        where = float_range_where(column).replace("'", "''")
-        return (
-            f"case when {x} is nan then 'NaN' "
-            f"when {x} = binary_double_infinity then 'Infinity' "
-            f"when {x} = -binary_double_infinity then '-Infinity' "
-            f"when {ax} < {float_tiny_sql(s)} then '{zero}' "
-            f"when {ax} < 9007199254740992 then "
-            f"case when {rounded} = 0 then '{zero}' else "
-            f"{sign} || to_char({rounded}, 'FM{'9' * 16}0{frac}') end "
-            f"when {ax} < {FLOAT_MAX_MAGNITUDE_SQL} then "
-            f"{sign} || to_char({big}, 'FM{'9' * 35}0') || '{frac}' "
-            f"else parity_refuse('{FLOAT_OUT_OF_RANGE_MESSAGE}' || to_char({x}) "
-            f"|| '{where}') end"
-        )
+        return f"parity_float({x}, {s}, {self._where(column)})"
 
     # ------------------------------------------------- downloads and samples
 
@@ -1074,7 +1153,9 @@ class OracleDialect(Dialect):
             import datetime as dt
 
             if isinstance(value, dt.timedelta):
-                total = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+                total = (
+                    value.days * 86_400 + value.seconds
+                ) * 1_000_000 + value.microseconds
                 days, micros = divmod(abs(total), 86_400_000_000)
                 sign = -1 if total < 0 else 1
                 return (0, sign * days, sign * micros)
@@ -1084,6 +1165,30 @@ class OracleDialect(Dialect):
                 return (int(years) * 12 + int(months), 0, 0)
             return value
         return value
+
+
+def _integer_width(column: Column) -> int:
+    """Most characters an integer NUMBER prints: its digits and a sign.
+
+    `NUMBER(p,0)` holds p digits; `NUMBER(p,-k)` p digits and k zeros;
+    `NUMBER(*,0)` (and INTEGER) 38. These bounds only choose the hash path
+    (`hash_parts`); one too small would raise ORA-01489, never truncate.
+    """
+    m = re.match(r"NUMBER\((\d+|\*),\s*(-?\d+)\)", column.raw_type.upper())
+    if not m or m.group(1) == "*":
+        return 40
+    return int(m.group(1)) + max(0, -int(m.group(2))) + 1
+
+
+def _decimal_width(column: Column) -> int:
+    """Most characters a decimal NUMBER prints before its fractional places:
+    sign, integer digits (p - s of them, at least one; 38 when undeclared,
+    as larger values are refused), one more for a rounding carry (9.99 at
+    scale 0 is 10) and the point."""
+    m = re.match(r"NUMBER\((\d+),\s*(\d+)\)", column.raw_type.upper())
+    if not m:
+        return 41
+    return max(int(m.group(1)) - int(m.group(2)), 1) + 3
 
 
 def _frac_digits(raw: str) -> int:

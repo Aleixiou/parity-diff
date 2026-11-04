@@ -5,6 +5,25 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Oracle is supported** (`oracle://user:password@host:1521/service_name`,
+  extra `[oracle]`: python-oracledb in thin mode, no Oracle client). Verified
+  live on Oracle Database 23ai Free and 21c XE: the hash constant, every row
+  of a 5,000-row mixed-type table byte-identical to DuckDB, the FLOAT form on
+  the adversarial sample plus 10,000 random doubles at scales 0, 2, 6, 9 and
+  20, every planted difference found exactly, and the conformance sweep (every
+  Oracle type against `parity.reference`). Oracle-specific decisions: rows
+  whose text may pass 4,000 bytes are hashed by an MD5 written in PL/SQL and
+  declared inside the query (`STANDARD_HASH` takes no CLOB and `DBMS_CRYPTO`
+  needs a grant a reader lacks), so the login needs only `CREATE SESSION` and
+  `SELECT`; `DATE` is a timestamp; Oracle's empty string is NULL, and every
+  run comparing text with an Oracle side says so; FLOAT is rebuilt from an
+  exact decomposition, since `cast(binary_double as number)` keeps 17
+  digits; every NLS setting that changes a rendering is pinned (verified
+  against a logon trigger setting all of them hostile); one `READ ONLY`
+  transaction is the snapshot (ORA-01466 for a table changed during the run
+  is reported naming the side). `LONG`, `XMLTYPE`, `VECTOR` and object
+  columns are refused; `JSON` and `ROWID` are not covered. Only non-AL32UTF8
+  databases are refused at connect.
 - **User documentation restructured** for someone who has never seen the
   tool. The README is now install, a five-minute first try on two DuckDB
   files (no server needed), use on real databases, reading the output, CI,

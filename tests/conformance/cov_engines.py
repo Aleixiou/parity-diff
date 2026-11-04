@@ -1262,7 +1262,14 @@ class OracleCov(CovEngine):
         self.tables: list[str] = []
 
     def natives(self) -> list[Native]:
-        """Every Oracle type `map_type_oracle` covers, plus UNKNOWN ones."""
+        """Every Oracle type `map_type_oracle` covers, plus UNKNOWN ones.
+
+        BOOLEAN and JSON columns exist from 23ai only."""
+        v23 = int(str(self.con.version).split(".")[0]) >= 23
+        return [n for n in self._natives() if v23 or n.ddl not in ("boolean", "json")]
+
+    def _natives(self) -> list[Native]:
+        """All of them, 23ai included."""
         return [
             Native("number(10)", "int", int_range(-(10**10) + 1, 10**10 - 1)),
             Native("number(19)", "int", int_range(-(10**19) + 1, 10**19 - 1)),
@@ -1315,7 +1322,11 @@ class OracleCov(CovEngine):
         if ddl == "binary_float":
             return OraBind(":v", x, oracledb.DB_TYPE_BINARY_FLOAT)
         if ddl in ("clob", "nclob"):
-            return OraBind(":v", x, oracledb.DB_TYPE_CLOB if ddl == "clob" else oracledb.DB_TYPE_NCLOB)
+            return OraBind(
+                ":v",
+                x,
+                oracledb.DB_TYPE_CLOB if ddl == "clob" else oracledb.DB_TYPE_NCLOB,
+            )
         if ddl == "blob":
             return OraBind(":v", x, oracledb.DB_TYPE_BLOB)
         if native.group == "date_ext":
@@ -1323,7 +1334,9 @@ class OracleCov(CovEngine):
         if native.group == "ts_ext":
             return OraBind("to_timestamp(:v, 'YYYY-MM-DD HH24:MI:SS BC')", x)
         if native.group == "date":
-            return OraBind("to_date(:v, 'YYYY-MM-DD')", f"{x.year:04d}-{x.month:02d}-{x.day:02d}")
+            return OraBind(
+                "to_date(:v, 'YYYY-MM-DD')", f"{x.year:04d}-{x.month:02d}-{x.day:02d}"
+            )
         if native.group == "ts_sub":
             return OraBind("to_timestamp(:v, 'YYYY-MM-DD HH24:MI:SS.FF9')", x)
         if native.group == "ts":
@@ -1354,7 +1367,7 @@ class OracleCov(CovEngine):
         cur = self.con.cursor()
         try:
             cur.execute(f'drop table "{table}" purge')
-        except Exception:
+        except Exception:  # noqa: S110 - it may not exist yet
             pass
         cols = ", ".join(
             f'"{n}" {"number(19)" if n == "id" else ddl}' for n, ddl in columns
@@ -1401,7 +1414,7 @@ class OracleCov(CovEngine):
         for t in self.tables:
             try:
                 cur.execute(f'drop table "{t}" purge')
-            except Exception:
+            except Exception:  # noqa: S110 - best-effort cleanup
                 pass
         cur.close()
         self.con.close()

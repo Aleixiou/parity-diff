@@ -120,6 +120,8 @@ escaped. A DBA can raise `max_allowed_packet`, or exclude the column.
 | `this MySQL server has no MD5() function, which every row hash needs. MySQL 9.7 moved it into an optional component: a DBA can add it with INSTALL COMPONENT 'file://component_classic_hashing'` | As it says. |
 | `this server has no UTF-8 collations (SQL Server 2019 or newer is required) …` | SQL Server 2017 and older are not supported. |
 | `unsupported SQL Server engine edition …: … Microsoft Fabric and Azure Synapse differ in isolation and are not supported yet.` | Not supported yet. |
+| `Oracle … is not supported: this dialect is verified on 21c and 23ai, and needs 19c or newer` | Upgrade, or diff a copy on a newer server. |
+| `database character set … is not supported: rows are hashed as the UTF-8 bytes every other engine hashes, which Oracle's VARCHAR2 holds only in an AL32UTF8 database` | Diff a copy in an AL32UTF8 database (the default since 12.2). |
 | `the server returned text that is not valid UTF-8 (…); is the database encoding SQL_ASCII?` | A PostgreSQL `SQL_ASCII` database stores bytes unchecked; text that is not UTF-8 cannot be compared with any other engine. |
 
 ## Connection errors
@@ -185,6 +187,10 @@ parity: --columns named columns present on only one side: ['extra']
 parity: --columns and --exclude both name: ['x']
 ```
 
+On Oracle, `column 'X' has type LONG (or XMLTYPE, VECTOR, …), which has no
+text form this dialect can compare …; leave it out with --exclude` and `CLOB
+column 'X' cannot be used as a key on Oracle` mean what they say.
+
 As each says. A SQL Server table too wide to compile into one checksum query
 asks you to compare fewer columns per run with `--columns` / `--exclude`.
 
@@ -227,6 +233,15 @@ DATABASE … SET ALLOW_SNAPSHOT_ISOLATION ON`; it does not block writers).
 Otherwise diff a quiet replica, a clone (Snowflake zero-copy `CLONE`), or a
 base table instead of a view, or re-run and see whether the differences move.
 
+## Oracle: "the table's definition changed after this diff's snapshot began (ORA-01466)"
+
+The Oracle side reads one `READ ONLY` snapshot, which cannot read a table
+created, altered or truncated after it began - or within a few seconds before
+it (even the first insert into a freshly created table counts). Run the diff
+again once the table is no longer being rebuilt. A diff running longer than
+the database's undo retention on a busy table stops with ORA-01555 (snapshot
+too old) instead: raise `UNDO_RETENTION`, or diff a quieter copy.
+
 ## Slow runs
 
 - **Cost is one full hash pass per side**: every compared column of every row
@@ -247,6 +262,12 @@ base table instead of a view, or re-run and see whether the differences move.
 - **Cloud warehouses**: a bigger Snowflake warehouse makes the hash pass
   faster; BigQuery bills by bytes scanned, not time (see
   [`engines.md`](engines.md)).
-- **Interrupting** (Ctrl-C) cancels the running queries on PostgreSQL, MySQL
-  and DuckDB; on Snowflake, BigQuery and SQL Server it waits for the query in
+- **Oracle rows that may be longer than 4,000 bytes** (estimated from the
+  raw column lengths: wide tables, CLOBs, long VARCHAR2s) are hashed as a
+  CLOB - natively by `DBMS_CRYPTO` when the login may call it, otherwise by an
+  MD5 written in PL/SQL at about 0.5 MB/s. `GRANT EXECUTE ON SYS.DBMS_CRYPTO`
+  to the reading login makes such tables much faster; it is not needed for
+  correctness.
+- **Interrupting** (Ctrl-C) cancels the running queries on PostgreSQL, MySQL,
+  Oracle and DuckDB; on Snowflake, BigQuery and SQL Server it waits for the query in
   flight.

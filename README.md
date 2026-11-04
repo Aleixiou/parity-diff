@@ -68,6 +68,7 @@ pip install "parity-diff[mysql]"      # MySQL only
 pip install "parity-diff[snowflake]"  # Snowflake only
 pip install "parity-diff[bigquery]"   # BigQuery only
 pip install "parity-diff[mssql]"      # SQL Server / Azure SQL only
+pip install "parity-diff[oracle]"     # Oracle only (thin mode: no Oracle client needed)
 ```
 
 > The PyPI distribution is `parity-diff` — plain `parity` is squatted by an
@@ -162,6 +163,7 @@ duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 snowflake://user:password@account/database/schema?warehouse=wh&role=r
 bigquery://project/dataset                      (optional ?location=EU)
 mssql://user:password@host:port/database        (also sqlserver://; port 1433)
+oracle://user:password@host:port/service_name   (port 1521; a service name, not a SID)
 ```
 
 Each engine's options, authentication, the minimum grants for a read-only
@@ -356,6 +358,7 @@ column on one side only is a schema difference (exit 1).
 | Snowflake | supported (verified live on AWS); connector 4.x, user/password login |
 | BigQuery | supported (verified live in the EU region); Application Default Credentials |
 | SQL Server / Azure SQL | supported (SQL Server 2019+; 2019 and 2022 verified identical; FLOAT columns need database compatibility level 130 or more); SQL authentication |
+| Oracle | supported (19c+; 21c and 23ai verified identical; AL32UTF8 databases); password login; stores `''` as NULL, which the output says |
 | Redshift, Databricks, Fabric | not yet — a new engine is one dialect file, see `CONTRIBUTING.md` |
 
 Per-engine details: [engines.md][engines]. Which value of which type was
@@ -419,7 +422,9 @@ and BigQuery have no local or CI instance, so their live suites run only when
 create and drop their own tables in that dataset. SQL Server's live suite runs
 when `PARITY_TEST_MSSQL` names a login that may create databases — the
 Developer-edition container works; see the top of `tests/test_mssql.py` — and
-`PARITY_TEST_MSSQL_RO`, if set, adds the read-only-login checks.
+`PARITY_TEST_MSSQL_RO`, if set, adds the read-only-login checks. Oracle's
+runs when `PARITY_TEST_ORACLE` is a URL, or `1` for the Oracle Free container
+described at the top of `tests/test_oracle.py`.
 
 A disposable PostgreSQL:
 

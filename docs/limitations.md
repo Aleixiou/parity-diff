@@ -87,11 +87,20 @@ list, grouped by topic. The error odds of each step are in
   before.
 - **NULL is not the empty string**, and a NULL boolean is not `false`: both
   are reported as `different`.
+- **Oracle cannot store the empty string**: it stores `''` as NULL. An Oracle
+  NULL is compared as NULL, so a row the other side holds as `''` is reported
+  as `different`, and every run comparing text with an Oracle side says so in
+  a caveat. There is no mode that equates the two: if the migration turned
+  Oracle's NULLs into `''` on purpose, those rows are reported, never hidden.
 - **Wide tables are fine.** PostgreSQL caps a function call at 100 arguments,
   so the row concatenation is built as a nested tree; tested to 500 columns.
   Long rows are fine too: SQL Server's `CONCAT_WS` silently cuts its result at
   4,000 characters unless an argument is `nvarchar(max)`, so every value is
   joined as one — tested with a difference planted at character 9,500.
+  Oracle's VARCHAR2 holds 4,000 bytes in SQL and its `STANDARD_HASH` takes no
+  CLOB, so a row whose text may be longer is built as a CLOB and hashed by an
+  MD5 written in PL/SQL inside the query — exact, slower (about 0.5 MB/s), and
+  tested with differences planted past character 4,000 and 32,767.
 - **A row wider than MySQL's `max_allowed_packet`** (64 MiB by default) is
   hashed column by column instead of as one string, so it can never drop out
   of a checksum; against another engine such a row is downloaded and compared
@@ -202,6 +211,10 @@ The per-type, per-engine evidence is [`coverage.md`](coverage.md).
   whole diff, or to NOLOCK, whose dirty reads invent differences. A table
   created or altered while a snapshot diff runs makes it stop with SQL
   Server's error 3961 rather than read inconsistent data.
+- **Oracle reads one snapshot** (`SET TRANSACTION READ ONLY`). A table
+  created, altered or truncated during the run, or within a few seconds
+  before it, stops it with ORA-01466 instead of being read; a run that
+  outlives the undo retention stops with ORA-01555. Both are loud.
 - The independent sample check re-reads its rows after the walk, so on an
   engine without one snapshot it fails on any sampled row that changed in
   between — but it cannot bound what changed elsewhere.
@@ -228,6 +241,7 @@ value renders, or which rows a query returns, is pinned at connect:
 | Snowflake | `TIMEZONE` UTC, `ROWS_PER_RESULTSET = 0` (no limit) |
 | DuckDB | `TimeZone` UTC, extension auto-install and auto-load off; the file is opened read-only |
 | BigQuery | read-only OAuth scope; base tables read `FOR SYSTEM_TIME AS OF` the first query |
+| Oracle | `NLS_LANGUAGE`, `NLS_TERRITORY`, `NLS_CALENDAR`, `NLS_NUMERIC_CHARACTERS`, the date and timestamp formats, `NLS_SORT`/`NLS_COMP` BINARY, `TIME_ZONE` +00:00, `NLS_NCHAR_CONV_EXCP`, `CURSOR_SHARING` EXACT, `QUERY_REWRITE_ENABLED` off; then a READ ONLY transaction, never committed |
 
 Red-team round G set every user-settable PostgreSQL setting at each value, and
 MySQL `sql_mode`, charset, time zone and `init_connect` variants, SQL Server
@@ -274,6 +288,12 @@ BigQuery `und:ci`; the six that changed anything are now pinned or refused.
   at connect, naming the engine edition: both isolate differently (Fabric
   ignores `SET TRANSACTION ISOLATION LEVEL`; Synapse dedicated pools read
   uncommitted by default), and neither has been verified.
+- **Oracle**: AL32UTF8 databases only (others are refused at connect);
+  password authentication only; `DATE` is compared as a timestamp, so against
+  a date-only column it differs on every row (the run warns about the type
+  mismatch); `LONG`, `XMLTYPE`, `VECTOR` and object columns are refused
+  (`--exclude` them); `JSON`, `ROWID` are not covered; Virtual Private
+  Database policies get a caveat, Data Redaction cannot be detected.
 - **SQL Server authenticates with SQL logins only** so far (no Windows or
   Entra ID authentication), and **Snowflake with user and password only** —
   see [`engines.md`](engines.md).

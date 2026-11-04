@@ -143,6 +143,12 @@ def test_the_sample_is_hard_and_mostly_checked(engine_runs):
         # Oracle's DATE holds a time of day: it is a TIMESTAMP, and Oracle has
         # no date-only type.
         | ({"date"} if engine == "oracle" else set())
+        # ... and no BOOLEAN column type before 23ai.
+        | (
+            {"boolean"}
+            if engine == "oracle" and not any(c.native == "boolean" for c in cells)
+            else set()
+        )
     ), (engine, logical)
 
 

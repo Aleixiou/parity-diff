@@ -37,7 +37,7 @@ from cov_known import (  # noqa: E402
 )
 from cov_values import FORM_DEPENDENT, REFUSE, RULED, cross_group  # noqa: E402
 
-ENGINE_ORDER = ["postgres", "duckdb", "mysql", "mssql", "bigquery", "snowflake"]
+ENGINE_ORDER = ["postgres", "duckdb", "mysql", "mssql", "bigquery", "snowflake", "oracle"]
 
 #: Matrix rows: (family label, value groups in it).
 FAMILIES: list[tuple[str, tuple[str, ...]]] = [
@@ -133,6 +133,16 @@ NOT_LOADED: dict[str, dict[str, str]] = {
         "with precision < 9, DATETIME alias, TIME(0..8), OBJECT and ARRAY (JSON "
         "as VARIANT is), VARBINARY; no single-precision FLOAT exists",
         "unknown": "GEOGRAPHY, GEOMETRY, VECTOR, FILE",
+    },
+    "oracle": {
+        "mapped": "NUMBER(p,0) for other p, NUMBER(p,-s), NUMBER(p,s) for other "
+        "s, FLOAT(p) (a decimal NUMBER), VARCHAR2/CHAR/NVARCHAR2/NCHAR of other "
+        "lengths, TIMESTAMP(p) for p other than 6 and 9, TIMESTAMP WITH TIME "
+        "ZONE of other precisions, INTERVAL DAY TO SECOND(p) for p other than 6, "
+        "RAW(n) for n < 2000; rows past 4,000 bytes (the PL/SQL hash path: "
+        "tests/test_oracle.py)",
+        "unknown": "ROWID, UROWID (text); LONG, LONG RAW, XMLTYPE, VECTOR, BFILE, "
+        "SDO_GEOMETRY and object types (refused); JSON is loaded below",
     },
 }
 
