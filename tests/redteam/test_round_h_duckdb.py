@@ -277,12 +277,6 @@ def test_a_view_over_an_altered_column_compares_its_real_type(tmp_path):
     assert found(result) == ONE
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD13: a `select *` view created before `alter table add column` returns the "
-    "new column, but information_schema lists only the old ones - the new column is "
-    "silently never compared, with no warning: a false match",
-)
 @pytest.mark.sample_check_may_disagree
 @pytest.mark.xfail(strict=True, reason="RT-HD13: a view's stale catalog type picks the wrong rule after ALTER TYPE: the difference is rendered away")
 @pytest.mark.parametrize(
@@ -311,6 +305,12 @@ def test_a_view_over_a_retyped_column_finds_the_change(tmp_path, old, new, a, b)
     assert found(result) == ONE
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HD13: a `select *` view created before `alter table add column` returns the "
+    "new column (DuckDB >= 1.5; 1.3-1.4 refuse to bind the view), but information_schema "
+    "lists only the old ones - the new column is silently never compared: a false match",
+)
 def test_a_view_that_gained_a_column_compares_it(tmp_path):
     """vw returns (id, v, w); w differs; the catalog lists (id, v)."""
     def mk(w: str) -> tuple[str, ...]:
@@ -401,6 +401,23 @@ def test_a_file_held_by_a_writer_process_names_the_side(tmp_path):
     finally:
         writer.kill()
         writer.wait()
+
+
+def test_a_read_only_file_is_compared(tmp_path):
+    """A file the user may not write (read-only attribute): opened and
+    compared, row 9 found, file unchanged."""
+    import stat
+
+    pa = duck_file(tmp_path, "a", "create table t (id int, v int)", "insert into t select i, i from range(1, 101) r(i)")
+    pb = duck_file(tmp_path, "b", "create table t (id int, v int)", "insert into t select i, i from range(1, 101) r(i)", "update t set v = 0 where id = 9")
+    before = Path(pa).read_bytes()
+    os.chmod(pa, stat.S_IREAD)
+    try:
+        result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    finally:
+        os.chmod(pa, stat.S_IREAD | stat.S_IWRITE)
+    assert found(result) == [(9, "different", ("v",))]
+    assert Path(pa).read_bytes() == before
 
 
 def test_the_side_is_read_only_even_for_a_writable_file(tmp_path):
