@@ -472,7 +472,8 @@ class SnowflakeDialect(Dialect):
         seen, and that is a caveat too; a role that may not read the policy
         list gets a caveat saying the check did not run.
         """
-        database = self.query("select current_database()")[0][0]
+        current = self.query("select current_database()")
+        database = current[0][0] if current else None
         if database is None:
             self._policy_notes.append(
                 f"{table}: masking and row access policies could not be checked "

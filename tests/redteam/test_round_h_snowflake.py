@@ -310,10 +310,10 @@ def test_rt_hf1_variant_doubles_that_print_exactly_are_compared(sfh):
         "RTH_SF_VE",
         "id int, v variant",
         "select 1, parse_json('1e0') union all select 2, to_variant(0.25::float) "
-        "union all select 3, parse_json('{\"x\": [2.5e0, \"s\"]}') "
+        'union all select 3, parse_json(\'{"x": [2.5e0, "s"]}\') '
         "union all select 4, parse_json('NaN')",
         "select 1, parse_json('1e0') union all select 2, to_variant(0.5::float) "
-        "union all select 3, parse_json('{\"x\": [7.5e0, \"s\"]}') "
+        'union all select 3, parse_json(\'{"x": [7.5e0, "s"]}\') '
         "union all select 4, parse_json('NaN')",
     )
     result = _diff(sfh, "RTH_SF_VEA", "RTH_SF_VEB", "id")

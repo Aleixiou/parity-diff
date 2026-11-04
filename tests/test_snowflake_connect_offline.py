@@ -170,6 +170,8 @@ def _assert_telemetry_off(seen: dict[str, Any]) -> None:
     assert seen["conn"].statements == [
         "alter session set timezone = 'UTC'",
         "alter session set rows_per_resultset = 0",
+        "alter session set quoted_identifiers_ignore_case = false",
+        "alter session set strict_json_output = false",
     ]
 
 

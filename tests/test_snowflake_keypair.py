@@ -15,8 +15,6 @@ connector receives; this file proves Snowflake accepts it.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from conftest import duckdb_write, open_duckdb, secret_env
 
