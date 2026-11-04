@@ -168,6 +168,24 @@ coincide (PostgreSQL `jsonb`, MySQL's binary JSON, BigQuery and Snowflake by
 code point, DuckDB verbatim text). Where they differ the run names both forms
 in a warning; equal documents can then read as different, never the reverse.
 
+**MySQL JSON scalars of MySQL's own types** are the one exception to "never
+the reverse", MySQL to MySQL. A JSON value made with `cast(date as json)` (or
+TIME, DATETIME, a binary string) is a typed scalar that MySQL's own JSON
+comparison tells apart from the string of the same text, but it prints as
+that string (`"2024-01-02"`, `"base64:type15:AP8="`), so the two compare
+equal here. No other engine has these scalar types, and documents written as
+JSON text never contain them (RT-HM8).
+
+**MySQL text in a legacy character set** (sjis, euckr, gbk, big5, cp1251,
+ucs2, …) is compared as its Unicode text when every character converts. A
+value holding a character with no Unicode mapping - a Shift-JIS or EUC-KR
+user-defined character, a byte unassigned in its code page, a surrogate in a
+ucs2 column - renders as `parity: not convertible from <charset> 0x<bytes>`:
+two such values are equal only when their bytes are, and such a value never
+equals anything on another engine (a migration that mapped it to a
+private-use character reads as different). MySQL itself would turn it into
+`?` or NULL (RT-HM1, RT-HM2).
+
 The per-type, per-engine evidence is [`coverage.md`](coverage.md).
 
 ## Schema differences

@@ -5,6 +5,48 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Security/correctness: MySQL red-team round H.** Three false matches fixed:
+  - **Legacy character sets (RT-HM1).** Text in sjis, euckr, gbk, big5, ujis,
+    gb2312, hebrew, greek, cp125x, tis620, geostd8, swe7, dec8 (any charset
+    but utf8mb4/utf8mb3, utf16 and latin1) converted to Unicode with every
+    unmappable character silently turned into `?` - two different
+    user-defined characters, and a real `?`, compared identical, and two
+    distinct keys were refused as duplicates. Each value now converts back
+    and is compared byte for byte with what is stored; one that loses a
+    character renders `parity: not convertible from <charset> 0x<bytes>`.
+  - **ucs2 surrogates (RT-HM2).** A ucs2 value holding a surrogate (an
+    emoji written as UTF-16) converted to SQL NULL and rendered as the NULL
+    sentinel: two different emoji were equal, and equal to NULL. Same fix.
+  - **Column-level grants (RT-HM3).** A login granted SELECT on some
+    columns only saw only those in `information_schema`, and the rest were
+    never compared, with no warning. Such a table is now refused, naming the
+    visible columns.
+  - **`--where` locking reads (RT-HM12):** `FOR SHARE`, `FOR UPDATE`, `LOCK
+    IN SHARE MODE`, `INTO`, `OUTFILE`, `DUMPFILE` are refused in a MySQL row
+    filter; a shared locking read held row locks on the live table for the
+    whole diff.
+  - False alarms fixed: ZEROFILL values and keys render without display
+    padding (RT-HM4/5); a SET no longer reads as a Python set's repr in the
+    sample check (RT-HM6); YEAR 0 renders `0` (RT-HM7); zero and invalid
+    dates are no longer read as NULL by the sample check (RT-HM13).
+  - ENUM's error value (index 0) renders `parity: invalid ENUM value (index
+    0)` instead of `''`, which equalled a real `''` member (RT-HM9).
+  - A view over a MyISAM/MEMORY table now carries the no-snapshot caveat
+    (RT-HM17); MariaDB is refused by name (RT-HM11); MySQL 9 `VECTOR` is
+    compared as the hex of its bytes instead of crashing (RT-HM14); refusals
+    are explained under a non-English `lc_messages` (RT-HM10); a table the
+    login holds no privilege on is no longer called simply "not found"
+    (RT-HM15); a Ctrl-C that cannot KILL at `max_user_connections` warns
+    instead of failing silently (RT-HM16, still cannot cancel).
+  - **Checksums that move:** values in a legacy-charset column that did not
+    convert (they rendered `?` or NULL before); every value of a ZEROFILL
+    column (and ZEROFILL keys in a composite or decimal key); YEAR 0; ENUM
+    index-0 values. Text that converts renders byte-identically, and no
+    column's SQL changed but legacy-charset, ENUM, ZEROFILL and YEAR
+    columns'.
+  - Documented, not fixed: JSON scalars of MySQL's own types
+    (`cast(date as json)`) print as JSON strings (RT-HM8).
+
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)
   and its fetch failed, the result used to stay identical with exit 0 and

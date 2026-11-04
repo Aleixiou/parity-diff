@@ -711,7 +711,35 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   `READ ONLY` with `sql_mode` pinned; a row past `max_allowed_packet` makes
   `concat_ws` return NULL, so `row_hash` falls back to hashing per-column md5s
   rather than letting the row drop out of `sum()`; non-InnoDB tables get a
-  no-snapshot caveat.
+  no-snapshot caveat - views too, through `view_table_usage` (8.0.13+), and
+  conservatively when the base tables cannot be listed (RT-HM17).
+  **Round H (2026-11-04, verified on 8.0.46, 8.0.42 native, 9.7.4):**
+  `cast(c as char)` from a legacy character set turns every character with no
+  Unicode mapping into `?`/U+FFFD and a ucs2 surrogate into SQL NULL - no
+  error, any sql_mode - so different stored characters, a real `?` and NULL
+  all compared equal (RT-HM1/HM2, false matches). Outside
+  `_LOSSLESS_CHARSETS` (utf8mb4/mb3, utf16, latin1: verified total and
+  one-to-one) a value converts back to its own charset and is compared byte
+  for byte; equal renders exactly as before (**no checksum of convertible
+  text moves**), unequal renders `parity: not convertible from <cs> 0x<HEX>`
+  - a marker, not a refusal, like SQL Server's unpaired surrogates, so keys
+  stay distinct. Column-level grants hide columns from information_schema;
+  `SELECT * ... LIMIT 0` fails exactly then (1142/1143) and the table is
+  refused (RT-HM3, false match). A `--where` holding `FOR SHARE`/`FOR
+  UPDATE`/`LOCK IN SHARE MODE`/`INTO`/`OUTFILE`/`DUMPFILE` outside quotes is
+  refused: READ ONLY does not refuse a shared locking read (RT-HM12).
+  ZEROFILL and YEAR render `c + 0` (display padding is not the value;
+  checksums move for ZEROFILL columns and YEAR 0 only); ENUM index 0 renders
+  `parity: invalid ENUM value (index 0)`, never `''` (RT-HM9); `VECTOR` is
+  hex of its bytes. The sample check reads ENUM/SET/legacy-charset text as
+  hex facts (index, stored, round-tripped, utf8mb4 bytes) and DATE/TIMESTAMP
+  as MySQL's text (the connector returns None for zero dates). MariaDB is
+  refused by name; `lc_messages` is pinned to `en_US` and the error patterns
+  no longer need English. Open: a cancel at `max_user_connections` cannot
+  KILL (the C connector has no socket to interrupt) and now warns instead of
+  failing silently (RT-HM16); JSON typed scalars (`cast(date as json)`)
+  print as strings (RT-HM8, documented); casefold column matching (RT-HM18,
+  engine).
 - **SQL Server:** unpaired surrogates render as a marker plus their bytes
   (UTF-8 conversion turned them all into U+FFFD); downloads fetch the canonical
   text as `varbinary` UTF-8 bytes; `sql_variant` renders `<BaseType>:<exact>`;

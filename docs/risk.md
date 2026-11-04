@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 3599972b4f280264`
+Source fingerprint: `src-sha256: 3fc5f413fb1c5524`
 
 ## Summary
 
@@ -62,6 +62,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
+| A MySQL view over a non-transactional table read as one snapshot | **0** — the view's base tables are followed through `view_table_usage` (views of views included) and any non-InnoDB one gets the caveat below; a view whose base tables cannot be listed gets it too (round H, RT-HM17) | By design (tested) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
 
 ## 2. Matching schemas and columns
@@ -69,6 +70,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Risk | Odds | Kind |
 |---|---|---|
 | A column present on one side only is silently skipped | **0** — it is a schema difference, exit 1 | By design (tested) |
+| Columns the login may not read are silently left out (MySQL column-level grants, which hide them from `information_schema`) | **0** — `SELECT *` fails exactly when a column is hidden, and the table is then refused naming the visible columns (round H, RT-HM3, a false match before) | By design (verified live) |
 | Two columns differing only in case are confused | **0** — such a table is refused | By design (tested) |
 | A type mismatch between sides goes unnoticed | **0** — a warning is printed; values compare by canonical text | By design (tested) |
 | A renamed column (`--map`) paired with the wrong column | **0** — side B's column is re-keyed under side A's name before any other matching, so the compared list, its order (the row text's field order) and the key follow from A's names alone; exact, so no new rendering or checksum risk. Refused: a mapped name absent on its side, one column mapped twice either way, a mapped B column a same-named column would still match, mapped and excluded. Pinned both ways: swapped columns mapped as a swap match except the planted row, unswapped ones differ on every row | By design (tested) |
@@ -87,6 +89,7 @@ line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
 | The predicate escapes its parentheses (`1=1) or (1=1`) or ends the statement | **0** for what the check knows: `;`, comments, MySQL `#`, a backslash before a quote, triple- and dollar-quoted strings and unbalanced quotes, brackets or parentheses are refused before any query; on SQL Server the SELECT guard also applies. Not a security boundary: it is the user's own SQL, and the sessions are read-only | By design (tested) |
 | The predicate selects different rows in different queries (`random()`, `clock_timestamp()`; `now()`/`current_date` where an engine gives each query its own snapshot) | a change between the row count and the first level, or between two levels of one range, is **never identical** (unexplained); a row entering the filter beyond the key range measured first is **not compared**; beyond that **not bounded** — every filtered run's caveat says to prefer fixed literals | Not quantifiable |
 | A deterministic predicate inside one snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables; `now()` is stable within PostgreSQL's transaction) | **no new risk**: every query sees the same rows, so the walk is the unfiltered walk over a smaller table | By design (tested) |
+| A predicate takes row locks on the live table (MySQL `FOR SHARE` / `LOCK IN SHARE MODE` in a subquery, which READ ONLY allows) | **0** — `FOR SHARE`, `FOR UPDATE`, `LOCK IN SHARE MODE`, `INTO`, `OUTFILE` and `DUMPFILE` outside quotes are refused on MySQL before any query (round H, RT-HM12) | By design (tested) |
 | The two sides' predicates select different slices | **not the tool's to know**: rows in one slice only read as only in A / only in B, and a one-sided filter draws a warning | By design |
 
 ## 3. Checking keys
@@ -109,6 +112,9 @@ and 4.3. This is where every past false match lived.
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
 | A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |
+| MySQL text in a legacy character set (sjis, euckr, gbk, big5, cp125x, ucs2, …) holding a character with no Unicode mapping | **0** false matches — MySQL's conversion turns such characters into `?` (and ucs2 surrogates into NULL) silently, so each value is converted back and compared byte for byte with what is stored; one that does not survive renders `parity: not convertible from <charset> 0x<bytes>`. Convertible text renders exactly as before (round H, RT-HM1/HM2, false matches before; verified on 16 lossy charsets and MySQL 8.0, 8.4, 9.7) | By design (verified live) |
+| MySQL display forms taken for values (ZEROFILL padding, YEAR 0 as `0000`, ENUM's index-0 error value as `''`) | **0** — rendered as their values (`5`, `0`) and the error value as its own marker (round H, RT-HM4/5/7/9) | By design (tested) |
+| MySQL JSON scalars of MySQL's own types (`cast(date as json)`, binary) | **not covered**: they print as the JSON string of their text and compare equal to it, MySQL to MySQL only; documented (RT-HM8) | Not quantifiable |
 | Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
 
 Findings this check produced and fixed: 8 (COV-1 to COV-8), two of them
@@ -116,7 +122,11 @@ false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
 +05:00:30 as +05:30) and one a refusal of ordinary values (SQL Server
 sql_variant floats, -0.0 and negatives below 1e-99); the type rules found
 one more (BigQuery SQL NULL equal to JSON `null`). Red-team round G (settings, versions): 14
-problems, 8 of them false matches, all fixed. Earlier campaign: about 30
+problems, 8 of them false matches, all fixed. Round H, MySQL: 18 findings,
+4 of them false matches (legacy character sets, ucs2 surrogates, column-level
+grants, the ENUM error value), all fixed; open are a Ctrl-C that cannot
+cancel at `max_user_connections` (now reported), JSON typed scalars
+(documented) and casefold column matching (engine, RT-HM18). Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range
@@ -189,7 +199,10 @@ residue is random (`random.SystemRandom`), and the data is not crafted
 against the sample. The bound covers the run's `covered_columns`; columns
 listed as uncovered carry none. Driver quirks that would make the check
 disagree falsely are worked around per engine and verified live (MySQL
-FLOAT and BIT width, SQL Server NULs, 7-digit times and sql_variant base
+FLOAT and BIT width; MySQL SET, ENUM and legacy-charset text, read as hex
+facts because the connector returns a SET as a Python set, the ENUM error
+value as `''` and an unconvertible character as `?`; MySQL zero dates, read
+as text because the connector returns them as None; SQL Server NULs, 7-digit times and sql_variant base
 types, PostgreSQL and DuckDB infinite and BC dates and interval months,
 DuckDB TIMETZ offsets). Measured: on the full live suite (1,620 tests, default sample 10,000) the check
 raised no false disagreement; every disagreement it raised was a planted

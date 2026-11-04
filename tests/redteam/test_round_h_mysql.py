@@ -272,7 +272,9 @@ CONVERTIBLE = [
 ]
 
 
-@pytest.mark.parametrize(("charset", "text", "_"), CONVERTIBLE, ids=[c[0] for c in CONVERTIBLE])
+@pytest.mark.parametrize(
+    ("charset", "text", "_"), CONVERTIBLE, ids=[c[0] for c in CONVERTIBLE]
+)
 def test_rt_hm1_convertible_legacy_text_still_equals_unicode_text(
     tables, pg_table, mysql_url, pg_url, charset, text, _
 ):
@@ -800,7 +802,13 @@ def test_rt_hm12_locking_and_into_clauses_are_refused(mysql_url, where):
 
 
 @pytest.mark.parametrize(
-    "where", ["note = 'for share'", "`into` = 1", 'note = "lock in share mode"', "information = 1"]
+    "where",
+    [
+        "note = 'for share'",
+        "`into` = 1",
+        'note = "lock in share mode"',
+        "information = 1",
+    ],
 )
 def test_rt_hm12_the_words_in_strings_and_names_are_fine(mysql_url, where):
     d = get_dialect(mysql_url, side="A")
@@ -1185,7 +1193,9 @@ def test_rt_hm16_a_failed_cancel_is_reported(root80):
     try:
         d = get_dialect(f"mysql://{user}:rthmw@{HOST80}/rth", side="A")
         try:
-            with pytest.warns(RuntimeWarning, match=r"side A.*could not cancel.*KILL QUERY"):
+            with pytest.warns(
+                RuntimeWarning, match=r"side A.*could not cancel.*KILL QUERY"
+            ):
                 d.cancel()
         finally:
             d.close()

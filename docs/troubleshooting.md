@@ -38,7 +38,10 @@ parity: [side A: postgres] table public.orders exists but this role cannot read 
 
 The table is there; the login lacks `SELECT`. SQL Server cannot tell the two
 apart and adds to every not-found message: `If it does exist, this login may
-lack SELECT on it (db_datareader, or GRANT SELECT)`. BigQuery says `cannot
+lack SELECT on it (db_datareader, or GRANT SELECT)`. Nor can MySQL, for a login
+with no privilege on the database: it answers `SELECT command denied` whether
+or not the table exists, and the message adds `Or it exists and this login
+holds no privilege on it`. BigQuery says `cannot
 read dataset … while looking for …: it does not exist, or this account lacks
 access to it`. Grants per engine: [`engines.md`](engines.md).
 
@@ -117,6 +120,7 @@ escaped. A DBA can raise `max_allowed_packet`, or exclude the column.
 | `FLOAT column 'x' needs PostgreSQL 12 or newer (server_version_num …): older servers do not print doubles as their shortest round-trip decimal, so they cannot be rendered canonically` | `--exclude` the float columns, or upgrade. |
 | `FLOAT column 'x' cannot be compared in a database at compatibility level …: below 130 SQL Server converts floats to decimal inexactly. Raise the level to 130 or more, or leave the column out with --exclude` | As it says. |
 | `DuckDB … is not supported: parity needs DuckDB 1.3 or newer (older versions render some values differently, which can hide a difference). Upgrade with: pip install -U duckdb` | As it says. |
+| `this server is MariaDB, not MySQL. parity's MySQL dialect has not been verified against MariaDB …` | MariaDB is not supported; diff a copy in MySQL or another engine. |
 | `this MySQL server has no MD5() function, which every row hash needs. MySQL 9.7 moved it into an optional component: a DBA can add it with INSTALL COMPONENT 'file://component_classic_hashing'` | As it says. |
 | `this server has no UTF-8 collations (SQL Server 2019 or newer is required) …` | SQL Server 2017 and older are not supported. |
 | `unsupported SQL Server engine edition …: … Microsoft Fabric and Azure Synapse differ in isolation and are not supported yet.` | Not supported yet. |
@@ -187,6 +191,14 @@ parity: --columns named unknown columns: ['x']
 parity: --columns named columns present on only one side: ['extra']
 parity: --columns and --exclude both name: ['x']
 ```
+
+```
+parity: [side A: mysql] this login may read only some columns of table orders (column-level privileges). MySQL then lists only those - ['id', 'a'] - and hides the rest from information_schema, so the hidden columns would silently go uncompared. Ask for SELECT on the whole table …
+```
+
+The login holds `GRANT SELECT (col, …)` on some columns only. Grant SELECT on
+the table: a comparison of the visible columns alone could not say what it
+left out.
 
 As each says. A SQL Server table too wide to compile into one checksum query
 asks you to compare fewer columns per run with `--columns` / `--exclude`.

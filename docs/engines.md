@@ -92,22 +92,31 @@ plaintext without saying so. Password authentication only.
 
 **Tables.** Unqualified names mean the URL's database.
 
-**Minimum permissions.** `SELECT` on the table:
+**Minimum permissions.** `SELECT` on the whole table:
 
 ```sql
 create user 'parity_reader'@'%' identified by '…';
 grant select on warehouse.orders to 'parity_reader'@'%';
 ```
 
-The tool also reads `information_schema.columns` and `information_schema.tables`
-(to learn each table's storage engine), which list what the user may see. To
-interrupt a running query on Ctrl-C it opens a second connection as the same
-user and issues `KILL QUERY` on its own session, which needs no extra
-privilege.
+Column-level grants (`grant select (id, a) on …`) are refused: MySQL then
+lists only the granted columns in `information_schema`, and the others would
+silently go uncompared. The tool also reads `information_schema.columns`,
+`information_schema.tables` (to learn each table's storage engine) and, for a
+view, `information_schema.view_table_usage`, which list what the user may
+see. To interrupt a running query on Ctrl-C it opens a second connection as
+the same user and issues `KILL QUERY` on its own session, which needs no extra
+privilege - but needs a free connection: a login at its
+`max_user_connections` cannot be cancelled, and the run says so with the
+`KILL QUERY` a DBA can issue instead.
 
 **Consistency.** One REPEATABLE READ, READ ONLY transaction — one snapshot for
-InnoDB tables. A table on a non-transactional engine (MyISAM, MEMORY) has no
-snapshot, and the run says so.
+InnoDB tables. A table on a non-transactional engine (MyISAM, MEMORY, ARCHIVE,
+CSV) has no snapshot, and the run says so - for a view too, when any of its
+base tables is one, or when its base tables cannot be listed (before 8.0.13).
+
+**MariaDB** is refused by name: it accepts `mysql://` but differs in
+collations, functions and renderings, and nothing here was verified on it.
 
 **Caveats.**
 
@@ -120,6 +129,24 @@ snapshot, and the run says so.
   columns.
 - A row wider than `max_allowed_packet` is hashed column by column; a single
   value past it once escaped is refused.
+- Text in a legacy character set (sjis, euckr, gbk, big5, cp1251, ucs2, …)
+  renders as its Unicode text when every character converts; a value holding
+  a character with no Unicode mapping (a Shift-JIS user-defined character, a
+  ucs2 surrogate) renders as `parity: not convertible from <charset> 0x<bytes>`,
+  so it is never equal to a `?`, a NULL or another such value - and never
+  equal to anything on another engine.
+- ZEROFILL and YEAR render their values (`5`, `0`), not their display
+  padding (`00000005`, `0000`). ENUM's error value (index 0, what an invalid
+  value becomes outside strict mode) renders `parity: invalid ENUM value
+  (index 0)`, not `''`.
+- MySQL 9 `VECTOR` renders as the hex of its stored floats: exact MySQL to
+  MySQL, equal to nothing on another engine.
+- A `--where` with `FOR SHARE`, `FOR UPDATE`, `LOCK IN SHARE MODE` or `INTO`
+  is refused: a locking read would hold row locks on the live table for the
+  whole diff.
+- JSON values of MySQL's own scalar types (DATE, TIME, DATETIME, binary,
+  made with `cast(... as json)`) print as JSON strings and compare equal to
+  the string of the same text - see [limitations](limitations.md).
 
 ## DuckDB
 

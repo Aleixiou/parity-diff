@@ -502,9 +502,7 @@ class MySQLDialect(Dialect):
             raise self._err(self._not_found(table, schema, name))
         self._require_every_column(table, schema, name, [str(r[0]) for r in rows])
         self._note_snapshot(table, schema, name)
-        return [
-            _column(str(r[0]), str(r[1]), r[2], str(r[3] or ""), r[4]) for r in rows
-        ]
+        return [_column(str(r[0]), str(r[1]), r[2], str(r[3] or ""), r[4]) for r in rows]
 
     def _relation(self, schema: str, name: str) -> str:
         """`schema`.`name` quoted, or the bare name without a schema."""
@@ -586,7 +584,9 @@ class MySQLDialect(Dialect):
                 if not bases:
                     self._no_snapshot[f"view {table}"] = "unknown"
                 for bs, bn in bases:
-                    todo.append((str(bs), str(bn), f"view {table} (base table {bs}.{bn})"))
+                    todo.append(
+                        (str(bs), str(bn), f"view {table} (base table {bs}.{bn})")
+                    )
 
     def _not_found(self, table: str, schema: str, name: str) -> str:
         """Say "not found, or not granted" when MySQL cannot tell which.
@@ -686,7 +686,12 @@ class MySQLDialect(Dialect):
                 if cs
                 else f"hex({c})"
             )
-            parts = [enum, f"hex({c})", back, f"ifnull(hex(convert({c} using utf8mb4)), '-')"]
+            parts = [
+                enum,
+                f"hex({c})",
+                back,
+                f"ifnull(hex(convert({c} using utf8mb4)), '-')",
+            ]
             return f"case when {c} is null then null else concat_ws(',', {', '.join(parts)}) end"
         return super().sample_select(column)
 
@@ -722,7 +727,9 @@ class MySQLDialect(Dialect):
         if not re.fullmatch(r"[a-z0-9_]+", cs):
             # Pasted into SQL as a name; information_schema never reports
             # anything else, but say so rather than quote it.
-            raise self._err(f"column {column.name!r} has an unexpected character set {cs!r}")
+            raise self._err(
+                f"column {column.name!r} has an unexpected character set {cs!r}"
+            )
         return cs
 
     def _string_sampled_as_bytes(self, column: Column) -> bool:
@@ -816,7 +823,11 @@ class MySQLDialect(Dialect):
             # '0000', though their values - as the driver and every other
             # engine read them - are 5 and 0. Only those columns change SQL,
             # and only YEAR 0 and ZEROFILL values change text.
-            expr = f"cast({c} + 0 as char)" if _display_padded(column) else f"cast({c} as char)"
+            expr = (
+                f"cast({c} + 0 as char)"
+                if _display_padded(column)
+                else f"cast({c} as char)"
+            )
         elif t is LogicalType.DECIMAL:
             expr = self._decimal_text(column, c)
         elif t is LogicalType.FLOAT:
