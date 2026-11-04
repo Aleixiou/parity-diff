@@ -1134,3 +1134,53 @@ def test_tls_instance_and_parameter_errors_are_clear_and_secret_free(query):
     assert code == 2
     assert "side A" in err
     assert not pw or pw not in out + err
+
+
+# ============================================================ odd schemas
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HS11: a table or schema whose name holds a '.' cannot be "
+    "named at all - the table argument is split on every dot",
+)
+def test_rt_hs11_a_dotted_table_name_can_be_compared(db):
+    """`[dbo].[orders.2024]` is legal (and common for imported files). The
+    table argument has no quoting syntax, so `dbo.orders.2024` is three
+    parts and refused, and `dbo.[orders.2024]` is looked up literally with
+    its brackets."""
+    ex(DB, "drop table if exists [orders.2024]", "drop table if exists dotted_b")
+    ex(
+        DB,
+        "create table [orders.2024] (id int primary key, v int)",
+        "create table dotted_b (id int primary key, v int)",
+        "insert [orders.2024] values (1, 1), (2, 2)",
+        "insert dotted_b values (1, 1), (2, 3)",
+    )
+    results = []
+    for name in ("dbo.orders.2024", "dbo.[orders.2024]", 'dbo."orders.2024"'):
+        try:
+            results.append(found(run(db, db, name, "dbo.dotted_b")))
+        except ValueError:
+            results.append(None)
+    assert [(2, "different", ("v",))] in results
+
+
+def test_a_1100_column_sparse_table_finds_the_last_column(db):
+    """Sparse columns lift the 1,024-column limit; at 1,100 compared
+    columns (the column set excluded) the checksum query still compiles and
+    the difference in the very last column is found. (3,000 passed on SQL
+    Server 2019 during the campaign, in ~50 s.)"""
+    n = 1100
+    cols = ", ".join(f"c{i} int sparse null" for i in range(n))
+    ex(DB, "drop table if exists sp_a", "drop table if exists sp_b")
+    ex(
+        DB,
+        f"create table sp_a (id int primary key, {cols}, cs xml column_set for all_sparse_columns)",
+        f"create table sp_b (id int primary key, {cols}, cs xml column_set for all_sparse_columns)",
+        f"insert sp_a (id, c{n - 1}) values (1, 1), (2, 2)",
+        f"insert sp_b (id, c{n - 1}) values (1, 1), (2, 3)",
+    )
+    assert found(run(db, db, "dbo.sp_a", "dbo.sp_b", exclude=["cs"])) == [
+        (2, "different", (f"c{n - 1}",))
+    ]
