@@ -71,7 +71,7 @@ from parity.dialects.base import (
     float_zero_text,
     sql_literal,
 )
-from parity.types import Column, LogicalType
+from parity.types import Column, KeySpec, LogicalType
 
 #: Query parameters a `snowflake://` URL may carry. Anything else is refused,
 #: never ignored: a dropped parameter is a setting the user believes is in
@@ -84,6 +84,27 @@ URL_PARAMS = ("private_key_file", "role", "warehouse")
 #: only thing protecting the key file. `<name>_A` / `<name>_B` take
 #: precedence for one side, so two Snowflake sides can use two keys.
 KEY_PASSPHRASE_ENV = "PARITY_SNOWFLAKE_KEY_PASSPHRASE"  # noqa: S105 - a variable name
+
+#: Session settings pinned at connect, after the login: each one, left to a
+#: user or account default, changes what the tool reads or how it renders.
+SESSION_PINS = (
+    # Timestamps render through this; pin it so two accounts in different
+    # regions cannot disagree on the same instant.
+    "alter session set timezone = 'UTC'",
+    # A user or account ROWS_PER_RESULTSET caps every result - column
+    # introspection and checksum buckets - so columns and buckets past it
+    # went unseen on both sides: identical (RT-G2). 0 is no limit.
+    "alter session set rows_per_resultset = 0",
+    # With QUOTED_IDENTIFIERS_IGNORE_CASE on, a quoted identifier folds to
+    # upper case, so `"orders"` - found exactly in information_schema - is
+    # read as the table ORDERS: the columns of one table, the rows of another,
+    # and a real difference read identical (RT-HF2, verified live).
+    "alter session set quoted_identifiers_ignore_case = false",
+    # With STRICT_JSON_OUTPUT on, TO_JSON prints an SQL NULL inside an ARRAY
+    # (`undefined`) as JSON `null`, and NaN / Infinity as null too: three
+    # distinct VARIANTs one text (RT-HF6, verified live).
+    "alter session set strict_json_output = false",
+)
 
 _URL_SHAPE = (
     "snowflake://user:password@account/database/schema?warehouse=WH&role=ROLE "
@@ -378,13 +399,8 @@ class SnowflakeDialect(Dialect):
         self._conn.telemetry_enabled = False
         cur = self._conn.cursor()
         try:
-            # Timestamps render through this; pin it so two accounts in
-            # different regions cannot disagree on the same instant.
-            cur.execute("alter session set timezone = 'UTC'")
-            # A user or account ROWS_PER_RESULTSET caps every result - column
-            # introspection and checksum buckets - so columns and buckets past
-            # it went unseen on both sides: identical (RT-G2). 0 is no limit.
-            cur.execute("alter session set rows_per_resultset = 0")
+            for pin in SESSION_PINS:
+                cur.execute(pin)
         finally:
             cur.close()
 
@@ -436,7 +452,85 @@ class SnowflakeDialect(Dialect):
         )
         if not rows:
             raise self._err(self._not_found(table, schema, name))
+        self._note_policies(table, schema, name)
         return [_column(str(r[0]), str(r[1]), r[2], r[3]) for r in rows]
+
+    def _note_policies(self, table: str, schema: str, name: str) -> None:
+        """Remember the masking and row access policies on `table`.
+
+        Both are invisible in the data: a masking policy hands the reading
+        role the mask (`***`) on both sides, so values that differ compare
+        equal, and a row access policy hides rows from both sides, so a
+        difference in them is never seen - each read identical with no word
+        said (RT-HF4, RT-HF5, verified live). Like PostgreSQL row-level
+        security, each becomes a caveat on every run: the tool cannot tell
+        whether a policy actually masks or filters for this role (most are
+        conditional on the role), only that one is attached. Aggregation and
+        projection policies need nothing - Snowflake refuses the tool's
+        queries outright. POLICY_REFERENCES lists only the policies on the
+        object itself, so for a view those of the tables beneath it are not
+        seen, and that is a caveat too; a role that may not read the policy
+        list gets a caveat saying the check did not run.
+        """
+        database = self.query("select current_database()")[0][0]
+        if database is None:
+            self._policy_notes.append(
+                f"{table}: masking and row access policies could not be checked "
+                "(no current database)"
+            )
+            return
+        ref = ".".join(self.quote(p) for p in (str(database), schema, name))
+        kind = self.query(
+            "select table_type from information_schema.tables "
+            f"where table_schema = {sql_literal(schema)} "
+            f"and table_name = {sql_literal(name)}"
+        )
+        is_view = bool(kind) and "VIEW" in str(kind[0][0]).upper()
+        try:
+            rows = self.query(
+                "select policy_kind, policy_name, ref_column_name "
+                "from table(information_schema.policy_references("
+                f"ref_entity_name => {sql_literal(ref)}, "
+                f"ref_entity_domain => {sql_literal('view' if is_view else 'table')}))"
+            )
+        except Exception as exc:  # noqa: BLE001 - any refusal: say so, never guess
+            reason = str(exc).strip().splitlines()[0][:200] if str(exc).strip() else ""
+            self._policy_notes.append(
+                f"{table}: masking and row access policies could not be checked "
+                f"({type(exc).__name__}: {reason}). A policy masks values or hides "
+                "rows from both sides alike, and the differences it covers are "
+                "not seen; check SHOW MASKING POLICIES / POLICY_REFERENCES as an "
+                "administrator"
+            )
+            return
+        for policy_kind, policy_name, column in rows:
+            kind_text = str(policy_kind).upper()
+            if kind_text == "MASKING_POLICY" and column is not None:
+                self._masked.append((table, str(column), str(policy_name)))
+            elif kind_text == "ROW_ACCESS_POLICY":
+                self._policy_notes.append(
+                    f"row access policy {policy_name} filters {table}: rows it "
+                    "hides from this role are not compared at all, so a "
+                    "difference there cannot be seen. Diff as a role the policy "
+                    "does not filter for a complete result"
+                )
+        if is_view:
+            self._policy_notes.append(
+                f"{table} is a view: masking and row access policies on the "
+                "tables it reads are not checked, and one that masks values or "
+                "hides rows from this role hides their differences too"
+            )
+
+    #: Policy findings per side, filled by `columns` and printed by `caveats`.
+    _policy_notes: list[str]
+    _masked: list[tuple[str, str, str]]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._policy_notes = []
+        self._masked = []
+        #: (table, where, columns) whose VARIANT doubles were checked.
+        self._doubles_checked: set[tuple[str, str | None, tuple[str, ...]]] = set()
 
     def quote(self, identifier: str) -> str:
         """Wrap an identifier in double quotes, doubling any it contains.
@@ -447,6 +541,24 @@ class SnowflakeDialect(Dialect):
         names `columns()` read back.
         """
         return '"' + identifier.replace('"', '""') + '"'
+
+    def check_where(self, where: str) -> None:
+        """The shared row-filter check, plus Snowflake's `//` line comment.
+
+        Snowflake reads `//` to the end of the line as a comment, which no
+        other engine does, so the shared scan counted the parentheses inside
+        it as code: `id < 40 // (` ... closed the wrapper the tool puts round
+        the predicate, and the bucket bounds were no longer ANDed in (RT-HF10,
+        verified live). Refused outside a quoted region only - the shared
+        check has already refused every quoting it cannot read the way
+        Snowflake does - so `v <> 'http://x'` still works.
+        """
+        super().check_where(where)
+        if "//" in _unquoted(where):
+            raise self._err(
+                f"row filter {where!r} contains '//' outside a quoted string "
+                "(Snowflake reads it as a comment to the end of the line)"
+            )
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """What makes this side's comparison less than exact, for the output.
@@ -463,6 +575,17 @@ class SnowflakeDialect(Dialect):
                 "a single-snapshot result"
             )
         ]
+        compared = {c.name.casefold() for c in columns}
+        for table, column, policy in self._masked:
+            if column.casefold() in compared:
+                out.append(
+                    f"masking policy {policy} is set on column {column!r} of "
+                    f"{table}: if it masks values for this role, both sides "
+                    "compare the mask and a difference in that column cannot be "
+                    "seen. Diff as a role the policy does not mask, or leave the "
+                    "column out with --exclude"
+                )
+        out.extend(self._policy_notes)
         fine = sorted(
             c.name for c in columns if self.holds_sub_micro(c) and not c.sub_micro
         )
@@ -499,7 +622,7 @@ class SnowflakeDialect(Dialect):
         elif t is LogicalType.FLOAT:
             expr = self._float_text(c, self.float_scale_for(column), column)
         elif t is LogicalType.DECIMAL:
-            expr = f"cast(cast({c} as number(38,{self.float_scale})) as varchar)"
+            expr = self._decimal_text(c, self.float_scale)
         elif t is LogicalType.BOOLEAN:
             expr = f"case when {c} then 'true' when not {c} then 'false' end"
         elif t is LogicalType.DATE:
@@ -544,12 +667,48 @@ class SnowflakeDialect(Dialect):
             expr = f"{self.binary_prefix_sql()} || lower(hex_encode({c}))"
         elif t is LogicalType.JSON:
             expr = self._json_text(c)
+        elif _base(column.raw_type) == "GEOGRAPHY":
+            # No varchar cast exists for these three (RT-HF7: the walk died
+            # in its first checksum query). WKB carries every coordinate as
+            # its exact double; a GEOGRAPHY is always WGS 84.
+            expr = f"{self.binary_prefix_sql()} || lower(hex_encode(st_aswkb({c})))"
+        elif _base(column.raw_type) == "GEOMETRY":
+            # EWKB: the SRID too, so one shape in two systems is a difference.
+            expr = f"{self.binary_prefix_sql()} || lower(hex_encode(st_asewkb({c})))"
+        elif _base(column.raw_type) == "VECTOR":
+            # Its elements as a JSON array. A FLOAT vector holds float32s,
+            # and TO_JSON's 16 significant digits tell any two float32s apart
+            # (they need 9) - unlike the doubles of RT-HF1.
+            expr = self.escape_text(f"to_json(cast({c} as array))")
         else:
             # STRING, and every unmapped type through its varchar cast:
             # arbitrary text, so escaped. Verified live against DuckDB, also
             # under an `en-ci` collation, which REPLACE ignores here.
             expr = self.escape_text(f"cast({c} as varchar)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _decimal_text(self, c: str, s: int) -> str:
+        """A NUMBER rounded half away from zero to `s` places, `s` digits shown.
+
+        It used to be `cast(c as number(38, s))`, which holds only 38 - s
+        integer digits: a NUMBER(38,2) value of 36 digits raised "Number out
+        of representable range" at the default scale, and a NUMBER(30,2) one
+        of 19 at scale 20 - nothing could be compared (RT-HF8). `ROUND(c, s)`
+        never widens: its result keeps min(scale, s) places in the column's
+        own precision (verified live), and a carry fits in the integer digit
+        that dropping places frees. The places it does not print are zeros,
+        appended here. Same rounding (half away from zero), same text for
+        every value the cast held - `0.000000` for a negative value that
+        rounds to zero included - so no checksum moved.
+        """
+        r = f"cast(round({c}, {s}) as varchar)"
+        if s == 0:
+            return r
+        return (
+            f"case when contains({r}, '.') "
+            f"then {r} || repeat('0', {s} - (length({r}) - position('.', {r}))) "
+            f"else {r} || '.{'0' * s}' end"
+        )
 
     #: VARIANT types whose TO_JSON is the value itself. Any other (DATE, TIME,
     #: TIMESTAMP_*, BINARY) prints as a JSON *string*, which a VARCHAR
@@ -736,10 +895,20 @@ class SnowflakeDialect(Dialect):
         """
         if column.logical_type is LogicalType.TIMESTAMP:
             c = self.quote(column.name)
+            # The instant, as `normalize` prints it: a TIMESTAMP_TZ to_char
+            # prints its stored offset's wall clock, so without the move to
+            # UTC 12:00:00.000000001 +00:00 and +05:00 were one key, and one
+            # instant at two offsets two keys (RT-HF3). LTZ prints in the
+            # session zone, pinned to UTC.
+            shown = (
+                f"convert_timezone('UTC', {c})"
+                if _base(column.raw_type) == "TIMESTAMP_TZ"
+                else c
+            )
             return (
                 f"case when {c} is null or date_part(nanosecond, {c}) % 1000 = 0 "
                 f"then {self.normalize(column)} "
-                f"else to_char({c}, 'YYYY-MM-DD HH24:MI:SS.FF9') end"
+                f"else to_char({shown}, 'YYYY-MM-DD HH24:MI:SS.FF9') end"
             )
         if column.logical_type is LogicalType.TIME:
             # The same for TIME: a key's nanoseconds are kept.
@@ -774,6 +943,110 @@ class SnowflakeDialect(Dialect):
         n, d = f"({numerator})", f"({denominator})"
         return f"cast(({n} - mod({n}, {d})) / {d} as number(38,0))"
 
+    def segment_checksums(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        lo: int,
+        hi: int,
+        n_segments: int,
+        where: str | None = None,
+    ) -> dict[int, tuple[int, int]]:
+        """The shared checksums, after the VARIANT double check."""
+        self._check_variant_doubles(table, key, columns, where)
+        return super().segment_checksums(table, key, columns, lo, hi, n_segments, where)
+
+    def fetch_range(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        lo: int,
+        hi: int,
+        where: str | None = None,
+    ) -> dict[int | str, tuple[str, ...]]:
+        """The shared download, after the VARIANT double check."""
+        self._check_variant_doubles(table, key, columns, where)
+        return super().fetch_range(table, key, columns, lo, hi, where)
+
+    def _check_variant_doubles(
+        self, table: str, key: KeySpec, columns: Sequence[Column], where: str | None
+    ) -> None:
+        """Refuse a VARIANT holding a double its JSON text does not pin down.
+
+        TO_JSON prints a DOUBLE inside a VARIANT, OBJECT or ARRAY with 16
+        significant digits (`1.000000000000000e+00`), and a double needs 17
+        to round-trip: 1 and 1.0000000000000002, or 0.3 and 0.1 + 0.2, print
+        alike, so rows differing only there compared identical - and the
+        sample check reads the same text (RT-HF1, verified live). Snowflake
+        has no exact printing of a double inside a document, so a document
+        holding such a double is refused, naming the column, a key and the
+        path: once per table, column set and filter, one scan per JSON
+        column, before the first checksum. The test is exact without a
+        correctly rounded parse: if two doubles print one text, that text
+        parses back to at most one of them, so at least one is caught. A
+        double whose text parses back to itself has a text no other double
+        has, and is compared as before - as are integers and decimals, which
+        a VARIANT holds exactly.
+        """
+        json_columns = [c for c in columns if c.logical_type is LogicalType.JSON]
+        memo = (table, where, tuple(c.name for c in json_columns))
+        if not json_columns or memo in self._doubles_checked:
+            return
+        identity = self.key_identity(key)
+        for col in json_columns:
+            c = self.quote(col.name)
+            inexact = (
+                "typeof({v}) = 'DOUBLE' "
+                "and cast(to_json({v}) as float) <> cast({v} as float)"
+            )
+            sql = (
+                f"select k, p from (select {identity} as k, '' as p "
+                f"{self.rows_from(table, where, inexact.format(v=c))} limit 1) "
+                "union all "
+                f"select k, p from (select t.k, f.path as p from (select {identity} "
+                f"as k, to_variant({c}) as v {self.rows_from(table, where)}) t, "
+                "lateral flatten(input => t.v, recursive => true) f "
+                f"where {inexact.format(v='f.value')} limit 1) "
+                "limit 1"
+            )
+            found = self.query(sql)
+            if found:
+                k, path = found[0]
+                where_in = f" at {path}" if path else ""
+                raise self._err(
+                    f"VARIANT column {col.name!r} of {table} holds a double"
+                    f"{where_in} (key {k!r}) whose JSON text Snowflake prints with "
+                    "16 significant digits, which another double shares: two "
+                    "different values would compare identical. It cannot be "
+                    "compared exactly; leave it out with --exclude"
+                )
+        self._doubles_checked.add(memo)
+
+    def bucket_expr(self, key: KeySpec, k: str, lo: int, hi: int, n_segments: int) -> str:
+        """The shared bucket expression, unless it would pass 38 digits.
+
+        NUMBER(38,0) is the only integer Snowflake has - `int` is NUMBER(38,0)
+        - and it holds keys up to 10^38 - 1. The shared expression forms
+        `(k - lo) * n` and writes the span as a literal, so keys 0 to 10^37
+        died at 32 segments ("Number out of representable range"), and a span
+        past 10^38 cannot even be written (RT-HF9). For such a span the bucket
+        is read off its boundaries instead: bucket q starts at lo + ceil(q *
+        span / n) - exactly what `engine.bucket_bounds` inverts - so the key
+        is compared with n - 1 literals, each inside [lo, hi), with no
+        arithmetic at all. Every narrower span (all of BIGINT's) keeps the
+        shared SQL byte for byte, so no checksum moved.
+        """
+        span = hi - lo
+        if key.hashed or span * n_segments < 10**38:
+            return super().bucket_expr(key, k, lo, hi, n_segments)
+        whens = " ".join(
+            f"when {k} >= {self.int_literal(lo - (-(q * span) // n_segments))} then {q}"
+            for q in range(n_segments - 1, 0, -1)
+        )
+        return f"(case {whens} else 0 end)"
+
     def wide_int(self, expr: str) -> str:
         """Widen past 64 bits before arithmetic. NUMBER(38,0) holds 38 digits,
         which the key offset cannot overflow."""
@@ -785,6 +1058,28 @@ class SnowflakeDialect(Dialect):
         NUMBER(38,0) is far beyond any row count times 2^60.
         """
         return f"coalesce(sum(cast(({expr}) as number(38,0))), 0)"
+
+
+def _unquoted(predicate: str) -> str:
+    """`predicate` with every quoted region (`'...'`, `"..."`) blanked out.
+
+    A doubled quote closes and reopens, which leaves the region's text out
+    either way. Only for a predicate the shared check has passed: no
+    backslash before a quote, no dollar quoting, every quote closed.
+    """
+    out: list[str] = []
+    close = ""
+    for ch in predicate:
+        if close:
+            if ch == close:
+                close = ""
+            out.append(" ")
+        elif ch in "'\"":
+            close = ch
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _base(raw: str) -> str:
