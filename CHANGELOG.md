@@ -5,6 +5,51 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+### Upgrading from 0.4.0 — what you will notice
+
+Read this first; the detailed entries follow.
+
+- **Some comparisons that read identical in 0.4.0 now report differences.**
+  Those differences are real: red-team round H found and closed about 35 ways
+  two different values could render alike (legacy MySQL character sets,
+  BigQuery ARRAY/STRUCT/GEOGRAPHY, DuckDB nested types and empty lists on
+  1.3-1.4, Snowflake TIMESTAMP_TZ keys, SQL Server spatial SRIDs, PostgreSQL
+  money under a zero-decimal locale, and more, each listed below). Re-run any
+  0.4.0 comparison of those types before relying on it.
+- **Some runs now stop with a clear refusal (exit 2) instead of comparing
+  silently** - always where the old comparison could not be trusted:
+  a login that sees only some columns (MySQL column-level grants; on
+  PostgreSQL those columns become a schema difference), SQL Server columns
+  under dynamic data masking without `UNMASK`, Snowflake VARIANT doubles that
+  print alike, a DuckDB file that redefines a built-in or is not a DuckDB file,
+  MotherDuck URLs, MariaDB, Snowflake URL options the tool does not know, and
+  PostgreSQL extension types whose text is not exact. The message names the
+  side, the column and the fix (usually a grant or `--exclude`).
+- **A sample check that cannot run now makes the result "not proven"
+  (exit 1)**, where 0.4.0 still said identical. `--verify-sample 0` keeps the
+  old behaviour, and says so.
+- **The sample check is bigger:** 10,000 rows at 99.9% confidence by default
+  (was 1,000 at 99%), so the risk line reads "fewer than 0.069% of rows"; tables
+  of 10,000 rows or fewer are re-compared in full. Runs take slightly longer.
+- **New caveats on some runs:** row-level security under a PostgreSQL view, SQL
+  Server security policies (on every run whose login lacks `VIEW DEFINITION`,
+  because it cannot rule them out), Snowflake masking and row access policies,
+  PostgreSQL inheritance children, and every filtered run. Read them; they say
+  what the verdict does not cover.
+- **Fewer false alarms:** an integer column against a decimal column with no
+  fractional digits (e.g. PostgreSQL `bigint` against Snowflake `NUMBER(14,0)`)
+  now compares by value; DuckDB `DECIMAL(p,p)` keys match other engines.
+- **New:** `--where` / `--a-where` / `--b-where`, `--map`, `parity run CONFIG`,
+  Oracle (`pip install "parity-diff[oracle]"`), Snowflake key-pair login, and
+  rewritten user docs (`docs/output.md`, `docs/troubleshooting.md`,
+  `docs/engines.md`, `docs/limitations.md`). PostgreSQL connections now time
+  out after 30 s instead of hanging on an unreachable host.
+- **Nothing to migrate:** the tool stores no state between runs (`parity run
+  --resume` files are new in this release), so moved checksums only matter if
+  you compare raw checksums yourself.
+
+### Detailed changes
+
 - **Cross-engine fuzzer, round H: two false alarms fixed.**
   - **DuckDB DECIMAL(p,p) keys (RT-HX1).** A decimal with no integer digit
     printed no leading zero (`.25`, `-.517439`), where the key rule and every
