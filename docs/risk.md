@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: b0834c292d7b078c`
+Source fingerprint: `src-sha256: 2ec2dbbca7e3b36b`
 
 ## Summary
 
@@ -27,7 +27,7 @@ For one run that reports **identical**, on columns the rules cover:
 |---|---|---|
 | A real difference sums to the same checksum by accident | at most **2⁻⁶⁰ ≈ 8.67 × 10⁻¹⁹** per key range holding a difference | Proven bound |
 | A rendering error hides a difference, and the independent sample check misses it too | fewer than **1 − 0.001^(1/n)** of the rows, at 99.9% confidence, for n rows sampled — **0.069%** at the default n = 10,000 (about 1 row in 1,450); **0** when every row was compared | Proven bound |
-| An engine renders a value differently from the rules | **0 of 4,142** checks at float scale 6 outside the 26 required refusals (4,116 exact), every type with a rule × 6 engines | Measured |
+| An engine renders a value differently from the rules | **0 of 4,180** checks at float scale 6 outside the 26 required refusals (4,154 exact), every type with a rule × 6 engines | Measured |
 | Rows lost between the database and the comparison | **0**: the run is not identical when a download cannot explain a checksum difference | By design (enforced) |
 | A partial run read as complete | **0**: a run stopped by `--max-diffs` is never identical | By design (enforced) |
 | The sample check could not run, and the run reads as checked | **0**: a check that was asked for and failed to fetch its rows makes the run "not proven", never identical (exit 1). Only `--verify-sample 0` rests the verdict on the checksums alone, and the report then says the check was off and computes no risk figure | By design (enforced) |
@@ -35,7 +35,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A renamed column (`--map`) compared against the wrong counterpart | **0**: pairing is exact, ambiguous maps are refused | By design (tested) |
 | A row filter (`--where`) missing one of the queries that read the table | **0**: one code path builds every such query; a test records every statement on all six dialects | By design (tested) |
 | A filtered "identical" read as one about the whole table | **0**: the headline, a `filtered:` line, JSON and a caveat state the filter; a filtered run **proves nothing about rows outside it** | By design (enforced) |
-| A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()` without one snapshot) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
+| A row filter whose result changes during the run (`random()`, `clock_timestamp()`, `now()`/`current_timestamp()` unless the engine evaluates it once per run - BigQuery's snapshot does not pin its clock) | a change between two queries of the same range is **never identical** (row counts and each level's sums are cross-checked); a row entering the filter outside the key range first measured is not compared; otherwise **not bounded** | Not quantifiable |
 | A `parity run` summary reading stronger than one of its pairs | **0**: the run is identical only if every pair is; every pair's qualifiers appear in every output format; an error or Ctrl-C is exit 2 | By design (tested) |
 | A `--resume`d pair whose tables or settings changed carried over as identical | **0** for the config entry, the tool version and the connection strings as expanded (hashed); **not bounded** for data written since the earlier run — the report names it and its timestamp | By design / Not quantifiable |
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
@@ -43,7 +43,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
 | Row-level security hides rows from the reading role (PostgreSQL) | **not bounded**: those rows are not compared; every run names the table in a caveat | Not quantifiable |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
-| Columns of types outside the rules (BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, ranges, arrays of JSON, geometry, XML; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
+| Columns of types outside the rules (BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, ranges, geometry, XML; listed per run) | **no bound**; named in the report as not covered. Not only false alarms: until round H, BigQuery's text for ARRAY/STRUCT/GEOGRAPHY collided (false matches). Now injective on BigQuery; elsewhere a raw text cast whose injectivity is per engine | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
 
 How to state a run's risk to a client: quote the run's own `risk` line (or
@@ -126,9 +126,9 @@ and 4.3. This is where every past false match lived.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Rendering disagrees with the rules, covered types | **0 of 4,142** checks at scale 6 (4,116 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
+| Rendering disagrees with the rules, covered types | **0 of 4,180** checks at scale 6 (4,154 exact, 26 required refusals), same at scale 2; see `docs/coverage.md` per type and engine | Measured |
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
-| Types outside the rules: BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report | Not quantifiable |
+| Types outside the rules: BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report. The real risk is not only false alarms: an engine's text for such a type can collide - BigQuery's `FORMAT('%t')` printed `['a, b']` like `['a', 'b']` and a NULL struct field like `'NULL'` (round H, fixed). On BigQuery every one is now injective by construction (STRUCT by `canonical_struct_text`, GEOGRAPHY as WKB, INTERVAL/RANGE components printed exactly); on other engines the fallback is the engine's own text cast, injective only as far as that cast is | Not quantifiable |
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
 | A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |
@@ -141,7 +141,10 @@ Findings this check produced and fixed: 8 (COV-1 to COV-8), two of them
 false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
 +05:00:30 as +05:30) and one a refusal of ordinary values (SQL Server
 sql_variant floats, -0.0 and negatives below 1e-99); the type rules found
-one more (BigQuery SQL NULL equal to JSON `null`). Red-team round G (settings, versions): 14
+one more (BigQuery SQL NULL equal to JSON `null`). Red-team round H on BigQuery: 11
+findings, 3 of them false matches (ARRAY, STRUCT and GEOGRAPHY text) and one
+a `--where` bracket escape in the scanner every engine shares, all fixed;
+BigQuery ARRAY now follows the list rule. Red-team round G (settings, versions): 14
 problems, 8 of them false matches, all fixed. Round H, MySQL: 18 findings,
 4 of them false matches (legacy character sets, ucs2 surrogates, column-level
 grants, the ENUM error value), all fixed; open are a Ctrl-C that cannot

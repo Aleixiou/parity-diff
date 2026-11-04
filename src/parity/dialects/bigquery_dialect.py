@@ -45,17 +45,24 @@ The BigQuery-specific decisions, each confirmed by that run:
   the whole walk sees one version of a live table (CLAUDE.md section 4.9).
   Views are *not* pinned: BigQuery silently ignores `FOR SYSTEM_TIME AS OF` on
   a view - verified, it returned the live row count - so a view is read live at
-  every level, the same READ COMMITTED limitation Snowflake has.
+  every level, the same READ COMMITTED limitation Snowflake has. A table
+  clone honours the clause and is pinned like a base table (verified, RT-HB5);
+  a table snapshot is immutable, so it is read as it is, with no caveat.
 - **Read-only by construction.** Credentials are requested with the
   `bigquery.readonly` OAuth scope and queries go through `jobs.query`. Verified:
-  SELECT, INFORMATION_SCHEMA and time travel work; INSERT, DELETE, CREATE, DROP
-  and multi-statement scripts are refused by the server ("Need BigQuery or
-  Cloud Platform write scope"). Credentials that cannot be down-scoped (a VM's
-  metadata server) keep their own scopes; the dialect still issues SELECT only.
+  SELECT, INFORMATION_SCHEMA and time travel work; INSERT, DELETE, UPDATE,
+  MERGE, CREATE, DROP, EXPORT DATA, temp tables, transactions and EXECUTE
+  IMMEDIATE are refused by the server ("Need BigQuery or Cloud Platform write
+  scope"), inside a multi-statement script as much as alone. A script that
+  only reads (DECLARE, a temp function, SELECT) does run - the scope refuses
+  writes, not scripts - but the dialect never sends one, and `;` is refused
+  in a row filter. Credentials that cannot be down-scoped (a VM's metadata
+  server) keep their own scopes; the dialect still issues SELECT only.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import parse_qs, unquote
@@ -65,7 +72,9 @@ from parity.dialects.base import (
     FLOAT_MAX_MAGNITUDE_SQL,
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
+    LIST_ELEMENT_TYPES,
     Dialect,
+    escape_canonical_text,
     float_tiny_sql,
     float_zero_text,
 )
@@ -74,6 +83,15 @@ from parity.types import Column, LogicalType
 #: Read-only OAuth scope. Under it the server refuses any DML, DDL or script,
 #: so no bug in query building can write to a user's project.
 READONLY_SCOPE = "https://www.googleapis.com/auth/bigquery.readonly"
+
+#: Table types that honour `FOR SYSTEM_TIME AS OF`: a base table and a table
+#: clone (verified live: a row inserted into a clone mid-walk stays invisible).
+_PINNABLE = {"BASE TABLE", "CLONE"}
+
+#: Table types that cannot change, so reading them live is one snapshot
+#: anyway: a table snapshot is read-only by definition (BigQuery refuses DML
+#: on it), and needs neither time travel nor a caveat.
+_IMMUTABLE = {"SNAPSHOT"}
 
 #: Query parameters `bigquery://` understands. Anything else is refused rather
 #: than ignored: a misspelt `locaton=` silently dropped is a query routed to the
@@ -145,9 +163,10 @@ class BigQueryDialect(Dialect):
         #: Base tables (project, dataset, table) that read at `snapshot`. Only
         #: base tables: on a view BigQuery ignores time travel without an error.
         self._pinned: set[tuple[str, str, str]] = set()
-        #: Tables `columns()` found to be views (or anything but a base
-        #: table): read live at every level, which `caveats` reports.
-        self._live: set[tuple[str, str, str]] = set()
+        #: Tables `columns()` found to be views (or anything else time travel
+        #: does not pin), with their table_type: read live at every level,
+        #: which `caveats` reports.
+        self._live: dict[tuple[str, str, str], str] = {}
 
     # ---------------------------------------------------------------- setup
 
@@ -206,9 +225,19 @@ class BigQueryDialect(Dialect):
 
         Three parts are accepted here, unlike the other engines, because
         reading another project's dataset (a shared or public one) while
-        billing your own is ordinary BigQuery usage.
+        billing your own is ordinary BigQuery usage. The name may come as the
+        console copies it, in backticks - whole (`` `p.d.t` ``) or per part
+        (`` `p`.`d`.`t` ``) - and the project may be domain-scoped
+        (``example.com:proj``), whose own dot is not a separator (RT-HB7,
+        RT-HB10).
         """
-        parts = table.split(".")
+        parts = _split_table_name(table)
+        if parts is None:
+            raise self._err(
+                f"table name {table!r} has backticks parity cannot read: quote "
+                "the whole name (`project.dataset.table`) or each part "
+                "(`project`.`dataset`.`table`), or leave the backticks out"
+            )
         if len(parts) == 3:
             return parts[0], parts[1], parts[2]
         if len(parts) == 2:
@@ -249,6 +278,11 @@ class BigQueryDialect(Dialect):
         project, dataset, name = self._resolve(table)
         schema = f"{project}.{dataset}"
         info = self.qualify_parts(project, dataset)
+        # `is_hidden`: an ingestion-time partitioned table lists its
+        # pseudo-columns (_PARTITIONTIME, _PARTITIONDATE) with is_hidden YES.
+        # They are load metadata, not data - a copy of the table elsewhere
+        # has no such column, and a reload of the same rows has other values
+        # (RT-HB4) - and `select *` leaves them out too.
         sql = (
             "select c.column_name, c.data_type, t.table_type, "
             "format_timestamp('%Y-%m-%d %H:%M:%E6S+00', current_timestamp()) "
@@ -256,26 +290,56 @@ class BigQueryDialect(Dialect):
             f"join {info}.INFORMATION_SCHEMA.TABLES as t "
             "on c.table_name = t.table_name "
             f"where c.table_name = {self.string_literal(name)} "
+            "and c.is_hidden = 'NO' "
             "order by c.ordinal_position"
         )
         try:
             rows = self.query(sql)
         except Exception as exc:
             # A missing dataset and a dataset this account cannot see return
-            # the same 403 from BigQuery, so the message has to cover both.
+            # the same 403 from BigQuery, so the message has to cover both -
+            # and so does a dataset in another location than the job (RT-HB8).
             raise self._err(
                 f"cannot read dataset {schema} while looking for {table}: it "
-                f"does not exist, or this account lacks access to it ({exc})"
+                f"does not exist, or this account lacks access to it"
+                f"{self._location_hint(project, dataset)} ({exc})"
             ) from exc
         if not rows:
             raise self._err(self._not_found(table, schema, name))
         if self.snapshot is None:
             self.snapshot = str(rows[0][3])
-        if rows[0][2] == "BASE TABLE":
+        kind = str(rows[0][2])
+        if kind in _PINNABLE:
             self._pinned.add((project, dataset, name))
-        else:
-            self._live.add((project, dataset, name))
+        elif kind not in _IMMUTABLE:
+            self._live[(project, dataset, name)] = kind
         return [_column(str(r[0]), str(r[1])) for r in rows]
+
+    def _location_hint(
+        self, project: str, dataset: str
+    ) -> str:  # pragma: no cover - live
+        """Name the dataset's location when it is not where jobs run.
+
+        A job runs in one location and cannot read a dataset in another, and
+        the server's error is the same "not found or no access" as for a
+        missing dataset. Dataset metadata is readable across locations, so ask
+        for it and say which `?location=` would work. Best effort: when that
+        lookup fails too, the hint says where jobs run and how to change it.
+        """
+        here = self._location or "the dataset's default location"
+        try:
+            found = self._client.get_dataset(f"{project}.{dataset}").location
+        except Exception:  # noqa: BLE001 - a hint only; the real error follows
+            return (
+                f"; or it is in another location than this connection's jobs "
+                f"({here}): add ?location=<its region> to the connection string"
+            )
+        if found and (self._location or "").lower() != str(found).lower():
+            return (
+                f"; it is in location {found} and this connection runs jobs in "
+                f"{here}: add ?location={found} to the connection string"
+            )
+        return ""
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """Say so when the walk is not one snapshot (RT-D7).
@@ -287,14 +351,16 @@ class BigQueryDialect(Dialect):
         """
         if not self._live:
             return []
-        names = sorted(".".join(ref) for ref in self._live)
+        names = sorted(
+            f"{'.'.join(ref)} ({kind.lower()})" for ref, kind in self._live.items()
+        )
         note = (
-            f"{' and '.join(names)} is not a base table, and BigQuery ignores "
-            "time travel on a view, so it is read live at every level rather "
-            "than as one snapshot: rows written during the diff can be "
-            "reported as differences that never existed at one point in time, "
-            "or missed. Diff the base table, or a snapshot of the view, for a "
-            "single-snapshot result"
+            f"{' and '.join(names)} is not a base table or a clone, and "
+            "BigQuery ignores time travel on it, so it is read live at every "
+            "level rather than as one snapshot: rows written during the diff "
+            "can be reported as differences that never existed at one point "
+            "in time, or missed. Diff the base table, or a snapshot of it, for "
+            "a single-snapshot result"
         )
         return [note]
 
@@ -406,34 +472,47 @@ class BigQueryDialect(Dialect):
             # From 2^53 every double is an integer, rebuilt exactly from two
             # INT64s; past 2^116 the high half overflows and ERROR() refuses.
             # Inf/NaN cannot reach BIGNUMERIC, so they become the fixed tokens.
+            #
+            # The whole is one WITH expression, so each piece is written - and
+            # computed - once. Spelt out inline it was ~2,200 characters a
+            # column (r15 and r16 twice each, the exponent five times), and
+            # ~460 FLOAT64 columns passed BigQuery's 1,024K-character query
+            # limit (RT-HB9). WITH binds eagerly, so the BIGNUMERIC is NULL
+            # outside the band that needs it: CAST raises on Inf, NaN and
+            # magnitudes past BIGNUMERIC, and ROUND past 38 places, which the
+            # CASE used to keep out of reach. The text is unchanged - verified
+            # on the 1,565-value sample at scales 0, 6 and 20.
             self.float_scale_for(column)  # BIGNUMERIC's 38 places bound it
-            xb = f"abs(cast({c} as bignumeric))"
-            e = (
-                f"(case when {xb} >= 1 then length(cast(trunc({xb}) as string)) - 1 "
-                f"else -1 - length(regexp_extract(cast({xb} as string), r'^0[.](0*)')) end)"
-            )
-            r15, r16, r17 = (
-                f"round(cast({c} as bignumeric), {n - 1} - {e}, 'ROUND_HALF_EVEN')"
-                for n in (15, 16, 17)
-            )
-            shortest = (
-                f"case when cast({r15} as float64) = {c} then {r15} "
-                f"when cast({r16} as float64) = {c} then {r16} else {r17} end"
-            )
             two53 = f"{FLOAT_EXACT_INT_FROM}"
-            hi = f"trunc({c} / {two53})"
+            tiny = float_tiny_sql(s)
+            # WITH variables shadow columns; only the first binding reads one.
+            x, b, a, e, h = "_fx", "_fb", "_fa", "_fe", "_fh"
+            r15, r16, r17 = "_f15", "_f16", "_f17"
+            rounds = ", ".join(
+                f"{r} as round({b}, {n - 1} - {e}, 'ROUND_HALF_EVEN')"
+                for r, n in ((r15, 15), (r16, 16), (r17, 17))
+            )
             expr = (
-                f"case when is_inf({c}) then (case when {c} > 0 then 'Infinity' "
+                f"with({x} as {c}, "
+                f"{b} as if(abs({x}) >= {tiny} and abs({x}) < {two53}, "
+                f"cast({x} as bignumeric), null), "
+                f"{a} as abs({b}), "
+                f"{e} as case when {a} >= 1 then length(cast(trunc({a}) as string)) - 1 "
+                f"else -1 - length(regexp_extract(cast({a} as string), r'^0[.](0*)')) end, "
+                f"{rounds}, "
+                f"{h} as trunc({x} / {two53}), "
+                f"case when is_inf({x}) then (case when {x} > 0 then 'Infinity' "
                 f"else '-Infinity' end) "
-                f"when is_nan({c}) then 'NaN' "
-                f"when abs({c}) < {float_tiny_sql(s)} then '{float_zero_text(s)}' "
-                f"when abs({c}) < {two53} "
-                f"then format({fmt}, round({shortest}, {s})) "
-                f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as float64) "
-                f"then format({fmt}, cast(cast({hi} as int64) as bignumeric) * {two53} "
-                f"+ cast({c} - {hi} * {two53} as int64)) "
-                f"when {c} is not null then error(concat('{FLOAT_OUT_OF_RANGE_MESSAGE}', "
-                f"cast({c} as string))) end"
+                f"when is_nan({x}) then 'NaN' "
+                f"when abs({x}) < {tiny} then '{float_zero_text(s)}' "
+                f"when abs({x}) < {two53} then format({fmt}, round(case "
+                f"when cast({r15} as float64) = {x} then {r15} "
+                f"when cast({r16} as float64) = {x} then {r16} else {r17} end, {s})) "
+                f"when abs({x}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as float64) "
+                f"then format({fmt}, cast(cast({h} as int64) as bignumeric) * {two53} "
+                f"+ cast({x} - {h} * {two53} as int64)) "
+                f"when {x} is not null then error(concat('{FLOAT_OUT_OF_RANGE_MESSAGE}', "
+                f"cast({x} as string))) end)"
             )
         elif t is LogicalType.BOOLEAN:
             # `when not`, never `else`: an `else` sends NULL to 'false'.
@@ -468,16 +547,87 @@ class BigQueryDialect(Dialect):
             # false match, unless NULL is kept NULL for the coalesce first.
             text = f"if({c} is null, null, to_json_string({c}))"
             expr = self.escape_text(self.json_compact_layout(text))
+        elif t is LogicalType.LIST:
+            expr = self._array_text(column)
         else:
-            # Anything else (ARRAY, STRUCT, INTERVAL, ...) through
-            # FORMAT('%t'), which renders every type - CAST to STRING raises on
-            # ARRAY/STRUCT and would kill the diff. But '%t' renders NULL as the
-            # *string* 'NULL', which would slip past the coalesce and compare
-            # equal to a real 'NULL' on the other side; hence the explicit guard.
-            # Arbitrary text (strings inside arrays and structs, JSON), so
-            # escaped like STRING.
-            expr = self.escape_text(f"if({c} is null, null, format('%t', {c}))")
+            expr = self._unknown_text(column)
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    #: The `WITH OFFSET` alias an array's elements are ordered by.
+    LIST_OFFSET_NAME = "__parity_offset"
+
+    def list_element(self, column: Column) -> Column:
+        """The element of an `ARRAY<T>` column: `T`, by BigQuery's own map."""
+        raw = column.raw_type.strip()
+        if not (raw.upper().startswith("ARRAY<") and raw.endswith(">")):
+            return super().list_element(column)  # the shared `T[]` spelling
+        return _column(self.LIST_ELEMENT_NAME, raw[6:-1].strip())
+
+    def _array_text(self, column: Column) -> str:
+        """An ARRAY as `canonical_list_text`: each element by its own rule.
+
+        The elements in storage order (`WITH OFFSET`), each followed by the
+        terminator, joined; an empty array joins to NULL, hence `ifnull`,
+        and renders `[]`. '%t' printed `[a, b]` with strings unquoted, so
+        ['a, b'] equalled ['a', 'b'] and [''] equalled [] (RT-HB1). A table
+        cannot hold a NULL array (it stores one as empty) or a NULL element;
+        a view's may, and they render the sentinel. Elements without a list
+        rule (STRUCT, GEOGRAPHY, JSON, INTERVAL) render by this dialect's
+        own injective text and keep the column UNKNOWN.
+        """
+        c = self.quote(column.name)
+        if column.logical_type is LogicalType.LIST:
+            element = self.list_element_text(column)
+        else:
+            element = self.normalize(self.list_element(column))
+        var = self.quote(self.LIST_ELEMENT_NAME)
+        off = self.quote(self.LIST_OFFSET_NAME)
+        each = self.concat_sql(element, self.list_terminator_sql())
+        return (
+            f"if({c} is null, null, concat('[', ifnull((select string_agg({each}, '' "
+            f"order by {off}) from unnest({c}) as {var} with offset as {off}), ''), ']'))"
+        )
+
+    def _unknown_text(self, column: Column) -> str:
+        """Text for a type with no shared rule - injective on BigQuery.
+
+        STRUCT renders by `canonical_struct_text`: each field by its own
+        rule, named (RT-HB2: '%t' printed `(a, b, c)` for both ('a, b', 'c')
+        and ('a', 'b, c'), and a NULL field as the string 'NULL'). The fields
+        are read through `unnest([c])`, which turns them into columns the
+        field rules can name. A struct with anonymous fields (only a view's
+        can have them) cannot be read that way and renders as TO_JSON_STRING,
+        which quotes strings and prints floats to round-trip precision.
+        ARRAY of such an element follows `canonical_list_text` too. GEOGRAPHY
+        renders as its WKB, exactly (RT-HB3: WKT kept 15 significant digits,
+        so points stored differently compared equal). Anything else
+        (INTERVAL, RANGE) through FORMAT('%t'), which prints each component
+        exactly. '%t' renders NULL as the *string* 'NULL', which would slip
+        past the coalesce, hence the guard. Text values inside are escaped
+        like STRING.
+        """
+        c = self.quote(column.name)
+        raw = column.raw_type.strip()
+        up = raw.upper()
+        if up.startswith("ARRAY<") and raw.endswith(">"):
+            return self._array_text(column)
+        if up.startswith("STRUCT<") and raw.endswith(">"):
+            fields = _struct_fields(raw[7:-1])
+            if fields is None:
+                return self.escape_text(f"if({c} is null, null, to_json_string({c}))")
+            mark = self.concat_sql(self.backslash_sql(), "'='")
+            parts = ", ".join(
+                f"{self.string_literal(escape_canonical_text(name))}, {mark}, "
+                f"{self.normalize(_column(name, kind))}, {self.list_terminator_sql()}"
+                for name, kind in fields
+            )
+            return (
+                f"if({c} is null, null, (select concat('{{', {parts}, '}}') "
+                f"from unnest([{c}])))"
+            )
+        if up == "GEOGRAPHY":
+            return f"to_hex(st_asbinary({c}))"
+        return self.escape_text(f"if({c} is null, null, format('%t', {c}))")
 
     def concat_sql(self, left: str, right: str) -> str:
         """`concat()`, the spelling the sentinel has always used here."""
@@ -564,6 +714,112 @@ class BigQueryDialect(Dialect):
         return f"coalesce(sum(cast(({expr}) as bignumeric)), 0)"
 
 
+def _split_table_name(table: str) -> list[str] | None:
+    """A table reference's parts, backticks and domain-scoped projects read.
+
+    Split on dots outside backticks; a backticked part is taken literally,
+    its backticks stripped. One backticked part holding the whole name
+    (`` `p.d.t` ``, as the console copies it) is read as if unquoted. A bare
+    part holding `:` names a domain-scoped project (``example.com:proj``):
+    it and the bare parts before it are one project, rejoined by their dots.
+    None when a backtick appears anywhere but around a whole part - one is
+    never stripped from inside a name.
+    """
+    parts: list[str] = []
+    quoted: list[bool] = []
+    i = 0
+    while True:
+        if table.startswith("`", i):
+            end = table.find("`", i + 1)
+            if end < 0:
+                return None
+            parts.append(table[i + 1 : end])
+            quoted.append(True)
+            i = end + 1
+            if i < len(table) and table[i] != ".":
+                return None
+        else:
+            end = table.find(".", i)
+            end = len(table) if end < 0 else end
+            part = table[i:end]
+            if "`" in part:
+                return None
+            parts.append(part)
+            quoted.append(False)
+            i = end
+        if i >= len(table):
+            break
+        i += 1  # the dot
+    if len(parts) == 1 and quoted[0]:
+        return None if "`" in parts[0] else _split_table_name(parts[0])
+    for j, part in enumerate(parts):
+        if ":" in part and not any(quoted[: j + 1]):
+            return [".".join(parts[: j + 1]), *parts[j + 1 :]]
+    return parts
+
+
+def _split_top_level(body: str) -> list[str]:
+    """`body` split at commas outside `<>`, `()`, backticks and quotes."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == "\\":
+                i += 1  # an escaped character inside a quoted name
+            elif ch == quote:
+                quote = ""
+        elif ch in "`'\"":
+            quote = ch
+        elif ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+        i += 1
+    parts.append(body[start:])
+    return parts
+
+
+_FIELD = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\s+(\S.*)$", re.S)
+
+
+def _struct_fields(body: str) -> list[tuple[str, str]] | None:
+    """The (name, type) fields of `STRUCT<body>`, or None for anonymous ones.
+
+    INFORMATION_SCHEMA prints `STRUCT<x STRING, y NUMERIC(10, 2)>`, a name
+    that needs quoting in backticks. A field with no name (`STRUCT<INT64>`,
+    possible in a view) cannot be selected by name, so the struct is read
+    another way.
+    """
+    fields: list[tuple[str, str]] = []
+    for part in _split_top_level(body):
+        part = part.strip()
+        if part.startswith("`"):
+            end = 1
+            name = ""
+            while end < len(part) and part[end] != "`":
+                if part[end] == "\\" and end + 1 < len(part):
+                    end += 1
+                name += part[end]
+                end += 1
+            kind = part[end + 1 :].strip()
+            if end >= len(part) or not kind:
+                return None
+            fields.append((name, kind))
+            continue
+        match = _FIELD.match(part)
+        if not match:
+            return None
+        fields.append((match.group(1), match.group(2).strip()))
+    return fields or None
+
+
 def _column(name: str, raw: str) -> Column:
     """Build a Column, marking TIMESTAMP as an instant and DATETIME as naive."""
     t = raw.upper()
@@ -580,9 +836,15 @@ def map_type_bigquery(raw: str) -> LogicalType:
 
     INFORMATION_SCHEMA reports parameterised types as `NUMERIC(12, 2)` and
     `STRING(20)`, and aliases such as SMALLINT as INT64; strip the parameters.
-    Composite types (`ARRAY<INT64>`, `STRUCT<...>`) fall through to UNKNOWN.
+    An ARRAY whose element has a list rule is a LIST (`ARRAY<STRING(10)>`
+    included); any other ARRAY, STRUCT, GEOGRAPHY, INTERVAL and RANGE are
+    UNKNOWN, rendered injectively by the dialect (`_unknown_text`).
     """
-    t = raw.upper().split("(")[0].strip()
+    stripped = raw.strip()
+    if stripped.upper().startswith("ARRAY<") and stripped.endswith(">"):
+        element = map_type_bigquery(stripped[6:-1])
+        return LogicalType.LIST if element in LIST_ELEMENT_TYPES else LogicalType.UNKNOWN
+    t = raw.upper().split("(")[0].split("<")[0].strip()
     if t in {"INT64", "INTEGER", "INT", "SMALLINT", "BIGINT", "TINYINT", "BYTEINT"}:
         return LogicalType.INTEGER
     if t in {"NUMERIC", "DECIMAL", "BIGNUMERIC", "BIGDECIMAL"}:

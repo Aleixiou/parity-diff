@@ -144,22 +144,30 @@ hex), JSON (the engine's normalised document), and:
   differently across a DST change;
 - **time with time zone** (PostgreSQL timetz, DuckDB TIMETZ) as local time and
   offset: `12:00+05:45` and `06:15+00` differ;
-- **arrays and lists** (PostgreSQL arrays, DuckDB lists) of integers,
+- **arrays and lists** (PostgreSQL arrays, DuckDB lists, BigQuery ARRAY) of integers,
   decimals, floats, booleans, text, dates, timestamps, times, binary, bit
   strings, intervals, timetz or inet, element by element by each element's
   rule (`[]`, `['']`, `[NULL]` and `['a,b']` against `['a','b']` all differ).
   A PostgreSQL array's dimensions and lower bounds are part of its value (a
-  2x2 array is not its four elements). A list cannot be a key;
+  2x2 array is not its four elements). A list cannot be a key. A BigQuery
+  table cannot store a NULL array (it stores an empty one) or a NULL
+  element, so a NULL array on another engine reads as different from
+  BigQuery's `[]`;
 - **inet/cidr** (PostgreSQL) as `address/prefix`: `10.0.0.1/32` is not
   `10.0.0.1/8`;
 - **SQL Server sql_variant** as base type and exact value, so `int 1`,
   `bigint 1` and `N'1'` differ (floats as their IEEE bits).
 
-**Anything else** — BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs,
-ranges, geometry, XML — is compared as raw text, reported as a warning and
-listed as not covered by the sample check: two engines may render it
-differently for reasons that have nothing to do with the data, and no risk
-figure covers it. DuckDB `UNION`/`VARIANT` and Snowflake `VARIANT` keep their
+**Anything else** — BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of
+those or of JSON, nested lists, other engines' structs, ranges, geometry,
+XML — is compared as text, reported as a warning and listed as not covered
+by the sample check: two engines may render it differently for reasons that
+have nothing to do with the data, and no risk figure covers it. On BigQuery
+that text is injective by construction (a STRUCT is each field by its own
+rule, named; GEOGRAPHY its WKB; INTERVAL and RANGE print every component),
+so two different stored values never render alike there; it used to be
+`FORMAT('%t')`, which printed strings unquoted and NULL fields as `NULL` -
+false matches (RT-HB1..HB3). DuckDB `UNION`/`VARIANT` and Snowflake `VARIANT` keep their
 type tag, so `1` and `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds
 when it has any.
 
@@ -207,7 +215,8 @@ The per-type, per-engine evidence is [`coverage.md`](coverage.md).
   query reads a base table `FOR SYSTEM_TIME AS OF` the instant of the first
   one. DuckDB files are opened read-only.
 - **A BigQuery view is not pinned** — BigQuery silently ignores time travel on
-  views — and neither is a MySQL table on a non-transactional engine (MyISAM,
+  views (and on external tables and materialized views); a table clone is
+  pinned and a table snapshot cannot change — and neither is a MySQL table on a non-transactional engine (MyISAM,
   MEMORY); like every table on Snowflake (READ COMMITTED only), such a source
   changing during the run can produce differences that never existed at one
   point in time, or hide ones that did. **Every run says so** when it

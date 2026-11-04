@@ -123,9 +123,10 @@ NOT_LOADED: dict[str, dict[str, str]] = {
         "mapped": "INT64 aliases (INTEGER, SMALLINT, ...), BIGDECIMAL, "
         "parameterised NUMERIC(p,s) / STRING(n) / BYTES(n); a JSON null (the "
         "load job cannot store one; the NULL guard is pinned offline)",
-        "unknown": "ARRAY, STRUCT, GEOGRAPHY, INTERVAL, RANGE (no rule yet: a "
-        "BigQuery ARRAY cannot be NULL or hold NULLs, so it meets another "
-        "engine's arrays only partly)",
+        "unknown": "STRUCT, GEOGRAPHY, INTERVAL, RANGE, and ARRAY of those or "
+        "of JSON (no cross-engine rule; rendered injectively: STRUCT field by "
+        "field, GEOGRAPHY as WKB). ARRAY of ruled types follows the list rule, "
+        "but a BigQuery table cannot store a NULL array or a NULL element",
     },
     "snowflake": {
         "mapped": "NUMBER(p,0) for p < 38 and NUMBER(p,s) for other s, INT/BIGINT "

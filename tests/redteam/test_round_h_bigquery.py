@@ -169,52 +169,34 @@ def nested(bq):
     return a, b
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB1: ARRAY renders through FORMAT('%t') with strings unquoted, so "
-    "['a, b'] equals ['a', 'b'] and [''] equals [] - a false match",
-)
 def test_array_elements_keep_their_boundaries(bigquery_url, nested):
     result = _bq_bq(bigquery_url, *nested, columns=["arr"])
     assert _found(result) == [(2, "different", ["arr"]), (3, "different", ["arr"])]
 
 
 def test_array_unquoted_strings_collide_in_the_rendering_itself(bq):
-    """The mechanism behind RT-HB1, pinned on literals: if BigQuery ever
-    quotes strings in '%t', this fails and RT-HB1 must be re-examined."""
+    """The mechanism behind RT-HB1, pinned on literals: '%t' itself still
+    collides (so it must never come back), and the dialect's rendering -
+    `canonical_list_text` since the fix - keeps the four apart."""
     run, *_ = bq
-    got = run(
-        "select "
-        + ", ".join(
-            "(" + _render(t, v) + ")"
-            for t, v in [
-                ("ARRAY<STRING>", "['a, b']"),
-                ("ARRAY<STRING>", "['a', 'b']"),
-                ("ARRAY<BYTES>", "[b'a, b']"),
-                ("ARRAY<BYTES>", "[b'a', b'b']"),
-            ]
-        )
-    )[0]
-    assert got[0] == got[1] == "[a, b]"
-    assert got[2] == got[3] == "[a, b]"
+    cases = [
+        ("ARRAY<STRING>", "['a, b']"),
+        ("ARRAY<STRING>", "['a', 'b']"),
+        ("ARRAY<BYTES>", "[b'a, b']"),
+        ("ARRAY<BYTES>", "[b'a', b'b']"),
+    ]
+    raw = run("select " + ", ".join(f"format('%t', {v})" for _, v in cases))[0]
+    assert raw[0] == raw[1] == "[a, b]"
+    assert raw[2] == raw[3] == "[a, b]"
+    got = run("select " + ", ".join("(" + _render(t, v) + ")" for t, v in cases))[0]
+    assert len(set(got)) == 4, got
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB2: STRUCT renders through FORMAT('%t'): ('a, b', 'c') equals "
-    "('a', 'b, c'), and a NULL field equals the string 'NULL' - a false match",
-)
 def test_struct_fields_keep_their_boundaries_and_nulls(bigquery_url, nested):
     result = _bq_bq(bigquery_url, *nested, columns=["st"])
     assert _found(result) == [(2, "different", ["st"]), (3, "different", ["st"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB3: GEOGRAPHY renders as WKT with 15 significant digits, so "
-    "points stored with different coordinates (ST_X 0.9999999999999998 vs 1.0) "
-    "compare identical - a false match",
-)
 def test_geography_points_that_are_stored_differently_differ(bigquery_url, nested, bq):
     run, _, ds, _ = bq
     a, b = nested
@@ -228,12 +210,6 @@ def test_geography_points_that_are_stored_differently_differ(bigquery_url, neste
     assert _found(result) == [(2, "different", ["g"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB4: the hidden pseudo-column _PARTITIONTIME of an ingestion-time "
-    "partitioned table is listed by INFORMATION_SCHEMA.COLUMNS and compared as "
-    "data - a schema difference against any copy, every row against a reload",
-)
 def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tmp_path):
     run, name, ds, _ = bq
     t = name("ingest")
@@ -251,11 +227,6 @@ def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tm
     assert _found(result) == [(2, "different", ["v"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB5: a table CLONE honours FOR SYSTEM_TIME AS OF but is read live "
-    "(table_type 'CLONE' is not 'BASE TABLE'), with a caveat calling it a view",
-)
 def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
     run, name, ds, _ = bq
     base, clone = name("cl_base"), name("cl_clone")
@@ -281,12 +252,6 @@ def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
 BRACKET_ESCAPE = "']' in unnest([']'])) or (true or 'x' in unnest(['['])"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB6: the --where check skips `[` to the first `]` even inside a "
-    "string literal, so a predicate with `[']']` escapes its parentheses (and "
-    "the bucket bounds) on BigQuery",
-)
 def test_a_bracketed_string_cannot_escape_the_filter_parentheses():
     assert row_filter_problem(BRACKET_ESCAPE) is not None
 
@@ -302,11 +267,6 @@ def test_the_bracket_predicate_really_escapes_on_bigquery(bq):
     assert got == [(10,)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB7: a domain-scoped project (example.com:proj) cannot be named in "
-    "a three-part table name; its dot splits it into four parts and it is refused",
-)
 def test_a_domain_scoped_project_can_be_named_in_the_table():
     d = BigQueryDialect(side="A")
     d.project = "billing-project"
@@ -570,12 +530,6 @@ def test_materialized_view_is_read_live_and_compared(bigquery_url, bq, tmp_path)
     assert any("read live" in w for w in result.warnings)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB8: a table in another region (US public data from an EU "
-    "connection) is reported as missing or inaccessible; nothing points at the "
-    "location or at ?location=",
-)
 def test_a_table_in_another_location_fails_naming_the_location(bigquery_url):
     """The test dataset is in the EU; a US public table cannot be read by a job
     in the EU (with `?location=US` the same call succeeds). The error must
@@ -774,12 +728,6 @@ def test_cli_end_to_end_json_exit_code_and_no_credentials(bigquery_url, bq, tmp_
         assert secret not in blob
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB9: each FLOAT64 column's rendering is ~2,200 characters, so a "
-    "table of 500 FLOAT64 columns exceeds BigQuery's 1,024K-character query "
-    "limit and cannot be compared at all",
-)
 def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path):
     run, name, ds, _ = bq
     n = 500
@@ -799,10 +747,11 @@ def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path
 
 
 def test_the_rendering_length_that_breaks_the_query_limit():
-    """The arithmetic behind RT-HB9, offline: the FLOAT64 expression alone is
-    over 2,000 characters, so ~460 columns reach 1,024K."""
+    """The arithmetic behind RT-HB9, offline: the FLOAT64 expression was over
+    2,000 characters, so ~460 columns reached 1,024K. As one WITH expression
+    it is under 1,300, so ~800 fit."""
     d = BigQueryDialect()
-    assert len(d.normalize(_column("f499", "FLOAT64"))) > 2000
+    assert len(d.normalize(_column("f499", "FLOAT64"))) < 1300
 
 
 @pytest.mark.parametrize(
@@ -847,12 +796,6 @@ def test_schema_changes_and_replacement_mid_walk_stay_invisible(bigquery_url, bq
         fresh.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB10: a table written as the BigQuery console copies it, "
-    "`project.dataset.table` in backticks, is refused as 'Invalid project ID' "
-    "or 'table not found' with no word about the backticks",
-)
 @pytest.mark.parametrize("form", ["`{t}`", "`{p}.{d}.{t}`", "`{p}`.`{d}`.`{t}`"])
 def test_a_backtick_quoted_table_name_is_read_or_explained(bigquery_url, bq, form):
     t = _where_table(bq)
@@ -970,12 +913,6 @@ def test_current_timestamp_in_a_filter_moves_under_the_pinned_snapshot(bigquery_
         a.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB11: the --where caveat says now()/current_date are a risk only "
-    "'on an engine without one snapshot', but BigQuery's base-table snapshot "
-    "does not pin current_timestamp(): each query has its own clock",
-)
 def test_the_filter_caveat_warns_about_bigquery_clock_functions():
     from parity.dialects.duckdb_dialect import DuckDBDialect
     from parity.engine import _filter_caveats

@@ -274,6 +274,12 @@ def pg_array_literal(items: Sequence[Any]) -> str:
     return "{" + ",".join(one(x) for x in items) + "}"
 
 
+def no_null_elements(v: Val) -> bool:
+    """Lists a BigQuery table can store: no NULL element, and not NULL - it
+    stores a NULL array as an empty one, which the empty-list value covers."""
+    return v.value is not None and None not in v.value
+
+
 def json_not(*texts: str) -> Callable[[Val], bool]:
     """JSON values other than these (an engine refuses them on load)."""
     return lambda v: v.value not in texts
@@ -1015,6 +1021,14 @@ class BigQueryCov(CovEngine):
             Native("JSON", "json", json_not("null")),
             # BigQuery refuses an integer past 64 bits in JSON on load.
             Native("JSON", "json_forms", json_not("12345678901234567890123")),
+            # ARRAY follows the LIST rule (RT-HB1). A BigQuery table cannot
+            # store a NULL element, or a NULL array (it stores it as empty).
+            Native("ARRAY<STRING>", "list_text", no_null_elements),
+            Native("ARRAY<INT64>", "list_int", no_null_elements),
+            Native("ARRAY<DATE>", "list_date", no_null_elements),
+            Native("ARRAY<NUMERIC>", "list_dec", no_null_elements),
+            Native("ARRAY<FLOAT64>", "list_float", no_null_elements),
+            Native("ARRAY<BOOL>", "list_bool", no_null_elements),
         ]
 
     def table_name(self, slug: str) -> str:
@@ -1025,6 +1039,8 @@ class BigQueryCov(CovEngine):
         """A value in BigQuery's JSON load encoding."""
         if x is None:
             return None
+        if isinstance(x, list):
+            return [self._json(native, e) for e in x]
         if isinstance(x, Decimal):
             return format(x, "f")
         if isinstance(x, float):
@@ -1045,7 +1061,13 @@ class BigQueryCov(CovEngine):
         """Create the table by a load job with an explicit schema."""
         from google.cloud import bigquery
 
-        schema = [bigquery.SchemaField(n, ddl) for n, ddl in columns]
+        # A load schema spells ARRAY<T> as a REPEATED T field.
+        schema = [
+            bigquery.SchemaField(n, ddl[6:-1], mode="REPEATED")
+            if ddl.startswith("ARRAY<")
+            else bigquery.SchemaField(n, ddl)
+            for n, ddl in columns
+        ]
         names = [n for n, _ in columns]
         kinds = [ddl for _, ddl in columns]
         data = [

@@ -44,14 +44,17 @@ with no privilege on the database: it answers `SELECT command denied` whether
 or not the table exists, and the message adds `Or it exists and this login
 holds no privilege on it`. BigQuery says `cannot
 read dataset … while looking for …: it does not exist, or this account lacks
-access to it`. Grants per engine: [`engines.md`](engines.md).
+access to it` - and, when the dataset is in another location than the jobs,
+`it is in location US and this connection runs jobs in EU: add ?location=US
+to the connection string`. Grants per engine: [`engines.md`](engines.md).
 
 ```
 parity: [side A: postgres] table name 'db.public.orders' has 3 dot-separated parts; expected 'table' or 'schema.table'
 ```
 
 Drop the database part — the database comes from the connection string.
-(BigQuery alone accepts `project.dataset.table`.)
+(BigQuery alone accepts `project.dataset.table`, backticked whole or per part
+as the console copies it, and a domain-scoped `example.com:project`.)
 
 ## Key column not found, not unique, or NULL
 

@@ -24,7 +24,7 @@ that can only read anyway: then the server itself refuses a write.
 | DuckDB | `duckdb` | yes (file opened read-only) | 1.3+; 1.3–2.0 verified identical |
 | SQL Server / Azure SQL | `mssql` | only with `ALLOW_SNAPSHOT_ISOLATION ON` | 2019+; 2019 and 2022 verified; FLOAT needs compatibility level 130+ |
 | Snowflake | `snowflake` | no (READ COMMITTED only) | verified live on AWS; connector 4.x only |
-| BigQuery | `bigquery` | base tables yes (time travel); views no | verified live in the EU region |
+| BigQuery | `bigquery` | base tables and clones yes (time travel); views no | verified live in the EU region |
 
 Every run that lacks a single snapshot says so in a caveat. Redshift,
 Databricks and Fabric are not supported yet.
@@ -333,9 +333,12 @@ project's data while the jobs run (and are billed) in the URL's project.
 
 **Consistency.** BigQuery has no multi-statement snapshot, so every query
 reads a base table `FOR SYSTEM_TIME AS OF` the server time captured by the
-first query: one snapshot. **Views are not pinned** — BigQuery silently
-ignores time travel on a view — so a view is read live at every level, and
-the run says so.
+first query: one snapshot; a table clone is pinned the same way, and a
+table snapshot is immutable. **Views are not pinned** — BigQuery silently
+ignores time travel on a view (and on a materialized view or an external
+table) — so it is read live at every level, and the run says so.
+`current_timestamp()` in `--where` is *not* pinned by the snapshot: every
+query has its own clock.
 
 **Cost.** On-demand pricing bills **bytes scanned**, and BigQuery bills every
 query for the full columns it reads, whatever its `WHERE` clause (unless the
@@ -351,8 +354,19 @@ time instead.
 
 **Caveats.**
 
-- ARRAY, STRUCT and INTERVAL columns have no exact rule yet: they are compared
-  as raw text, listed as not covered, and carry no risk figure.
+- ARRAY follows the shared list rule (so it matches PostgreSQL arrays and
+  DuckDB lists); a BigQuery table stores a NULL array as empty, so a NULL
+  array elsewhere reads as different. STRUCT (each field by its own rule,
+  named), GEOGRAPHY (its WKB), INTERVAL and RANGE have no cross-engine rule:
+  they are compared as text that is injective on BigQuery, listed as not
+  covered, and carry no risk figure.
+- Hidden pseudo-columns (`_PARTITIONTIME` of an ingestion-time partitioned
+  table) are not data and are not compared.
+- Table names may be written as the console copies them, in backticks
+  (`` `project.dataset.table` `` or per part), and a domain-scoped project
+  (`example.com:project.dataset.table`) is read whole.
+- A dataset in another location than the connection's jobs is reported with
+  its location and the `?location=` that reaches it.
 - `TIMESTAMP` on BigQuery is an instant (its naive type is `DATETIME`), and
   the tool treats it so.
 - Ctrl-C waits for the query in flight: cancelling a job needs a write scope.

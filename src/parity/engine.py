@@ -1105,9 +1105,10 @@ def _filter_caveats(
                 f"the rows it selects are compared, so this result says nothing "
                 f"about the rest of the table. Each query evaluates it afresh: "
                 f"an expression that can change during the run (random(), "
-                f"clock_timestamp(), or now() and current_date on an engine "
-                f"without one snapshot) can select different rows in different "
-                f"queries - prefer fixed literals"
+                f"clock_timestamp(), now(), current_timestamp() or "
+                f"current_date, unless the engine evaluates it once per run - "
+                f"a snapshot need not pin the clock) can select "
+                f"different rows in different queries - prefer fixed literals"
             )
     if bool(where_a) != bool(where_b):
         only, other = ("A", "B") if where_a else ("B", "A")
