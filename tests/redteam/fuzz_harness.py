@@ -845,6 +845,8 @@ def _mutate_cell(rng: random.Random, op: str, c: Col, v: Any, fs: int, engines: 
     if op == "case" and k in ("char", "ascii") and v:
         nv = v.swapcase()
         return nv if nv != v else _SKIP
+    if op == "space" and k == "char" and not v:
+        return _SKIP  # " " + "" is a trailing space, which char(n) cannot hold
     if op == "space" and k in ("char", "ascii") and v is not None:
         nv = " " + v if k == "char" else rng.choice([v + " ", " " + v])
         return nv if len(nv) <= 12 or k == "ascii" else _SKIP

@@ -285,6 +285,14 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
             continue
         if kind == "int" and rng.random() < 0.2:
             b_kind = "bigint"
+        # A migration's type change that keeps every value: must compare equal.
+        widen = {"small": "int", "tiny": "int", "char": "text", "ascii": "text",
+                 "money": "dec", "ts3": "ts"}
+        if kind in widen and rng.random() < 0.3:
+            b_kind = widen[kind]
+            if kind == "money":
+                cols.append(Col(name, kind, 19, 4, b_kind))
+                continue
         if kind == "real" and rng.random() < 0.3:
             b_kind = "double"
         cols.append(Col(name, kind, b_kind=b_kind))
@@ -494,6 +502,8 @@ def _pred(rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]
         return f"{q} {op} {n}", ("cmp", j)
     if c.kind in fh.TEXT_LIKE and r < 0.7:
         lit = rng.choice(["", "a", "m", "x", "é", "it''s", "50%", "a_b", "日"])
+        if c.kind == "ascii":  # MySQL refuses a latin1-utf8mb4 comparison
+            lit = lit if lit.isascii() else "n"
         op = rng.choice(["<>", ">", "<", "=", "like"])
         if op == "like":
             return f"{q} like '{lit}%'", ("like", j)
@@ -757,6 +767,8 @@ def report(out: OutcomeH) -> str:
 
 def main() -> int:
     """Run the campaign until `--minutes` or `--cases` per pair."""
+    # Repros carry any Unicode; a cp1252 console must not end the campaign.
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", type=int, default=100)
     ap.add_argument("--minutes", type=float, default=0, help="per pair, overrides --cases")
