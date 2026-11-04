@@ -736,6 +736,25 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   password, through the same `connect_kwargs` that carries the telemetry pins
   (pinned offline in `test_snowflake_connect_offline.py`; live test gated on
   `PARITY_TEST_SNOWFLAKE_KEYPAIR`). No browser or token authenticator.
+- **Snowflake round H** (verified live 2026-11-04, `tests/redteam/
+  test_round_h_snowflake.py`): `SESSION_PINS` adds
+  `quoted_identifiers_ignore_case = false` (else `"orders"` reads ORDERS)
+  and `strict_json_output = false` (else `[1,undefined]` prints `[1,null]`).
+  **A VARIANT double is refused when TO_JSON's 16-digit text does not read
+  back as it** (`_check_variant_doubles`, one FLATTEN scan per JSON column
+  before the first checksum): there is no exact printing of a double inside
+  a document, and adjacent doubles printed alike. DECIMAL renders as
+  `round(c, s)` padded to s places - never `cast(c as number(38, s))`, which
+  held only 38 - s integer digits; byte-identical where the cast worked.
+  NUMBER(38,0) key spans whose `(k - lo) * n` passes 38 digits bucket by
+  comparing the key with the precomputed boundaries (`bucket_expr`).
+  TIMESTAMP_TZ FF9 keys go through `convert_timezone('UTC', ...)` like
+  values. Masking and row access policies (`POLICY_REFERENCES`) are caveats,
+  as PostgreSQL RLS is - the tool cannot tell whether a conditional policy
+  masks for its role; a view's underlying policies are not visible, which is
+  a caveat too. GEOGRAPHY / GEOMETRY / VECTOR render WKB / EWKB / the
+  vector's JSON array. `check_where` refuses `//` outside quotes. Test-suite
+  URLs are `SecretUrl` (conftest): repr() masks the password.
 - **The walk is checked by a second method** (`engine._verify`,
   `parity/reference.py`). About `verify_sample` rows, chosen by a hash of the
   key text (`fetch_sample`), are fetched as raw driver values and compared in

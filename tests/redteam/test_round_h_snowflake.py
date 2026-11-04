@@ -33,7 +33,7 @@ import parity.dialects.snowflake_dialect as sd
 from parity.cli import main
 from parity.dialects.snowflake_dialect import SnowflakeDialect, map_type_snowflake
 from parity.engine import diff
-from parity.types import Column
+from parity.types import Column, LogicalType
 
 SCHEMA = "RTH_SF_HT"
 
@@ -70,6 +70,88 @@ def test_rt_hf3_offline_a_nanosecond_tz_key_is_moved_to_utc():
     sql = SnowflakeDialect(side="A").normalize_key(col)
     nine = sql[sql.index("else ") :]
     assert "convert_timezone" in nine, nine
+
+
+def _int_key() -> Any:
+    from parity.types import KeySpec
+
+    return KeySpec([Column("K", map_type_snowflake("NUMBER", 0), "NUMBER")], False)
+
+
+def test_rt_hf9_offline_a_span_that_fits_keeps_the_shared_sql():
+    """Every span whose `(k - lo) * n` fits 38 digits - all of BIGINT's, and
+    NUMBER(38,0) keys up to ~3e36 at 32 segments - emits the shared bucket
+    SQL byte for byte, so no checksum moved."""
+    from parity.dialects.base import Dialect
+
+    d = SnowflakeDialect(side="A")
+    key = _int_key()
+    for lo, hi, n in [
+        (0, 10, 4),
+        (-(2**63), 2**63, 32),
+        (0, 10**36, 32),
+        (5, 3 * 10**36, 33),
+    ]:
+        assert d.bucket_expr(key, '"K"', lo, hi, n) == Dialect.bucket_expr(
+            d, key, '"K"', lo, hi, n
+        )
+
+
+@pytest.mark.parametrize(
+    ("lo", "hi", "n"),
+    [
+        (0, 10**37 + 1, 32),
+        (-(10**38) + 1, 10**38, 32),
+        (-(10**38) + 1, 10**38, 7),
+        (3, 10**38 - 1, 2),
+    ],
+)
+def test_rt_hf9_offline_a_wide_span_buckets_by_its_boundaries(lo, hi, n):
+    """The boundary form puts every key in the bucket `engine.bucket_bounds`
+    says it is in - checked at each boundary, one either side of it, and at
+    random keys - and writes no literal outside [lo, hi)."""
+    import random
+    import re
+
+    from parity.engine import bucket_bounds
+
+    sql = SnowflakeDialect(side="A").bucket_expr(_int_key(), '"K"', lo, hi, n)
+    arms = [(int(v), int(q)) for v, q in re.findall(r">= (-?\d+) then (\d+)", sql)]
+    assert len(arms) == n - 1 and all(lo <= v < hi for v, _ in arms)
+    assert "*" not in sql and "/" not in sql
+
+    def bucket(k: int) -> int:
+        return next((q for v, q in arms if k >= v), 0)
+
+    rng = random.Random(lo ^ hi ^ n)
+    keys = {lo, hi - 1, *(rng.randrange(lo, hi) for _ in range(500))}
+    for i in range(n):
+        b_lo, b_hi = bucket_bounds(i, lo, hi, n)
+        keys |= {b_lo - 1, b_lo, b_lo + 1, b_hi - 1}
+    for k in keys:
+        if lo <= k < hi:
+            q = bucket(k)
+            b_lo, b_hi = bucket_bounds(q, lo, hi, n)
+            assert b_lo <= k < b_hi, (k, q)
+
+
+def test_rt_hf8_offline_the_decimal_text_never_casts_to_number_38():
+    """RT-HF8: the DECIMAL rendering rounds in the column's own type."""
+    col = Column("W", LogicalType.DECIMAL, "NUMBER")
+    for scale in (0, 6, 20):
+        sql = SnowflakeDialect(side="A", float_scale=scale).normalize(col)
+        assert "number(38" not in sql and f'round("W", {scale})' in sql
+
+
+def test_rt_hf7_offline_spatial_and_vector_render_without_a_varchar_cast():
+    for raw, needle in [
+        ("GEOGRAPHY", 'st_aswkb("V")'),
+        ("GEOMETRY", 'st_asewkb("V")'),
+        ("VECTOR(FLOAT, 3)", 'to_json(cast("V" as array))'),
+    ]:
+        col = Column("V", map_type_snowflake(raw, None), raw)
+        sql = SnowflakeDialect(side="A").normalize(col)
+        assert needle in sql and "as varchar)" not in sql.replace(needle, ""), raw
 
 
 def _connect_log(monkeypatch) -> list[str]:

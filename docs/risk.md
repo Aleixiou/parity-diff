@@ -39,7 +39,7 @@ For one run that reports **identical**, on columns the rules cover:
 | A difference the rules ignore on purpose (past `--float-scale`, sub-µs against a µs engine, CHAR padding) | these are equal **by definition**; the report states the scale and the caveats | By design |
 | A table changing during the run on an engine without one snapshot | **not bounded**; the report warns, and the sample check catches what changed in the rows it reads | Not quantifiable |
 | A server setting hides rows or columns from the reading session | **0** for every setting found (round G: MySQL `sql_select_limit`, Snowflake `ROWS_PER_RESULTSET` reset per session); any other cap makes a side's checksum counts fall short of its row count, and the run is then not identical | By design (tested) |
-| Row-level security hides rows from the reading role (PostgreSQL) | **not bounded**: those rows are not compared; every run names the table in a caveat | Not quantifiable |
+| Row-level security hides rows from the reading role (PostgreSQL), a Snowflake row access policy hides them, or a Snowflake masking policy shows both sides the mask | **not bounded**: those rows or values are not compared; every run names the table (and a masked column) in a caveat, and on a Snowflake view says the policies beneath it are not checked | Not quantifiable |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
 | Columns of types outside the rules (BigQuery ARRAY/STRUCT/INTERVAL, nested lists, structs, ranges, arrays of JSON, geometry, XML; listed per run) | **no bound**; named in the report as not covered | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
@@ -57,9 +57,9 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Session settings change how values render | **0** for every pinned setting; round G set every user-settable PostgreSQL setting at each value, MySQL sql_mode, charset, time_zone and init_connect variants, SQL Server collations, ANSI options and 'user options', Snowflake output formats and BigQuery `und:ci`: the 6 that changed anything are now pinned or refused | Measured |
+| Session settings change how values render | **0** for every pinned setting; round G set every user-settable PostgreSQL setting at each value, MySQL sql_mode, charset, time_zone and init_connect variants, SQL Server collations, ANSI options and 'user options', Snowflake output formats and BigQuery `und:ci`: the 6 that changed anything are now pinned or refused; round H found 2 more on Snowflake (`QUOTED_IDENTIFIERS_IGNORE_CASE` read another table, `STRICT_JSON_OUTPUT` printed undefined as null), now pinned | Measured |
 | Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
-| Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
+| Rows hidden from the session (row caps, RLS, Snowflake policies) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS and Snowflake masking / row access policies: **not bounded**, named in a caveat (a Snowflake view's underlying policies cannot be listed, and the caveat says so) | By design / Not quantifiable |
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
@@ -94,7 +94,7 @@ line, JSON (`where_a`, `where_b`, `risk.filtered`) and a caveat.
 | Risk | Odds | Kind |
 |---|---|---|
 | Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation) | By design (tested) |
-| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do) | By design (tested) |
+| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits, as the instant in UTC), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do). This row said 0 for TIMESTAMP before round H too, and was wrong on Snowflake: a TIMESTAMP_TZ key with nanoseconds printed its stored wall clock, so two instants at different offsets merged (RT-HF3, fixed and tested live) | By design (tested) |
 
 ## 4. Rendering each value as canonical text (per engine)
 
@@ -109,14 +109,17 @@ and 4.3. This is where every past false match lived.
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
 | A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |
-| Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
+| Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value (Snowflake renders DECIMAL with `ROUND`, which never overflows, since round H) | By design (tested) |
+| A Snowflake VARIANT double that TO_JSON prints with 16 digits, shared by another double | **0** false matches — the column is refused before the first checksum, naming side, column, key and path (one scan per JSON column); a double whose text reads back as itself has a text no other double has | By design (tested live) |
 
 Findings this check produced and fixed: 8 (COV-1 to COV-8), two of them
 false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
 +05:00:30 as +05:30) and one a refusal of ordinary values (SQL Server
 sql_variant floats, -0.0 and negatives below 1e-99); the type rules found
 one more (BigQuery SQL NULL equal to JSON `null`). Red-team round G (settings, versions): 14
-problems, 8 of them false matches, all fixed. Earlier campaign: about 30
+problems, 8 of them false matches, all fixed. Round H on Snowflake: 11 problems
+(RT-HF1 to HF11), 6 of them false matches, all fixed or refused, plus a
+secret leak in the test suite's failure reports. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range
@@ -134,7 +137,7 @@ them per key range in a wide type and counts rows.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine), property-tested against `bucket_bounds` | By design (tested) |
+| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine; a Snowflake NUMBER(38,0) span too wide for 38 digits compares the key with its precomputed boundaries), property-tested against `bucket_bounds` | By design (tested) |
 | An empty range on one side is skipped | **0** — empty sums are 0 on both sides | By design (tested) |
 | A difference vanishes between two levels (rows changed between the queries) | **0** false matches — each level's buckets must add up, in rows and checksum, to the level above, or the range is unexplained | By design (tested) |
 

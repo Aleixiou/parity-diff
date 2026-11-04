@@ -267,8 +267,25 @@ pass over the compared columns, the narrowing queries, and the sample check.
 Credits are billed for the time the warehouse runs (with its usual minimum
 per resume). A larger warehouse shortens the hash pass.
 
+**Policies.** A masking policy hands the reading role the mask on both
+sides, and a row access policy hides rows from both: either makes real
+differences invisible. The policies attached to the compared table (from
+`POLICY_REFERENCES`) are named in a caveat on every run; for a view, the
+caveat says the policies of the tables beneath it are not checked. Diff as a
+role the policies do not mask or filter for a complete result.
+
+**VARIANT doubles.** Snowflake prints a DOUBLE inside a VARIANT, OBJECT or
+ARRAY with 16 significant digits, and two adjacent doubles can print alike.
+A JSON column holding such a double is refused, naming the column, a key and
+the path; `--exclude` it. Integers, decimals and doubles whose text reads
+back exactly are compared. GEOGRAPHY, GEOMETRY and VECTOR columns compare
+as WKB, EWKB and the vector's elements (listed as unmapped: within
+Snowflake only).
+
 **Caveats.** `ROWS_PER_RESULTSET`, which would cap results, is reset for the
-session. `TIMESTAMP(7-9)` columns compare at microseconds against engines
+session, and `QUOTED_IDENTIFIERS_IGNORE_CASE` and `STRICT_JSON_OUTPUT` are
+pinned off. A row filter may not contain `//` outside a quoted string
+(Snowflake's line comment). `TIMESTAMP(7-9)` columns compare at microseconds against engines
 that hold only microseconds, with a caveat. Ctrl-C waits for the query in
 flight (the dialect has no cancel). The login itself names the
 driver, Python and OS versions, as every Snowflake client's does.
