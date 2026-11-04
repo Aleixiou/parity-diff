@@ -86,6 +86,14 @@ class Column:
     #: one side holds microseconds only, they are truncated, as that side's
     #: data already is, and a caveat says so (COV-2).
     sub_micro: bool = False
+    #: The engine's full declaration where its type name leaves out what the
+    #: rendering needs: MySQL's COLUMN_TYPE (`int(6) unsigned zerofill`,
+    #: `enum('a','')`). Empty elsewhere. Not part of equality, so a Column
+    #: built from the type name alone still compares equal.
+    declared: str = field(default="", compare=False)
+    #: The character set a text column stores in, where an engine holds text
+    #: in more than one (MySQL); None elsewhere. Not part of equality.
+    charset: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

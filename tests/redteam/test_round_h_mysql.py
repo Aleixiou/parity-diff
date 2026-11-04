@@ -39,6 +39,8 @@ RUN = uuid.uuid4().hex[:6]
 #: Root and a plain login on the Docker MySQL 8.0 (`rth-mysql-80`).
 ROOT80 = os.environ.get("PARITY_RTH_MYSQL_ROOT", "mysql://root:rth@127.0.0.1:13480/rth")
 USER80 = os.environ.get("PARITY_RTH_MYSQL_USER", "mysql://rth:rth@127.0.0.1:13480/rth")
+#: host:port of the Docker MySQL 8.0, for the throwaway logins the grant tests make.
+HOST80 = ROOT80.rsplit("@", 1)[1].split("/")[0]
 #: The plain login on the Docker MariaDB 11 (`rth-mysql-maria11`).
 MARIA = os.environ.get("PARITY_RTH_MARIADB", "mysql://rth:rth@127.0.0.1:13411/rth")
 
@@ -193,10 +195,6 @@ LOSSY = [
 ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM1: legacy-charset bytes with no Unicode mapping all render as '?'",
-)
 @pytest.mark.parametrize(("charset", "va", "vb"), LOSSY, ids=[c[0] for c in LOSSY])
 def test_rt_hm1_unmappable_legacy_characters_are_not_one_value(
     tables, mysql_url, charset, va, vb
@@ -214,10 +212,6 @@ def test_rt_hm1_unmappable_legacy_characters_are_not_one_value(
     assert found(r) == [(1, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM1: an unmappable Shift-JIS character equals a PostgreSQL '?'",
-)
 def test_rt_hm1_unmappable_sjis_character_against_postgres_question_mark(
     tables, pg_table, mysql_url, pg_url
 ):
@@ -268,6 +262,67 @@ def test_lossless_character_sets_keep_every_difference(
     assert found(r) == [(1, "different", ("v",))]
 
 
+CONVERTIBLE = [
+    ("sjis", "アイ漢字?", "text"),
+    ("euckr", "한국어", "text"),
+    ("gbk", "中文", "text"),
+    ("cp1251", "Привет", "text"),
+    ("ucs2", "中文", "text"),
+    ("ascii", "plain", "text"),
+]
+
+
+@pytest.mark.parametrize(("charset", "text", "_"), CONVERTIBLE, ids=[c[0] for c in CONVERTIBLE])
+def test_rt_hm1_convertible_legacy_text_still_equals_unicode_text(
+    tables, pg_table, mysql_url, pg_url, charset, text, _
+):
+    """The fix for RT-HM1/HM2 moves no checksum of text that converts: a
+    legacy-charset column holding convertible characters (and a real `?`)
+    still equals the same text on PostgreSQL, key included, and the planted
+    row is the only difference. The sample check agrees on every row."""
+    r = _cross(
+        tables, pg_table, mysql_url, pg_url,
+        f"id varchar(10) character set {charset} primary key, "
+        f"v varchar(20) character set {charset}, w int",
+        [("insert into {t} values (%s, %s, 1), ('k2', 'same', 2)", (text, text))],
+        "id text primary key, v text, w int",
+        [f"insert into {{t}} values ('{text}', '{text}', 1), ('k2', 'same', 3)"],
+    )  # fmt: skip
+    assert found(r) == [("k2", "different", ("w",))]
+    assert r.verification is not None and r.verification.failures == []
+
+
+def test_rt_hm1_unconvertible_value_names_its_bytes(tables, mysql_url):
+    """An unconvertible value renders as the marker, its character set and
+    its stored bytes, so the report shows what is really there."""
+    r = _mysql_pair(
+        tables,
+        mysql_url,
+        "id int primary key, v varchar(10) character set sjis",
+        ["insert into {t} values (1, _sjis x'F040'), (2, 'x')"],
+        ["insert into {t} values (1, '?'), (2, 'x')"],
+        tag="cs_marker",
+    )
+    (d,) = r.diffs
+    assert d.values_a["v"] == "parity: not convertible from sjis 0xF040"
+
+
+def test_rt_hm9_enum_without_an_invalid_value_equals_text(
+    tables, pg_table, mysql_url, pg_url
+):
+    """ENUM and SET members, '' included, still render as their text: only
+    the index-0 error value changed."""
+    r = _cross(
+        tables, pg_table, mysql_url, pg_url,
+        "id int primary key, e enum('a', ''), s set('x','y')",
+        ["insert into {t} values (1, '', 'y,x'), (2, 'a', ''), (3, 'a', 'x')"],
+        "id int primary key, e text, s text",
+        ["insert into {t} values (1, '', 'x,y'), (2, 'a', ''), (3, '', 'x')"],
+    )  # fmt: skip
+    assert found(r) == [(3, "different", ("e",))]
+    assert r.verification is not None and r.verification.failures == []
+
+
 # ====================================================================
 # RT-HM2: a surrogate in a ucs2 column makes the whole value NULL
 # ====================================================================
@@ -281,7 +336,6 @@ def test_lossless_character_sets_keep_every_difference(
 # catches only the NULL case, and only for rows it samples.
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM2: ucs2 surrogate pairs render as NULL")
 def test_rt_hm2_two_different_emoji_in_ucs2_are_not_equal(tables, mysql_url):
     r = _mysql_pair(
         tables,
@@ -295,7 +349,6 @@ def test_rt_hm2_two_different_emoji_in_ucs2_are_not_equal(tables, mysql_url):
 
 
 @pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(strict=True, reason="RT-HM2: a ucs2 surrogate equals NULL in the walk")
 def test_rt_hm2_ucs2_value_with_a_surrogate_is_not_null(tables, mysql_url):
     r = _mysql_pair(
         tables,
@@ -313,10 +366,6 @@ def test_rt_hm2_ucs2_value_with_a_surrogate_is_not_null(tables, mysql_url):
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM3: columns the login cannot read are silently left out",
-)
 def test_rt_hm3_column_level_grants_do_not_silently_narrow_the_comparison(root80, tables):
     """A login granted SELECT on some columns only sees only those in
     information_schema.columns, so the rest are never compared: with the
@@ -335,7 +384,7 @@ def test_rt_hm3_column_level_grants_do_not_silently_narrow_the_comparison(root80
         f"grant select (id, a) on rth.{ta} to {user}@'%'",
         f"grant select (id, a) on rth.{tb} to {user}@'%'",
     )
-    url = f"mysql://{user}:rthcol@127.0.0.1:13480/rth"
+    url = f"mysql://{user}:rthcol@{HOST80}/rth"
     try:
         try:
             r = run_diff(get_dialect(url, side="A"), get_dialect(url, side="B"), ta, tb)
@@ -372,7 +421,6 @@ def test_a_read_only_replica_is_diffed_normally(root80, tables):
 # check) says. Every row then differs from a plain integer on any engine.
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM4: a ZEROFILL integer renders zero-padded")
 def test_rt_hm4_zerofill_integer_equals_the_same_plain_integer(tables, mysql_url):
     ta = tables(mysql_url, "zf_a", "id int primary key, v int(8) zerofill",
                 "insert into {t} values (1, 5), (2, 7)")  # fmt: skip
@@ -384,7 +432,6 @@ def test_rt_hm4_zerofill_integer_equals_the_same_plain_integer(tables, mysql_url
     assert found(r) == [(2, "different", ("v",))]
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM4: a ZEROFILL integer renders zero-padded")
 def test_rt_hm4_zerofill_integer_against_postgres(tables, pg_table, mysql_url, pg_url):
     r = _cross(
         tables, pg_table, mysql_url, pg_url,
@@ -394,7 +441,6 @@ def test_rt_hm4_zerofill_integer_against_postgres(tables, pg_table, mysql_url, p
     assert found(r) == [(2, "different", ("v",))]
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM5: a ZEROFILL key part renders zero-padded")
 @pytest.mark.parametrize(
     ("zf_ddl", "plain_ddl", "key", "rows_a", "rows_b", "expected"),
     [
@@ -440,10 +486,6 @@ def test_rt_hm5_zerofill_key_matches_the_plain_key(
 
 
 @pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM6: the reference reads a MySQL SET as a Python set's repr",
-)
 def test_rt_hm6_set_column_against_postgres_text(tables, pg_table, mysql_url, pg_url):
     """mysql-connector returns a SET as a Python `set`, which the reference
     rules turn into `{'x', 'z'}` while the walk (correctly) renders `x,z`. So
@@ -467,7 +509,6 @@ def test_rt_hm6_set_column_against_postgres_text(tables, pg_table, mysql_url, pg
 # ====================================================================
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM7: YEAR 0 renders '0000', not the integer 0")
 def test_rt_hm7_year_zero_against_an_integer_zero(tables, pg_table, mysql_url, pg_url):
     """YEAR is compared as an integer (2024 renders `2024`), but the year
     0000 renders `0000` while its value - and PostgreSQL's integer - is 0."""
@@ -486,7 +527,8 @@ def test_rt_hm7_year_zero_against_an_integer_zero(tables, pg_table, mysql_url, p
 
 @pytest.mark.xfail(
     strict=True,
-    reason="RT-HM8: a JSON DATE/TIME/DATETIME/BLOB scalar equals the JSON string of its text",
+    reason="RT-HM8 (documented, docs/limitations.md): a JSON DATE/TIME/DATETIME/BLOB "
+    "scalar equals the JSON string of its text",
 )
 def test_rt_hm8_json_opaque_scalars_are_not_strings(tables, mysql_url):
     """MySQL JSON can hold DATE, TIME, DATETIME and binary scalars
@@ -552,10 +594,6 @@ def test_json_numbers_and_strings_that_differ_are_found(tables, mysql_url, va, v
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM9: ENUM index 0 (an invalid value) and an '' member both render ''",
-)
 def test_rt_hm9_enum_error_value_is_not_the_empty_member(tables, mysql_url):
     """An invalid value written outside strict mode is stored as ENUM index
     0, MySQL's error value; an enum that also lists '' stores that member at
@@ -577,10 +615,6 @@ def test_rt_hm9_enum_error_value_is_not_the_empty_member(tables, mysql_url):
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM10: a non-English lc_messages hides the explained refusal",
-)
 @pytest.mark.parametrize(
     ("ddl", "value", "expect"),
     [
@@ -614,11 +648,6 @@ def test_rt_hm10_refusals_are_explained_under_any_lc_messages(
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM11: MariaDB connects, then fails with 'Illegal mix of collations' "
-    "or 'FUNCTION uuid_to_bin does not exist'",
-)
 @pytest.mark.parametrize(
     "ddl",
     [
@@ -653,10 +682,6 @@ def test_rt_hm11_mariadb_is_refused_by_name_or_compared(tables, ddl):
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM12: a FOR SHARE subquery in --where holds row locks for the whole diff",
-)
 @pytest.mark.parametrize("lock", ["for share", "lock in share mode"])
 def test_rt_hm12_row_filter_cannot_take_shared_locks(tables, mysql_url, lock):
     """The session is READ ONLY, which refuses FOR UPDATE (error 1792) but
@@ -755,15 +780,41 @@ def test_mysql_row_filters_that_could_escape_are_refused(mysql_url, where):
         d.close()
 
 
+@pytest.mark.parametrize(
+    "where",
+    [
+        "id in (select id from t for update)",
+        "id in (select id from t FOR  SHARE nowait)",
+        "id in (select id from t lock in share mode)",
+        "id in (select id into @x from t)",
+        "id in (select id from t into outfile '/tmp/x')",
+    ],
+)
+def test_rt_hm12_locking_and_into_clauses_are_refused(mysql_url, where):
+    d = get_dialect(mysql_url, side="A")
+    try:
+        with pytest.raises(ValueError, match=r"side A.*row filter"):
+            d.check_where(where)
+    finally:
+        d.close()
+
+
+@pytest.mark.parametrize(
+    "where", ["note = 'for share'", "`into` = 1", 'note = "lock in share mode"', "information = 1"]
+)
+def test_rt_hm12_the_words_in_strings_and_names_are_fine(mysql_url, where):
+    d = get_dialect(mysql_url, side="A")
+    try:
+        d.check_where(where)
+    finally:
+        d.close()
+
+
 # ====================================================================
 # RT-HM13: the sample check reads zero and invalid dates as NULL
 # ====================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM13: zero/invalid dates arrive as None, so a real difference is noted as a false alarm",
-)
 def test_rt_hm13_zero_date_difference_is_not_called_a_false_alarm(
     tables, pg_table, mysql_url, pg_url
 ):
@@ -987,7 +1038,6 @@ VERSION_CASES = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="RT-HM1/RT-HM2: lossy conversion on every version")
 @pytest.mark.parametrize(
     "url", VERSION_URLS, ids=lambda u: u.rsplit(":", 1)[1].split("/")[0]
 )
@@ -1028,10 +1078,6 @@ def test_identifiers_are_case_sensitive_on_a_case_sensitive_server(tables, url):
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM14: a MySQL 9 VECTOR column kills the run with 'Incorrect arguments to cast_as_char'",
-)
 def test_rt_hm14_vector_column_is_compared_or_refused_by_name(tables):
     """MySQL 9 added VECTOR. It is unmapped, so it falls through to
     `cast(c as char)`, which MySQL refuses for a vector (error 1210) - the
@@ -1058,10 +1104,6 @@ def test_rt_hm14_vector_column_is_compared_or_refused_by_name(tables):
     assert found(r) == [(2, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM15: a table the login may not read is reported as 'table not found'",
-)
 def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
     """MySQL hides a table the login holds no privilege on from
     information_schema, so the tool says `table not found: t (looked in
@@ -1079,7 +1121,7 @@ def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
         f"create user {user}@'%' identified by 'rthng'",
         f"grant select on rth.{other} to {user}@'%'",
     )
-    url = f"mysql://{user}:rthng@127.0.0.1:13480/rth"
+    url = f"mysql://{user}:rthng@{HOST80}/rth"
     try:
         with pytest.raises(ValueError, match=r"side A.*(denied|privilege|permission)"):
             run_diff(get_dialect(url, side="A"), get_dialect(USER80, side="B"), t, t)
@@ -1087,9 +1129,12 @@ def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
         mysql_run(root80, f"drop user if exists {user}@'%'")
 
 
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 @pytest.mark.xfail(
     strict=True,
-    reason="RT-HM16: Ctrl-C cannot stop a MySQL query when the login is at max_user_connections",
+    reason="RT-HM16 (open): Ctrl-C cannot stop a MySQL query when the login is at "
+    "max_user_connections - the C connector exposes no socket to interrupt in "
+    "place; the failure is now reported (test_rt_hm16_a_failed_cancel_is_reported)",
 )
 def test_rt_hm16_cancel_works_at_the_connection_limit(root80):
     """`cancel` (Ctrl-C) opens a second connection as the same login to KILL
@@ -1111,7 +1156,7 @@ def test_rt_hm16_cancel_works_at_the_connection_limit(root80):
         f"grant select on rth.* to {user}@'%'",
     )
     try:
-        d = get_dialect(f"mysql://{user}:rthmc@127.0.0.1:13480/rth", side="A")
+        d = get_dialect(f"mysql://{user}:rthmc@{HOST80}/rth", side="A")
         try:
             timer = threading.Timer(0.5, d.cancel)
             timer.start()
@@ -1124,6 +1169,28 @@ def test_rt_hm16_cancel_works_at_the_connection_limit(root80):
     finally:
         mysql_run(root80, f"drop user if exists {user}@'%'")
     assert elapsed < 4
+
+
+def test_rt_hm16_a_failed_cancel_is_reported(root80):
+    """The part of RT-HM16 that is fixed: a cancel that cannot open its KILL
+    connection says so - naming the side, the reason and the KILL QUERY a DBA
+    can run - instead of failing silently."""
+    user = f"rth_mw_{RUN}"
+    mysql_run(
+        root80,
+        f"drop user if exists {user}@'%'",
+        f"create user {user}@'%' identified by 'rthmw' with max_user_connections 1",
+        f"grant select on rth.* to {user}@'%'",
+    )
+    try:
+        d = get_dialect(f"mysql://{user}:rthmw@{HOST80}/rth", side="A")
+        try:
+            with pytest.warns(RuntimeWarning, match=r"side A.*could not cancel.*KILL QUERY"):
+                d.cancel()
+        finally:
+            d.close()
+    finally:
+        mysql_run(root80, f"drop user if exists {user}@'%'")
 
 
 def test_cancel_stops_a_running_query(root80):
@@ -1180,10 +1247,6 @@ def test_escaping_holds_under_every_collation(tables, mysql_url, coll):
     assert found(r) == [(k, "different", ("v",)) for k in (1, 2, 3)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM17: a view over a MyISAM table carries no no-snapshot caveat",
-)
 @pytest.mark.parametrize("engine", ["myisam", "memory"])
 def test_rt_hm17_view_over_a_non_transactional_table_says_so(tables, mysql_url, engine):
     """The no-snapshot caveat (RT-D3) is read from information_schema.tables
@@ -1328,10 +1391,6 @@ def test_rt_hm18_columns_that_differ_beyond_case_are_not_matched(
     assert r.schema_differences
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HM1: two unmappable legacy-charset keys collapse into one '?' key",
-)
 def test_rt_hm1_unmappable_keys_are_not_called_duplicates(tables, mysql_url):
     """As a key the same loss is loud but misleading: two distinct Shift-JIS
     user-defined characters both render `?`, so a primary key is refused as

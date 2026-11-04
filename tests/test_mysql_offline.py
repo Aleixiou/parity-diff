@@ -169,6 +169,7 @@ def test_the_session_is_pinned_read_only_before_autocommit_goes_off(monkeypatch)
     assert seen["autocommit"] is True and seen["ssl_ca"] == "/ca.pem"
     assert seen["port"] == 3307 and seen["password"] == "p"
     assert log == [
+        "set session lc_messages = 'en_US'",  # RT-HM10: explained refusals
         "set session time_zone = '+00:00'",
         f"set session sql_mode = '{SQL_MODE}'",
         "set session sql_select_limit = 18446744073709551615",  # RT-G1
@@ -178,6 +179,21 @@ def test_the_session_is_pinned_read_only_before_autocommit_goes_off(monkeypatch)
     assert d._conn.autocommit is False
     assert "PAD_CHAR_TO_FULL_LENGTH" not in SQL_MODE
     assert "NO_BACKSLASH_ESCAPES" not in SQL_MODE  # `string_literal` relies on it
+
+
+def test_a_mariadb_server_is_refused_by_name(monkeypatch):
+    """RT-HM11: MariaDB is not verified, so it is refused before any query."""
+    monkeypatch.setattr(_FakeConn, "server_info", "11.8.3-MariaDB-ubu2404", raising=False)
+    with pytest.raises(ValueError, match=r"side A.*MariaDB"):
+        _connect(monkeypatch, "mysql://u:p@h/db")
+
+
+def test_mysql_row_filters_refuse_locking_reads_offline():
+    """RT-HM12, without a server: the words outside quotes only."""
+    d = MySQLDialect(side="A")
+    with pytest.raises(ValueError, match=r"side A.*'for share'"):
+        d.check_where("id in (select id from t for share)")
+    d.check_where("note = 'for share' and `into` = 1")
 
 
 def test_ssl_mode_required_refuses_a_plaintext_session(monkeypatch):
