@@ -117,6 +117,24 @@ parity: [side A: mysql] …: its canonical text is longer than this server's max
 A text value too long for the MySQL server's `max_allowed_packet` once
 escaped. A DBA can raise `max_allowed_packet`, or exclude the column.
 
+```
+parity: [side B: snowflake] VARIANT column 'V' of ORDERS holds a double at items[3].price (key 42) whose JSON text Snowflake prints with 16 significant digits, which another double shares: …; leave it out with --exclude
+```
+
+Snowflake prints a double inside a VARIANT with 16 significant digits, and
+this one needs 17: a neighbouring double would print the same text, so the
+column cannot be compared exactly. Exclude it, or compare a view that casts
+the field to NUMBER or extracts it as a FLOAT column (FLOAT columns are
+compared exactly).
+
+```
+! side A: masking policy PII_MASK is set on column 'EMAIL' of ORDERS: if it masks values for this role, both sides compare the mask …
+! side A: row access policy REGION_ONLY filters ORDERS: rows it hides from this role are not compared at all …
+```
+
+Snowflake policies are attached to the table: diff as a role they do not
+mask or filter for, or `--exclude` the masked column.
+
 ## Version or feature refused
 
 | Message (start) | Fix |
@@ -154,8 +172,7 @@ parity: [side A] no dialect for scheme 'postgress'. Supported: duckdb, postgres,
   BigQuery and Snowflake: `unknown mssql connection parameter(s) ['encrypted']; supported:
   [...]`, `MySQL URL option 'sslmode' is not supported, and an option is
   refused rather than ignored. …`. The message lists what is accepted.
-  Snowflake reads only `warehouse` and `role` and **ignores** any other
-  parameter.
+  Snowflake reads only `warehouse`, `role` and `private_key_file`.
 - **TLS.** SQL Server encrypts and checks the certificate by default; a local
   test server with a self-signed certificate needs
   `?trust_server_certificate=yes` (never in production). On MySQL,

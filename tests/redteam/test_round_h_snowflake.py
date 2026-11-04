@@ -33,7 +33,7 @@ import parity.dialects.snowflake_dialect as sd
 from parity.cli import main
 from parity.dialects.snowflake_dialect import SnowflakeDialect, map_type_snowflake
 from parity.engine import diff
-from parity.types import Column
+from parity.types import Column, LogicalType
 
 SCHEMA = "RTH_SF_HT"
 
@@ -41,10 +41,6 @@ SCHEMA = "RTH_SF_HT"
 # --------------------------------------------------------------------- offline
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF10: the row-filter guard does not refuse Snowflake's `//` line comment",
-)
 @pytest.mark.parametrize(
     "predicate",
     [
@@ -66,10 +62,6 @@ def test_rt_hf10_a_double_slash_comment_is_refused(predicate):
         SnowflakeDialect(side="A").check_where(predicate)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF3: a TIMESTAMP_TZ key with nanoseconds renders its wall clock, not its instant",
-)
 def test_rt_hf3_offline_a_nanosecond_tz_key_is_moved_to_utc():
     """The FF9 branch of `normalize_key` formats the raw column, so a
     TIMESTAMP_TZ key prints in its stored offset. The FF6 branch (through
@@ -78,6 +70,88 @@ def test_rt_hf3_offline_a_nanosecond_tz_key_is_moved_to_utc():
     sql = SnowflakeDialect(side="A").normalize_key(col)
     nine = sql[sql.index("else ") :]
     assert "convert_timezone" in nine, nine
+
+
+def _int_key() -> Any:
+    from parity.types import KeySpec
+
+    return KeySpec([Column("K", map_type_snowflake("NUMBER", 0), "NUMBER")], False)
+
+
+def test_rt_hf9_offline_a_span_that_fits_keeps_the_shared_sql():
+    """Every span whose `(k - lo) * n` fits 38 digits - all of BIGINT's, and
+    NUMBER(38,0) keys up to ~3e36 at 32 segments - emits the shared bucket
+    SQL byte for byte, so no checksum moved."""
+    from parity.dialects.base import Dialect
+
+    d = SnowflakeDialect(side="A")
+    key = _int_key()
+    for lo, hi, n in [
+        (0, 10, 4),
+        (-(2**63), 2**63, 32),
+        (0, 10**36, 32),
+        (5, 3 * 10**36, 33),
+    ]:
+        assert d.bucket_expr(key, '"K"', lo, hi, n) == Dialect.bucket_expr(
+            d, key, '"K"', lo, hi, n
+        )
+
+
+@pytest.mark.parametrize(
+    ("lo", "hi", "n"),
+    [
+        (0, 10**37 + 1, 32),
+        (-(10**38) + 1, 10**38, 32),
+        (-(10**38) + 1, 10**38, 7),
+        (3, 10**38 - 1, 2),
+    ],
+)
+def test_rt_hf9_offline_a_wide_span_buckets_by_its_boundaries(lo, hi, n):
+    """The boundary form puts every key in the bucket `engine.bucket_bounds`
+    says it is in - checked at each boundary, one either side of it, and at
+    random keys - and writes no literal outside [lo, hi)."""
+    import random
+    import re
+
+    from parity.engine import bucket_bounds
+
+    sql = SnowflakeDialect(side="A").bucket_expr(_int_key(), '"K"', lo, hi, n)
+    arms = [(int(v), int(q)) for v, q in re.findall(r">= (-?\d+) then (\d+)", sql)]
+    assert len(arms) == n - 1 and all(lo <= v < hi for v, _ in arms)
+    assert "*" not in sql and "/" not in sql
+
+    def bucket(k: int) -> int:
+        return next((q for v, q in arms if k >= v), 0)
+
+    rng = random.Random(lo ^ hi ^ n)
+    keys = {lo, hi - 1, *(rng.randrange(lo, hi) for _ in range(500))}
+    for i in range(n):
+        b_lo, b_hi = bucket_bounds(i, lo, hi, n)
+        keys |= {b_lo - 1, b_lo, b_lo + 1, b_hi - 1}
+    for k in keys:
+        if lo <= k < hi:
+            q = bucket(k)
+            b_lo, b_hi = bucket_bounds(q, lo, hi, n)
+            assert b_lo <= k < b_hi, (k, q)
+
+
+def test_rt_hf8_offline_the_decimal_text_never_casts_to_number_38():
+    """RT-HF8: the DECIMAL rendering rounds in the column's own type."""
+    col = Column("W", LogicalType.DECIMAL, "NUMBER")
+    for scale in (0, 6, 20):
+        sql = SnowflakeDialect(side="A", float_scale=scale).normalize(col)
+        assert "number(38" not in sql and f'round("W", {scale})' in sql
+
+
+def test_rt_hf7_offline_spatial_and_vector_render_without_a_varchar_cast():
+    for raw, needle in [
+        ("GEOGRAPHY", 'st_aswkb("V")'),
+        ("GEOMETRY", 'st_asewkb("V")'),
+        ("VECTOR(FLOAT, 3)", 'to_json(cast("V" as array))'),
+    ]:
+        col = Column("V", map_type_snowflake(raw, None), raw)
+        sql = SnowflakeDialect(side="A").normalize(col)
+        assert needle in sql and "as varchar)" not in sql.replace(needle, ""), raw
 
 
 def _connect_log(monkeypatch) -> list[str]:
@@ -108,22 +182,30 @@ def _connect_log(monkeypatch) -> list[str]:
     return [s.lower().replace(" ", "") for s in log]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF2: QUOTED_IDENTIFIERS_IGNORE_CASE is not pinned off at connect",
-)
 def test_rt_hf2_offline_quoted_identifiers_ignore_case_is_pinned(monkeypatch):
     log = _connect_log(monkeypatch)
     assert any("quoted_identifiers_ignore_case=false" in s for s in log), log
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF6: STRICT_JSON_OUTPUT is not pinned off at connect",
-)
 def test_rt_hf6_offline_strict_json_output_is_pinned(monkeypatch):
     log = _connect_log(monkeypatch)
     assert any("strict_json_output=false" in s for s in log), log
+
+
+def test_rt_hf11_offline_a_secret_url_never_shows_its_password():
+    """The conftest URL type masks the password wherever pytest would print
+    it - repr() of a fixture argument and saferepr() in an assertion's
+    explanation - while handing the driver the real value."""
+    from _pytest._io.saferepr import saferepr
+    from conftest import SecretUrl, redact_url
+
+    secret = "Rth-" + uuid.uuid4().hex
+    url = SecretUrl(f"snowflake://me:{secret}@acct-x/db/sch?warehouse=w")
+    shown = [repr(url), saferepr(url), repr([url]), repr({"u": url}), redact_url(url)]
+    leaked = [secret in s for s in shown]
+    assert leaked == [False] * len(shown)
+    assert str(url).endswith("?warehouse=w") and secret in f"{url}"
+    assert urlsplit(url).password == secret
 
 
 def test_the_existing_pins_are_still_made(monkeypatch):
@@ -153,11 +235,6 @@ def _with_schema(url: str, schema: str) -> str:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF11: the conftest URL fixtures are plain strings, so a failing "
-    "live test prints the password and account in pytest's report",
-)
 def test_rt_hf11_the_url_fixture_never_shows_its_password(snowflake_url):
     """Leaked secret (test suite). pytest prints a failing test's arguments
     with repr(); `snowflake_url` (and the BigQuery, SQL Server, MySQL ones)
@@ -270,11 +347,6 @@ def _pair(url: str, name: str, columns: str, rows_a: str, rows_b: str) -> None:
 # --- RT-HF1: VARIANT doubles ---------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF1: TO_JSON prints a VARIANT double with 16 significant digits - "
-    "distinct doubles compare identical",
-)
 def test_rt_hf1_distinct_variant_doubles_are_different(sfh):
     """FALSE MATCH. Snowflake's TO_JSON writes a DOUBLE in a VARIANT as
     `d.ddddddddddddddde+xx` - 16 significant digits, where a double needs 17
@@ -301,8 +373,33 @@ def test_rt_hf1_distinct_variant_doubles_are_different(sfh):
         "where a.v <> b.v order by 1",
     )
     assert [int(r[0]) for r in differ] == [1, 2, 3]
-    result = _diff(sfh, "RTH_SF_VDA", "RTH_SF_VDB", "id")
-    assert _found(result) == {k: ("different", ["V"]) for k in (1, 2, 3)}
+    # Snowflake cannot print such a double exactly, so the column is refused
+    # - naming the side, the column and --exclude - never compared alike.
+    with pytest.raises(ValueError, match=r"side B.*'V'.*double.*--exclude"):
+        _diff(sfh, "RTH_SF_VDA", "RTH_SF_VDB", "id")
+    # Left out, the rest of the table is still compared.
+    result = _diff(sfh, "RTH_SF_VDA", "RTH_SF_VDB", "id", exclude=["v"])
+    assert result.diffs == [] and "V" not in [c.upper() for c in result.columns]
+
+
+def test_rt_hf1_variant_doubles_that_print_exactly_are_compared(sfh):
+    """The other half of the RT-HF1 fix: a double whose 16-digit text reads
+    back as itself is pinned down by it, so a document of such doubles is
+    compared as before - and a planted change in one is found, at the top
+    level and nested."""
+    _pair(
+        sfh,
+        "RTH_SF_VE",
+        "id int, v variant",
+        "select 1, parse_json('1e0') union all select 2, to_variant(0.25::float) "
+        'union all select 3, parse_json(\'{"x": [2.5e0, "s"]}\') '
+        "union all select 4, parse_json('NaN')",
+        "select 1, parse_json('1e0') union all select 2, to_variant(0.5::float) "
+        'union all select 3, parse_json(\'{"x": [7.5e0, "s"]}\') '
+        "union all select 4, parse_json('NaN')",
+    )
+    result = _diff(sfh, "RTH_SF_VEA", "RTH_SF_VEB", "id")
+    assert _found(result) == {k: ("different", ["V"]) for k in (2, 3)}
 
 
 # --- RT-HF2: QUOTED_IDENTIFIERS_IGNORE_CASE --------------------------------------
@@ -323,11 +420,6 @@ def _qiic_tables(url: str) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF2: a QUOTED_IDENTIFIERS_IGNORE_CASE user default makes the "
-    "tool read a different table than it introspected",
-)
 def test_rt_hf2_quoted_identifiers_ignore_case_reads_the_named_table(sfh):
     """FALSE MATCH. `columns()` finds `rth_sf_q` in information_schema (an
     exact string match), then every data query quotes it - and with
@@ -376,11 +468,6 @@ def tz_keys(sfh) -> str:
     return sfh
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF3: TIMESTAMP_TZ keys with nanoseconds compare wall clocks - "
-    "two different instants match",
-)
 def test_rt_hf3_distinct_nanosecond_tz_keys_do_not_match(tz_keys):
     """FALSE MATCH. `normalize_key` renders a key with a sub-microsecond part
     as `to_char(<raw column>, ...FF9)` - without the convert_timezone that
@@ -400,11 +487,6 @@ def test_rt_hf3_distinct_nanosecond_tz_keys_do_not_match(tz_keys):
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF3: the same nanosecond TIMESTAMP_TZ instant at two offsets is "
-    "reported as two different keys",
-)
 def test_rt_hf3_one_nanosecond_instant_at_two_offsets_is_one_key(tz_keys):
     """False alarm, the other half of RT-HF3: the instant stored at +00:00
     and at +05:00 renders two wall clocks, reported only_in_a / only_in_b.
@@ -446,11 +528,6 @@ def policies(sfh) -> str:
     return sfh
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF4: a masking policy on a compared column gives a silent "
-    "identical - no caveat",
-)
 def test_rt_hf4_a_masked_column_is_never_a_silent_match(policies):
     """FALSE MATCH. A masking policy makes both sides return `***` for the
     reading role, so row 2 ('b' against 'DIFFERENT') compares equal and the
@@ -462,10 +539,6 @@ def test_rt_hf4_a_masked_column_is_never_a_silent_match(policies):
     assert (not result.identical) or any("mask" in w.lower() for w in result.warnings)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF5: a row access policy hides rows from both sides with no caveat",
-)
 def test_rt_hf5_a_row_access_policy_is_never_a_silent_match(policies):
     """FALSE MATCH. The row access policy shows the reading role only id < 2,
     so the differing row 2 is invisible on both sides: identical, silently."""
@@ -525,10 +598,6 @@ def test_aggregation_and_projection_policies_fail_loudly(sfh, ddl, message):
 # --- RT-HF6: STRICT_JSON_OUTPUT ---------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF6: a STRICT_JSON_OUTPUT user default prints undefined as null",
-)
 def test_rt_hf6_strict_json_output_keeps_undefined_apart_from_null(sfh):
     """FALSE MATCH under a user default. ARRAY_CONSTRUCT(1, NULL) holds an
     SQL NULL element (`[1,undefined]`), PARSE_JSON('[1,null]') a JSON null;
@@ -556,11 +625,6 @@ def test_rt_hf6_strict_json_output_keeps_undefined_apart_from_null(sfh):
 # --- RT-HF7: GEOGRAPHY / GEOMETRY / VECTOR -----------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF7: GEOGRAPHY, GEOMETRY and VECTOR columns crash the walk "
-    "(no varchar cast)",
-)
 @pytest.mark.parametrize(
     ("typ", "same", "other"),
     [
@@ -607,11 +671,6 @@ def test_decfloat_is_compared_as_its_exact_text(sfh):
 # --- RT-HF8 / RT-HF9: NUMBER(38) at its limits ------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF8: a DECIMAL value with more than 38 - float_scale integer "
-    "digits crashes the DECIMAL rendering",
-)
 @pytest.mark.parametrize(
     ("typ", "wide", "scale"),
     [
@@ -660,10 +719,6 @@ def test_number_38_37_is_compared_at_the_scale(sfh):
     assert _found(result) == {2: ("different", ["F"])}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HF9: NUMBER(38,0) keys spanning more than ~3e36 crash the bucket expression",
-)
 @pytest.mark.parametrize("low", ["0", "-" + "9" * 38])
 def test_rt_hf9_number_38_keys_across_a_wide_range(sfh, low):
     """Crash. The bucket expression multiplies the key offset by the number
@@ -891,7 +946,9 @@ def test_a_row_inserted_mid_walk_does_not_hide_the_planted_difference(live_pair)
 def test_a_crafted_double_slash_filter_is_caught_downstream(sfh):
     """RT-HF10's crafted predicate escapes the parentheses on Snowflake; the
     per-level row-count check still keeps the verdict from being identical.
-    Differences planted at 30 (inside the filter) and 45 (outside)."""
+    Differences planted at 30 (inside the filter) and 45 (outside). The guard
+    now refuses the predicate, so it is switched off here to keep the second
+    line of defence tested."""
     _exec(
         sfh,
         "create or replace table RTH_SF_WA (id int, v varchar)",
@@ -900,11 +957,16 @@ def test_a_crafted_double_slash_filter_is_caught_downstream(sfh):
         "update RTH_SF_WB set v = 'CHANGED' where id in (30, 45)",
     )
     p = "id < 40 // (\n) or (1=0 // )\n or 1=0"
+    a, b = _open(sfh, "A"), _open(sfh, "B")
+    for d in (a, b):
+        d.check_where = lambda where: None  # type: ignore[method-assign]
     result = _diff(
         sfh,
         "RTH_SF_WA",
         "RTH_SF_WB",
         "id",
+        a=a,
+        b=b,
         where_a=p,
         where_b=p,
         threshold=4,

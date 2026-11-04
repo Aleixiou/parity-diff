@@ -151,6 +151,56 @@ with the caveat that 0.x means the CLI surface may still move.
     NULL (row `IS NOT NULL` semantics); NULL now means the value is NULL.
   - Inheritance children of a compared parent table are named in a caveat.
 
+- **Snowflake: red-team round H (RT-HF1 to RT-HF11), six false matches
+  fixed.** Each verified live (connector 4.8.1, AWS eu-central-2) and pinned
+  by a test that plants the difference:
+  - *VARIANT doubles* (RT-HF1, false match): `TO_JSON` prints a DOUBLE in a
+    VARIANT with 16 significant digits, so 1 and 1.0000000000000002, or 0.3
+    and 0.1 + 0.2, compared identical - and the sample check read the same
+    text. Snowflake has no exact printing of a double inside a document, so a
+    VARIANT/OBJECT/ARRAY column holding a double whose text another double
+    shares is now **refused** before the first checksum, naming the side,
+    column, a key and the JSON path (`--exclude` it). One extra scan per JSON
+    column. Doubles whose text reads back as themselves - and every integer
+    and decimal - are compared as before.
+  - *`QUOTED_IDENTIFIERS_IGNORE_CASE`* (RT-HF2, false match): as a user or
+    account default it folded the quoted `"orders"` to `ORDERS`, so the rows
+    of another table were compared. Pinned `false` at connect.
+  - *`STRICT_JSON_OUTPUT`* (RT-HF6, false match under a user default): it
+    printed an SQL NULL array element, NaN and Infinity as `null`. Pinned
+    `false`.
+  - *TIMESTAMP_TZ keys with nanoseconds* (RT-HF3, false match and false
+    alarm): the nine-digit key text printed the stored wall clock, so
+    12:00:00.000000001 at +00:00 and at +05:00 were one key, and one instant
+    at two offsets two keys. Now moved to UTC first, as values always were.
+    **Checksum move:** only TIMESTAMP_TZ keys with a sub-microsecond part
+    stored at a non-UTC offset.
+  - *Masking and row access policies* (RT-HF4, RT-HF5, false matches): both
+    sides saw the mask, or neither saw the hidden rows, and the run said
+    identical with no word. The policies on the compared table are read from
+    `POLICY_REFERENCES` and named in a caveat on every run (as PostgreSQL
+    row-level security is); for a view, a caveat says the policies of the
+    tables beneath it are not checked; a role that may not read the policy
+    list gets a caveat that the check did not run.
+  - *GEOGRAPHY, GEOMETRY, VECTOR* (RT-HF7, crash): they had no varchar cast
+    and killed the walk. Now WKB, EWKB (with the SRID) and the vector's JSON
+    array (float32 elements, which 16 digits distinguish), still listed as
+    unmapped.
+  - *Wide NUMBER values* (RT-HF8, crash): DECIMAL rendered through
+    `cast(c as number(38, scale))`, which holds 32 integer digits at scale 6
+    (18 at scale 20). Now `ROUND(c, scale)` with the missing places padded -
+    no widening. **No checksum moved:** byte-identical to the old text on
+    5,568 values over 11 NUMBER types at scales 0, 2, 6 and 20, live.
+  - *NUMBER(38,0) keys across more than ~3e36* (RT-HF9, crash): the bucket
+    expression overflowed 38 digits. Such a span now buckets by comparing the
+    key with its precomputed boundaries; every narrower span emits the
+    shared SQL byte for byte (no checksum moved).
+  - *`//` in a row filter* (RT-HF10): Snowflake's line comment is refused
+    outside a quoted string.
+  - *Test-suite secret leak* (RT-HF11): pytest printed a failing live test's
+    URL argument with `repr()` - password and account. Every
+    `PARITY_TEST_*` URL is now a `SecretUrl` whose repr masks the password,
+    and the conftest skip messages print `redact_url(...)`.
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)
   and its fetch failed, the result used to stay identical with exit 0 and

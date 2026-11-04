@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 122e904e899ae485`
+Source fingerprint: `src-sha256: 305628369a22d49f`
 
 ## Summary
 
@@ -45,6 +45,7 @@ For one run that reports **identical**, on columns the rules cover:
 | Row-level security hides rows from the reading role (PostgreSQL; SQL Server security policies) | **not bounded**: those rows are not compared; every run names the table in a caveat (on SQL Server, without VIEW DEFINITION on the database, a caveat that RLS cannot be ruled out) | Not quantifiable |
 | Dynamic data masking hands the login masks instead of values (SQL Server) | **0** for a table: a compared column masked for the login is refused; a view reading one is refused, and so is any view whose dependencies the login cannot see (no VIEW DEFINITION) in a database holding masked columns it cannot unmask | By design (tested live) |
 | Column-level grants hide a column from the reading login (PostgreSQL) | **0**: a column the login lacks SELECT on is a schema difference, never identical, unless `--exclude`d (round H) | By design (tested) |
+| A Snowflake row access policy hides them, or a Snowflake masking policy shows both sides the mask | **not bounded**: those rows or values are not compared; every run names the table (and a masked column) in a caveat, and on a Snowflake view says the policies beneath it are not checked | Not quantifiable |
 | Data crafted on purpose to collide | **not bounded**: eight crafted rows can cancel in one sum | Not quantifiable |
 | Columns of types outside the rules (BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, ranges, geometry, XML; listed per run) | **no bound**; named in the report as not covered. Not only false alarms: until round H, BigQuery's text for ARRAY/STRUCT/GEOGRAPHY collided (false matches). Now injective on BigQuery; elsewhere a raw text cast whose injectivity is per engine | Not quantifiable |
 | A bug in the tool not yet found | **no number exists**; see the evidence in each section | Not quantifiable |
@@ -66,7 +67,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | A pinned setting changed mid-walk by the queries themselves (`set_config()` in a `--where` or a view's function, PostgreSQL) | **0**: such filters are refused by name, and every pin is re-read after the walk - one that moved makes the run unexplained, never identical (round H) | By design (tested) |
 | PostgreSQL money written under a locale with other decimals than the login's default lc_monetary | **not bounded**: money is an integer of minor units and read at the login's own frac_digits (a caveat names them when not two); a session-only write locale cannot be detected | Not quantifiable |
 | Engine version renders differently | **0** within the supported ranges: PostgreSQL 12-17 byte-identical to 18 (9.6-11 for non-FLOAT, with `extra_float_digits = 3` there so floats inside unmapped types print exactly - round H), MySQL 8.4 and 9.7 to 8.0, SQL Server 2019 to 2022 and compatibility levels 130-160, DuckDB 1.3-2.0 to 1.5; versions outside are refused at connect (PostgreSQL < 9.6, DuckDB < 1.3) or for FLOAT (PostgreSQL < 12, SQL Server level < 130) | Measured |
-| Rows hidden from the session (row caps, RLS) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS: **not bounded**, named in a caveat | By design / Not quantifiable |
+| Rows hidden from the session (row caps, RLS, Snowflake policies) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS and Snowflake masking / row access policies: **not bounded**, named in a caveat (a Snowflake view's underlying policies cannot be listed, and the caveat says so) | By design / Not quantifiable |
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | A MySQL view over a non-transactional table read as one snapshot | **0** — the view's base tables are followed through `view_table_usage` (views of views included) and any non-InnoDB one gets the caveat below; a view whose base tables cannot be listed gets it too (round H, RT-HM17) | By design (tested) |
@@ -122,7 +123,7 @@ risk line, scale, filters and caveats, as the reports print them.
 | Risk | Odds | Kind |
 |---|---|---|
 | Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation) | By design (tested) |
-| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do) | By design (tested) |
+| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits, as the instant in UTC), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do). This row said 0 for TIMESTAMP before round H too, and was wrong on Snowflake: a TIMESTAMP_TZ key with nanoseconds printed its stored wall clock, so two instants at different offsets merged (RT-HF3, fixed and tested live) | By design (tested) |
 
 ## 4. Rendering each value as canonical text (per engine)
 
@@ -141,7 +142,8 @@ and 4.3. This is where every past false match lived.
 | MySQL text in a legacy character set (sjis, euckr, gbk, big5, cp125x, ucs2, …) holding a character with no Unicode mapping | **0** false matches — MySQL's conversion turns such characters into `?` (and ucs2 surrogates into NULL) silently, so each value is converted back and compared byte for byte with what is stored; one that does not survive renders `parity: not convertible from <charset> 0x<bytes>`. Convertible text renders exactly as before (round H, RT-HM1/HM2, false matches before; verified on 16 lossy charsets and MySQL 8.0, 8.4, 9.7) | By design (verified live) |
 | MySQL display forms taken for values (ZEROFILL padding, YEAR 0 as `0000`, ENUM's index-0 error value as `''`) | **0** — rendered as their values (`5`, `0`) and the error value as its own marker (round H, RT-HM4/5/7/9) | By design (tested) |
 | MySQL JSON scalars of MySQL's own types (`cast(date as json)`, binary) | **not covered**: they print as the JSON string of their text and compare equal to it, MySQL to MySQL only; documented (RT-HM8) | Not quantifiable |
-| Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value | By design (tested) |
+| Values past an engine's range (FLOAT ≥ 2¹¹⁶, DECIMAL wider than the cast) | **0** — refused with an error naming side, column and value (Snowflake renders DECIMAL with `ROUND`, which never overflows, since round H) | By design (tested) |
+| A Snowflake VARIANT double that TO_JSON prints with 16 digits, shared by another double | **0** false matches — the column is refused before the first checksum, naming side, column, key and path (one scan per JSON column); a double whose text reads back as itself has a text no other double has | By design (tested live) |
 
 Findings this check produced and fixed: 8 (COV-1 to COV-8), two of them
 false matches (Snowflake TIME; DuckDB TIMETZ, whose text printed the offset
@@ -157,7 +159,9 @@ grants, the ENUM error value), all fixed; open are a Ctrl-C that cannot
 cancel at `max_user_connections` (now reported), JSON typed scalars
 (documented) and casefold column matching (engine, RT-HM18). Round H on SQL Server: 11
 problems, 4 of them false matches (dynamic data masking, row-level security
-without a caveat, spatial SRID, invalid double-byte text), all fixed. Earlier campaign: about 30
+without a caveat, spatial SRID, invalid double-byte text), all fixed. Round H on Snowflake: 11 problems
+(RT-HF1 to HF11), 6 of them false matches, all fixed or refused, plus a
+secret leak in the test suite's failure reports. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range
@@ -175,7 +179,7 @@ them per key range in a wide type and counts rows.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine), property-tested against `bucket_bounds` | By design (tested) |
+| A key falls in no bucket or two | **0** — bucket arithmetic is exact (widened integers, exact division on every engine; a Snowflake NUMBER(38,0) span too wide for 38 digits compares the key with its precomputed boundaries), property-tested against `bucket_bounds` | By design (tested) |
 | An empty range on one side is skipped | **0** — empty sums are 0 on both sides | By design (tested) |
 | A difference vanishes between two levels (rows changed between the queries) | **0** false matches — each level's buckets must add up, in rows and checksum, to the level above, or the range is unexplained | By design (tested) |
 

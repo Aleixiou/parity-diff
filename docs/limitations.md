@@ -249,12 +249,20 @@ The per-type, per-engine evidence is [`coverage.md`](coverage.md).
   caveat (and, when the login lacks `VIEW DEFINITION` to see the policies, a
   caveat that RLS cannot be ruled out). SQL Server has no bypass: diff as a
   user the predicates let read every row.
+  Snowflake masking and row access policies on the compared table are named
+  the same way (a masked column compares the mask on both sides); the
+  policies of the tables beneath a Snowflake view are not visible to the
+  check, and the caveat says so.
 - A PostgreSQL parent table's rows include its inheritance children's; the
   run names the children.
 - **Masked values are never compared as masks.** A SQL Server column under
   dynamic data masking reads as its mask for a login without `UNMASK`, so
   such a compared column is refused (naming it; `GRANT UNMASK` or
   `--exclude` it), and a view reading one is refused as a whole.
+- **Snowflake VARIANT doubles that print alike are refused.** TO_JSON prints
+  a double inside a document with 16 significant digits; a JSON column
+  holding one whose text another double shares cannot be compared exactly
+  and stops the run, naming it.
 - Settings that cap result rows (MySQL `sql_select_limit`, Snowflake
   `ROWS_PER_RESULTSET`) are reset for the session, and if a side's checksums
   ever cover fewer rows than it holds, the run is not identical.
@@ -269,7 +277,7 @@ value renders, or which rows a query returns, is pinned at connect:
 | PostgreSQL | `TimeZone` UTC, `extra_float_digits = 1` (3 before 12), `standard_conforming_strings`, `IntervalStyle`, `DateStyle`, `bytea_output`, `lc_monetary` (money still read at the login's own decimal places), `client_encoding` UTF8, `search_path = pg_catalog` (so no user function can shadow a built-in), `quote_all_identifiers` off, and `idle_in_transaction_session_timeout` / (17+) `transaction_timeout` off so a role default cannot kill the held snapshot mid-run; then a read-only REPEATABLE READ transaction. Every pin is re-read after the walk: one a filter or a view's function moved makes the run unexplained |
 | MySQL | `time_zone` UTC, `sql_mode`, `sql_select_limit` (reset to no limit), then REPEATABLE READ, READ ONLY |
 | SQL Server | isolation (SNAPSHOT where allowed, else READ COMMITTED; a memory-optimized table is read `WITH (SNAPSHOT)` at READ COMMITTED), `NUMERIC_ROUNDABORT` off; never commits |
-| Snowflake | `TIMEZONE` UTC, `ROWS_PER_RESULTSET = 0` (no limit) |
+| Snowflake | `TIMEZONE` UTC, `ROWS_PER_RESULTSET = 0` (no limit), `QUOTED_IDENTIFIERS_IGNORE_CASE` and `STRICT_JSON_OUTPUT` off |
 | DuckDB | `TimeZone` UTC, extension auto-install and auto-load off; the file is opened read-only |
 | BigQuery | read-only OAuth scope; base tables read `FOR SYSTEM_TIME AS OF` the first query |
 

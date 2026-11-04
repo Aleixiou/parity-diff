@@ -15,17 +15,15 @@ connector receives; this file proves Snowflake accepts it.
 
 from __future__ import annotations
 
-import os
-
 import pytest
-from conftest import duckdb_write, open_duckdb
+from conftest import duckdb_write, open_duckdb, secret_env
 
 from parity.dialects.base import get_dialect
 from parity.engine import diff
 
 pytestmark = pytest.mark.snowflake
 
-KEYPAIR_URL = os.environ.get("PARITY_TEST_SNOWFLAKE_KEYPAIR", "")
+KEYPAIR_URL = secret_env("PARITY_TEST_SNOWFLAKE_KEYPAIR")
 
 N = 500
 

@@ -63,7 +63,15 @@ def test_normalize_renders_each_logical_type():
     sentinel = "(chr(92) || 'N')"
     cases = {
         LogicalType.INTEGER: 'cast("c" as varchar)',
-        LogicalType.DECIMAL: 'cast(cast("c" as number(38,6)) as varchar)',
+        # ROUND, never a cast to number(38, 6), which held 32 integer digits
+        # (RT-HF8); the places ROUND keeps short of six are padded with zeros.
+        LogicalType.DECIMAL: (
+            "case when contains(cast(round(\"c\", 6) as varchar), '.') "
+            "then cast(round(\"c\", 6) as varchar) || repeat('0', 6 - "
+            "(length(cast(round(\"c\", 6) as varchar)) - position('.', "
+            'cast(round("c", 6) as varchar)))) '
+            "else cast(round(\"c\", 6) as varchar) || '.000000' end"
+        ),
         LogicalType.BOOLEAN: "case when \"c\" then 'true' when not \"c\" then 'false' end",
         LogicalType.DATE: "to_char(\"c\", 'YYYY-MM-DD')",
         LogicalType.TIMESTAMP: "to_char(\"c\", 'YYYY-MM-DD HH24:MI:SS.FF6')",
@@ -123,7 +131,8 @@ def test_columns_reads_numeric_scale_to_split_number():
     class Stubbed(SnowflakeDialect):
         def query(self, sql):  # type: ignore[override]
             """Return canned information_schema rows instead of hitting a DB."""
-            assert "information_schema.columns" in sql
+            if "information_schema.columns" not in sql:
+                return []  # the policy lookups (RT-HF4/5): nothing attached
             assert "PARITY_TEST" in sql or "ENC" in sql or "ORDERS" in sql
             return [
                 ("ID", "NUMBER", 0, None),
