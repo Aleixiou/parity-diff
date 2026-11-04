@@ -560,7 +560,7 @@ class BigQueryDialect(Dialect):
         """The element of an `ARRAY<T>` column: `T`, by BigQuery's own map."""
         raw = column.raw_type.strip()
         if not (raw.upper().startswith("ARRAY<") and raw.endswith(">")):
-            raise self._err(f"column {column.name!r} ({column.raw_type}) is not an array")
+            return super().list_element(column)  # the shared `T[]` spelling
         return _column(self.LIST_ELEMENT_NAME, raw[6:-1].strip())
 
     def _array_text(self, column: Column) -> str:

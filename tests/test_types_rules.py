@@ -165,7 +165,7 @@ def test_reference_reads_every_driver_form():
         (map_type_bigquery, "TIME", LogicalType.TIME),
         (map_type_bigquery, "BYTES(16)", LogicalType.BINARY),
         (map_type_bigquery, "JSON", LogicalType.JSON),
-        (map_type_bigquery, "ARRAY<INT64>", LogicalType.UNKNOWN),
+        (map_type_bigquery, "ARRAY<INT64>", LogicalType.LIST),
     ],
 )
 def test_type_maps(mapper, raw: str, expected: LogicalType):

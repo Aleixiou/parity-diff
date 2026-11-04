@@ -1107,7 +1107,7 @@ def _filter_caveats(
                 f"an expression that can change during the run (random(), "
                 f"clock_timestamp(), now(), current_timestamp() or "
                 f"current_date, unless the engine evaluates it once per run - "
-                f"BigQuery's snapshot does not pin its clock) can select "
+                f"a snapshot need not pin the clock) can select "
                 f"different rows in different queries - prefer fixed literals"
             )
     if bool(where_a) != bool(where_b):
