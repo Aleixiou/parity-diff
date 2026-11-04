@@ -26,8 +26,18 @@ CASES = [
     ("varchar-list-null-vs-NULL", "VARCHAR[]", "[NULL]", "['NULL']"),
     ("varchar-list-comma", "VARCHAR[]", "['a, b']", "['a', 'b']"),
     ("timetz-offset-seconds", "TIMETZ", "'12:00:00+05:00:30'", "'12:00:00+05:30'"),
-    ("union-tag", "UNION(n INTEGER, s VARCHAR)", "union_value(n := 1)", "union_value(s := '1')"),
-    ("ns-timestamp", "TIMESTAMP_NS", "'2020-01-01 00:00:00.000000001'", "'2020-01-01 00:00:00.000000002'"),
+    (
+        "union-tag",
+        "UNION(n INTEGER, s VARCHAR)",
+        "union_value(n := 1)",
+        "union_value(s := '1')",
+    ),
+    (
+        "ns-timestamp",
+        "TIMESTAMP_NS",
+        "'2020-01-01 00:00:00.000000001'",
+        "'2020-01-01 00:00:00.000000002'",
+    ),
     ("interval-month-vs-days", "INTERVAL", "interval '1 month'", "interval '30 days'"),
     ("decimal-round", "DECIMAL(18,7)", "2.0000005", "2.0000004"),
 ]
@@ -51,8 +61,16 @@ def main(tmp: str) -> dict:
     out: dict = {"version": duckdb.__version__, "cases": {}}
     for name, typ, a, b in CASES:
         ddl = f"create table t (id int, v {typ})"
-        pa = write(os.path.join(tmp, f"{name}_a.duckdb"), ddl, f"insert into t values (1, {a}), (2, {a})")
-        pb = write(os.path.join(tmp, f"{name}_b.duckdb"), ddl, f"insert into t values (1, {b}), (2, {a})")
+        pa = write(
+            os.path.join(tmp, f"{name}_a.duckdb"),
+            ddl,
+            f"insert into t values (1, {a}), (2, {a})",
+        )
+        pb = write(
+            os.path.join(tmp, f"{name}_b.duckdb"),
+            ddl,
+            f"insert into t values (1, {b}), (2, {a})",
+        )
         try:
             da = get_dialect(f"duckdb:///{pa}", side="A")
             db = get_dialect(f"duckdb:///{pb}", side="B")
@@ -62,7 +80,7 @@ def main(tmp: str) -> dict:
         try:
             r = diff(da, db, "main.t", "main.t", key="id", verify_sample=0)
             out["cases"][name] = {"found": sorted([d.key, d.kind] for d in r.diffs)}
-        except Exception as exc:  # noqa: BLE001 - reported, not raised
+        except Exception as exc:
             out["cases"][name] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
         finally:
             da.close()

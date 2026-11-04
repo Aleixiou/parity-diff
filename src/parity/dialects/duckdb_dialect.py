@@ -260,7 +260,9 @@ class DuckDBDialect(Dialect):
             self._conn = duckdb.connect(":memory:")
             self._no_extension_downloads()
             self._pin_utc()
-            self._catalog = str(self._conn.execute("select current_database()").fetchall()[0][0])
+            self._catalog = str(
+                self._conn.execute("select current_database()").fetchall()[0][0]
+            )
             return
         if not os.path.exists(path):
             # read_only=True on a missing path fails with a driver-level error
@@ -274,7 +276,9 @@ class DuckDBDialect(Dialect):
         self._conn = duckdb.connect(path, read_only=True)
         self._no_extension_downloads()
         self._pin_utc()
-        self._catalog = str(self._conn.execute("select current_database()").fetchall()[0][0])
+        self._catalog = str(
+            self._conn.execute("select current_database()").fetchall()[0][0]
+        )
         self._refuse_shadowing()
 
     def _refuse_foreign_file(self, path: str) -> None:
@@ -294,9 +298,15 @@ class DuckDBDialect(Dialect):
             with open(path, "rb") as fh:
                 head = fh.read(16)
         except OSError as exc:
-            raise self._err(f"could not connect: cannot read {_redact(path)}: {exc}") from exc
+            raise self._err(
+                f"could not connect: cannot read {_redact(path)}: {exc}"
+            ) from exc
         if head[8:12] != b"DUCK":
-            what = " (it is a SQLite database)" if head.startswith(b"SQLite format 3") else ""
+            what = (
+                " (it is a SQLite database)"
+                if head.startswith(b"SQLite format 3")
+                else ""
+            )
             raise self._err(
                 f"{_redact(path)} is not a valid DuckDB database file{what}; "
                 "parity opens DuckDB files only and loads no extension to read "
@@ -447,7 +457,9 @@ class DuckDBDialect(Dialect):
         ]
         if not rows:
             raise self._err(self._not_found(table, schema, name))
-        kind = self.query(f"select table_type from system.information_schema.tables {where}")  # noqa: S608
+        kind = self.query(
+            f"select table_type from system.information_schema.tables {where}"
+        )
         if kind and kind[0][0] == "VIEW":
             listed = rows
             live = [
@@ -643,7 +655,9 @@ class DuckDBDialect(Dialect):
             element = self.list_element_text(column)
             var = self.quote(self.LIST_ELEMENT_NAME)
             each = f"[{element} || {self.list_terminator_sql()} for {var} in {c}]"
-            expr = f"case when {c} is not null then '[' || {self._joined(each)} || ']' end"
+            expr = (
+                f"case when {c} is not null then '[' || {self._joined(each)} || ']' end"
+            )
         elif t is LogicalType.BINARY:
             # The varchar cast prints printable bytes as themselves and the
             # rest as `\xFF`, so b'abc' rendered exactly like the text 'abc'.
@@ -714,7 +728,9 @@ class DuckDBDialect(Dialect):
         seconds before DuckDB 2.0 (RT-HD6), so it renders by the TIMETZ rule.
         """
         typ = f"variant_typeof({c})"
-        timetz = self._render(Column("", LogicalType.TIMETZ, "TIMETZ"), f"cast({c} as timetz)")
+        timetz = self._render(
+            Column("", LogicalType.TIMETZ, "TIMETZ"), f"cast({c} as timetz)"
+        )
         return (
             f"case when {c} is not null then {typ} || ':' || "
             f"case when {typ} = 'TIME_MICROS_TZ' then {timetz} "

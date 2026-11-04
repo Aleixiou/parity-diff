@@ -45,7 +45,9 @@ READER_PW = "Rth!hReader2026x"  # throwaway, for a disposable local login only
 # --------------------------------------------------------------- helpers
 
 
-def at(db: str, base: str = MSSQL_URL, user: str | None = None, pw: str | None = None) -> str:
+def at(
+    db: str, base: str = MSSQL_URL, user: str | None = None, pw: str | None = None
+) -> str:
     """`base` pointed at database `db`, optionally as another login."""
     u = urlparse(base)._replace(path="/" + db)
     if user:
@@ -93,7 +95,11 @@ def make_db(
     drop_db(name, base)
     ex("master", f"create database [{name}] collate {collation}", base=base)
     if snapshot:
-        ex("master", f"alter database [{name}] set allow_snapshot_isolation on", base=base)
+        ex(
+            "master",
+            f"alter database [{name}] set allow_snapshot_isolation on",
+            base=base,
+        )
     ex(
         name,
         f"create user [{READER}] for login [{READER}]",
@@ -136,7 +142,9 @@ def found(result) -> list[tuple]:
     )
 
 
-def pair(db: str, ddl: str, rows_a: list[str], rows_b: list[str], name: str) -> tuple[str, str]:
+def pair(
+    db: str, ddl: str, rows_a: list[str], rows_b: list[str], name: str
+) -> tuple[str, str]:
     """Create `<name>_a` and `<name>_b` with column list `ddl`; insert rows."""
     a, b = f"{name}_a", f"{name}_b"
     stmts = [f"drop table if exists {a}", f"drop table if exists {b}"]
@@ -170,7 +178,9 @@ def _scratch() -> Iterator[None]:
         f"with password = '{READER_PW}', check_policy = off",
     )
     yield
-    rows = ex("master", "select name from sys.databases where name like 'rth[_]mssql[_]%'")[0]
+    rows = ex(
+        "master", "select name from sys.databases where name like 'rth[_]mssql[_]%'"
+    )[0]
     for (name,) in rows:
         drop_db(name)
     ex("master", f"if suser_id('{READER}') is not null drop login [{READER}]")
@@ -270,7 +280,9 @@ def test_a_denied_column_is_refused_loudly_and_can_be_excluded(db):
 def test_the_reader_login_cannot_write_and_the_diff_still_finds_the_row(db):
     """The documented deployment: a db_datareader login. The diff runs and
     finds the planted row; the same login is refused a write by the server."""
-    ta, tb = pair(DB, "id int primary key, v nvarchar(10)", ["(1, N'a')"], ["(1, N'b')"], "ro")
+    ta, tb = pair(
+        DB, "id int primary key, v nvarchar(10)", ["(1, N'a')"], ["(1, N'b')"], "ro"
+    )
     assert found(run(reader(), reader(), ta, tb)) == [(1, "different", ("v",))]
     with pytest.raises(Exception, match=r"(?i)permission was denied"):
         ex(DB, "delete from dbo.ro_a", base=reader())
@@ -288,8 +300,14 @@ def test_rt_hs3_spatial_srid_is_compared(db):
     ta, tb = pair(
         DB,
         "id int primary key, g geometry, gg geography",
-        ["(1, geometry::Point(1, 2, 0), null)", "(2, null, geography::Point(47.5, 8.5, 4326))"],
-        ["(1, geometry::Point(1, 2, 4326), null)", "(2, null, geography::Point(47.5, 8.5, 4269))"],
+        [
+            "(1, geometry::Point(1, 2, 0), null)",
+            "(2, null, geography::Point(47.5, 8.5, 4326))",
+        ],
+        [
+            "(1, geometry::Point(1, 2, 4326), null)",
+            "(2, null, geography::Point(47.5, 8.5, 4269))",
+        ],
         "srid",
     )
     assert found(run(db, db, ta, tb)) == [
@@ -363,7 +381,8 @@ def test_rt_hs4_invalid_dbcs_bytes_are_distinct():
 
 
 @pytest.mark.parametrize(
-    "collation", ["Korean_Wansung_CI_AS", "Chinese_Taiwan_Stroke_CI_AS", "Chinese_PRC_CI_AS"]
+    "collation",
+    ["Korean_Wansung_CI_AS", "Chinese_Taiwan_Stroke_CI_AS", "Chinese_PRC_CI_AS"],
 )
 def test_rt_hs4_invalid_dbcs_bytes_are_distinct_in_korean_and_chinese(collation):
     """The same in the Korean and both Chinese code pages, measured over all
@@ -373,7 +392,11 @@ def test_rt_hs4_invalid_dbcs_bytes_are_distinct_in_korean_and_chinese(collation)
     ta, tb = pair(
         "rth_mssql_dbcs",
         "id int primary key, v varchar(20)",
-        ["(1, convert(varchar(20), 0x8101))", "(2, convert(varchar(20), 0x8102))", "(3, 'b')"],
+        [
+            "(1, convert(varchar(20), 0x8101))",
+            "(2, convert(varchar(20), 0x8102))",
+            "(3, 'b')",
+        ],
         ["(1, convert(varchar(20), 0x8102))", "(2, '?')", "(3, 'c')"],
         "cjk",
     )
@@ -497,20 +520,32 @@ def test_date_and_time_types_at_their_range_ends(db):
         DB,
         cols,
         [
-            "(1, '9999-12-31 23:59:59.9999999 +00:00', '2024-01-01 00:00:00 +14:00', "
-            "'23:59:59.999', '9999-12-31 23:59:59.9', '2079-06-06 23:59', '9999-12-31 23:59:59.997')",
-            "(2, '0001-01-01 00:00:00 -14:00', '0001-01-01 00:00:00 -00:01', '00:00:00', "
-            "'0001-01-01', '1900-01-01', '1753-01-01')",
-            "(3, '2024-06-01 12:00:00 +05:45', '2024-06-01 12:00:00 -09:30', '12:00:00.5', "
-            "'2024-01-01 00:00:00.5', '2024-01-01 00:00', '2024-01-01 00:00:00.003')",
+            (
+                "(1, '9999-12-31 23:59:59.9999999 +00:00', '2024-01-01 00:00:00 +14:00', "
+                "'23:59:59.999', '9999-12-31 23:59:59.9', '2079-06-06 23:59', '9999-12-31 23:59:59.997')"
+            ),
+            (
+                "(2, '0001-01-01 00:00:00 -14:00', '0001-01-01 00:00:00 -00:01', '00:00:00', "
+                "'0001-01-01', '1900-01-01', '1753-01-01')"
+            ),
+            (
+                "(3, '2024-06-01 12:00:00 +05:45', '2024-06-01 12:00:00 -09:30', '12:00:00.5', "
+                "'2024-01-01 00:00:00.5', '2024-01-01 00:00', '2024-01-01 00:00:00.003')"
+            ),
         ],
         [
-            "(1, '9999-12-31 23:59:59.9999998 +00:00', '2023-12-31 10:00:00 +00:00', "
-            "'23:59:59.998', '9999-12-31 23:59:59.8', '2079-06-06 23:58', '9999-12-31 23:59:59.993')",
-            "(2, '0001-01-01 14:00:00 +00:00', '0001-01-01 00:01:00 +00:00', '00:00:00.001', "
-            "'0001-01-01 00:00:00.1', '1900-01-01 00:01', '1753-01-01 00:00:00.003')",
-            "(3, '2024-06-01 06:15:00 +00:00', '2024-06-01 21:30:00 +00:00', '12:00:00.5', "
-            "'2024-01-01 00:00:00.5', '2024-01-01 00:00', '2024-01-01 00:00:00.003')",
+            (
+                "(1, '9999-12-31 23:59:59.9999998 +00:00', '2023-12-31 10:00:00 +00:00', "
+                "'23:59:59.998', '9999-12-31 23:59:59.8', '2079-06-06 23:58', '9999-12-31 23:59:59.993')"
+            ),
+            (
+                "(2, '0001-01-01 14:00:00 +00:00', '0001-01-01 00:01:00 +00:00', '00:00:00.001', "
+                "'0001-01-01 00:00:00.1', '1900-01-01 00:01', '1753-01-01 00:00:00.003')"
+            ),
+            (
+                "(3, '2024-06-01 06:15:00 +00:00', '2024-06-01 21:30:00 +00:00', '12:00:00.5', "
+                "'2024-01-01 00:00:00.5', '2024-01-01 00:00', '2024-01-01 00:00:00.003')"
+            ),
         ],
         "dtedge",
     )
@@ -568,7 +603,9 @@ def test_random_doubles_render_the_canonical_float_text(db):
             expr = a.normalize(Column("f", LogicalType.FLOAT, "float"))
             got = dict(a.query(f"select id, {expr} from dbo.ff_a"))
             bad = [
-                (v, got[i]) for i, v in enumerate(ordered) if got[i] != canonical_float_text(v, scale)
+                (v, got[i])
+                for i, v in enumerate(ordered)
+                if got[i] != canonical_float_text(v, scale)
             ]
             assert not bad, (scale, bad[:5])
     finally:
@@ -581,7 +618,9 @@ def test_random_doubles_render_the_canonical_float_text(db):
         a.close()
         b.close()
     v = ordered[planted]
-    if canonical_float_text(v, 18) != canonical_float_text(math.nextafter(v, math.inf), 18):
+    if canonical_float_text(v, 18) != canonical_float_text(
+        math.nextafter(v, math.inf), 18
+    ):
         assert found(result) == [(planted, "different", ("f",))]
     else:  # pragma: no cover - the seed keeps a visible one-ulp step
         assert result.identical
@@ -644,8 +683,14 @@ def test_rt_hs9_a_synonym_is_diffed_or_named(db):
     """INFORMATION_SCHEMA.COLUMNS has no synonyms, so `dbo.syn` is "not found"
     and the hint blames permissions. Either resolve it (`sys.synonyms`,
     `base_object_name`) or say it is a synonym and name its target."""
-    ta, tb = pair(DB, "id int primary key, v int", ["(1, 1)", "(2, 2)"], ["(1, 1)", "(2, 3)"], "syn")
-    ex(DB, "drop synonym if exists dbo.rth_syn", "create synonym dbo.rth_syn for dbo.syn_a")
+    ta, tb = pair(
+        DB, "id int primary key, v int", ["(1, 1)", "(2, 2)"], ["(1, 1)", "(2, 3)"], "syn"
+    )
+    ex(
+        DB,
+        "drop synonym if exists dbo.rth_syn",
+        "create synonym dbo.rth_syn for dbo.syn_a",
+    )
     try:
         result = run(db, db, "dbo.rth_syn", tb)
     except ValueError as exc:
@@ -727,7 +772,11 @@ def test_a_view_into_a_database_without_snapshot_is_refused_by_name():
     view - loud, never a READ COMMITTED read passed off as one snapshot."""
     other = make_db("rth_mssql_other", snapshot=False)
     main = make_db("rth_mssql_xdb")
-    ex("rth_mssql_other", "create table t (id int primary key, v int)", "insert t values (1, 1)")
+    ex(
+        "rth_mssql_other",
+        "create table t (id int primary key, v int)",
+        "insert t values (1, 1)",
+    )
     ex(
         "rth_mssql_xdb",
         "create view xv as select id, v from rth_mssql_other.dbo.t",
@@ -818,9 +867,21 @@ def test_an_escaping_filter_is_refused_and_a_bracketed_one_still_filters(db):
         "select value, value, case when value % 10 = 0 then 1 else 0 end "
         f"from {series(2000)}"
     )
-    ex(DB, f"insert esc_a {fill}", f"insert esc_b {fill}", "update esc_b set v = -1 where id = 1500")
+    ex(
+        DB,
+        f"insert esc_a {fill}",
+        f"insert esc_b {fill}",
+        "update esc_b set v = -1 where id = 1500",
+    )
     with pytest.raises(ValueError, match=r"side A.*row filter.*parenthesis"):
-        run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=ESCAPING_FILTER, where_b=ESCAPING_FILTER)
+        run(
+            db,
+            db,
+            "dbo.esc_a",
+            "dbo.esc_b",
+            where_a=ESCAPING_FILTER,
+            where_b=ESCAPING_FILTER,
+        )
     # (Balanced for the shared scan too, which still misreads `]]'`.)
     p = "[a]]'b] = 1 or id = 1500 or [a]]'b] = 7"
     r = run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=p, where_b=p)
@@ -922,7 +983,11 @@ def test_a_lock_hint_filter_is_refused_and_would_hold_its_locks():
     run using it on both sides of one table waited forever (side B blocks on
     side A's locks). `check_where` refuses it before any query."""
     url = make_db("rth_mssql_lock")
-    ex("rth_mssql_lock", "create table t (id int primary key, v int)", "insert t values (1, 1), (2, 2)")
+    ex(
+        "rth_mssql_lock",
+        "create table t (id int primary key, v int)",
+        "insert t values (1, 1), (2, 2)",
+    )
     a = get_dialect(url, side="A")
     try:
         pred = "id in (select id from dbo.t with (xlock, holdlock))"
@@ -1015,7 +1080,11 @@ def test_column_map_swaps_and_renames_bracketed_names(db):
         "insert map_b values (1, 10, 20, 1.50), (2, 11, 22, 2.51)",
     )
     r = run(
-        db, db, "dbo.map_a", "dbo.map_b", column_map={"x": "y", "y": "x", "amount": "amt]'s total"}
+        db,
+        db,
+        "dbo.map_a",
+        "dbo.map_b",
+        column_map={"x": "y", "y": "x", "amount": "amt]'s total"},
     )
     assert found(r) == [(2, "different", ("amount", "y"))]
 
@@ -1026,7 +1095,7 @@ def test_column_map_swaps_and_renames_bracketed_names(db):
 #: space, accents (composed and combining), Turkish i's, supplementary
 #: characters, an ideographic space, a unit separator and kana width.
 TRICKY_KEYS = [
-    "a", "A", "a ", " a", "é", "é", "i", "I", "ı", "İ",
+    "a", "A", "a ", " a", "é", "é", "i", "I", "ı", "İ",  # noqa: RUF001 - the Turkish dotless i is the test
     "\U0001d49c", "\U0001d49d", "　x", "x", "a\x1fb", "ｶ", "カ",
 ]  # fmt: skip
 
@@ -1051,7 +1120,9 @@ def _nliteral(text: str) -> str:
 
 
 @pytest.mark.parametrize(("ctype", "collation"), COLLATIONS)
-def test_text_keys_under_collations_match_duckdb_byte_for_byte(db, tmp_path, ctype, collation):
+def test_text_keys_under_collations_match_duckdb_byte_for_byte(
+    db, tmp_path, ctype, collation
+):
     """A heap (no unique index, so the collation cannot refuse a key) keyed
     on text the collation folds together, against DuckDB holding the same
     keys. Key 'A' differs in value and key 'a ' is missing on DuckDB; under
@@ -1063,10 +1134,16 @@ def test_text_keys_under_collations_match_duckdb_byte_for_byte(db, tmp_path, cty
     ex(DB, f"drop table if exists [{name}]")
     ex(DB, f"create table [{name}] (k {ctype} collate {collation} not null, v int)")
     # Literals built from code units: mssql-python's parameter binding
-    # truncates a string at its supplementary characters (verified: '𝒜'
+    # truncates a string at its supplementary characters (verified: '𝒜'  # noqa: RUF003 - a supplementary character on purpose
     # stored as '', '　x' as '　') - a driver bug in loading, not in
     # parity, which reads text as bytes.
-    ex(DB, *(f"insert [{name}] values ({_nliteral(k)}, {i})" for i, k in enumerate(TRICKY_KEYS)))
+    ex(
+        DB,
+        *(
+            f"insert [{name}] values ({_nliteral(k)}, {i})"
+            for i, k in enumerate(TRICKY_KEYS)
+        ),
+    )
     path = str(tmp_path / "keys.duckdb")
     con = duckdb.connect(path)
     try:
@@ -1229,7 +1306,9 @@ def test_a_1100_column_sparse_table_finds_the_last_column(db):
 
 # ============================================================ cross-engine
 
-PG_URL = os.environ.get("PARITY_TEST_PG", "postgres://parity:parity@127.0.0.1:5432/parity")
+PG_URL = os.environ.get(
+    "PARITY_TEST_PG", "postgres://parity:parity@127.0.0.1:5432/parity"
+)
 
 
 def test_a_mixed_composite_key_against_postgres(db):
@@ -1242,15 +1321,21 @@ def test_a_mixed_composite_key_against_postgres(db):
     is two rows - one on each side."""
     psycopg = pytest.importorskip("psycopg")
     try:
-        pg = psycopg.connect(PG_URL.replace("postgres://", "postgresql://"), autocommit=True)
+        pg = psycopg.connect(
+            PG_URL.replace("postgres://", "postgresql://"), autocommit=True
+        )
     except Exception as exc:  # pragma: no cover - depends on the machine
         pytest.skip(f"no PostgreSQL: {type(exc).__name__}")
     u = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"
     rows_ms = [
-        f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'x', N'v1', 1.25, "
-        "'2024-06-01 12:00:00 +02:00', 12.3400, 1)",
-        f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'y', N'v2', 0.1, "
-        "'2024-06-01 12:00:00 +00:00', 0, 0)",
+        (
+            f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'x', N'v1', 1.25, "
+            "'2024-06-01 12:00:00 +02:00', 12.3400, 1)"
+        ),
+        (
+            f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'y', N'v2', 0.1, "
+            "'2024-06-01 12:00:00 +00:00', 0, 0)"
+        ),
         f"('{u}', '2024-01-01 12:00:00', 2, N'z', N'v3', null, null, null, null)",
         f"('{u}', '2024-01-01 12:00:00', 2, N'Ab', N'v4', null, null, null, null)",
     ]
@@ -1281,9 +1366,7 @@ def test_a_mixed_composite_key_against_postgres(db):
             "'2024-06-01 21:00:00+09', 0, false), "
             f"('{lu}', '2024-01-01 12:00:00', 2.00, 'ab', 'v4', null, null, null, null)"
         )
-        r = run(
-            db, PG_URL, "dbo.ck_mix", "rth_mssql_pg.ck_mix", key=["u", "t", "d", "s"]
-        )
+        r = run(db, PG_URL, "dbo.ck_mix", "rth_mssql_pg.ck_mix", key=["u", "t", "d", "s"])
     finally:
         pg.cursor().execute("drop schema if exists rth_mssql_pg cascade")
         pg.close()
@@ -1316,7 +1399,11 @@ def test_rt_hs1_unmask_lifts_the_refusal_and_exclude_works_around_it(db):
         ["(1, 'bob@example.com', 1)", "(2, 'x@y.z', 3)"],
         "ddm2",
     )
-    ex(DB, "drop view if exists dbo.ddm2_v", "create view dbo.ddm2_v as select id, email, v from dbo.ddm2_a")
+    ex(
+        DB,
+        "drop view if exists dbo.ddm2_v",
+        "create view dbo.ddm2_v as select id, email, v from dbo.ddm2_a",
+    )
     with pytest.raises(ValueError, match=r"side A.*'email'.*ddm2_a.*UNMASK"):
         run(reader(), reader(), ta, tb)
     assert found(run(reader(), reader(), ta, tb, exclude=["email"])) == [
@@ -1353,23 +1440,41 @@ def test_rt_hs1_granular_unmask_on_one_column(db):
         ["(1, 2, 2)"],
         "ddm3",
     )
-    ex(DB, f"grant unmask on dbo.ddm3_a(a) to [{READER}]", f"grant unmask on dbo.ddm3_b(a) to [{READER}]")
+    ex(
+        DB,
+        f"grant unmask on dbo.ddm3_a(a) to [{READER}]",
+        f"grant unmask on dbo.ddm3_b(a) to [{READER}]",
+    )
     with pytest.raises(ValueError, match=r"'b'.*UNMASK"):
         run(reader(), reader(), ta, tb)
-    assert found(run(reader(), reader(), ta, tb, exclude=["b"])) == [(1, "different", ("a",))]
+    assert found(run(reader(), reader(), ta, tb, exclude=["b"])) == [
+        (1, "different", ("a",))
+    ]
 
 
 def test_rt_hs2_a_visible_policy_is_named_and_none_means_no_caveat(db):
     """With VIEW DEFINITION (sa here) an enabled filter predicate is named in
     the caveat, also through a view; a table without a policy draws none."""
     ta, tb = pair(
-        DB, "id int primary key, v int, owner sysname", ["(1, 1, 'x')"], ["(1, 2, 'x')"], "rls2"
+        DB,
+        "id int primary key, v int, owner sysname",
+        ["(1, 1, 'x')"],
+        ["(1, 2, 'x')"],
+        "rls2",
     )
-    ex(DB, "drop view if exists dbo.rls2_v", "create view dbo.rls2_v as select id, v, owner from dbo.rls2_a")
+    ex(
+        DB,
+        "drop view if exists dbo.rls2_v",
+        "create view dbo.rls2_v as select id, v, owner from dbo.rls2_a",
+    )
     r = run(db, db, ta, tb)
     assert found(r) == [(1, "different", ("v",))]
     assert not any("row-level security" in w for w in r.warnings)
-    ex(DB, "drop security policy if exists dbo.rth_pol2", "drop function if exists dbo.rth_fn2")
+    ex(
+        DB,
+        "drop security policy if exists dbo.rth_pol2",
+        "drop function if exists dbo.rth_fn2",
+    )
     ex(DB, "create function dbo.rth_fn2(@o sysname) returns table with schemabinding as "
            "return select 1 as ok where @o = @o")  # fmt: skip
     ex(DB, "create security policy dbo.rth_pol2 add filter predicate "
