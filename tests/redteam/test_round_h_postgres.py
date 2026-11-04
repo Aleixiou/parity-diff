@@ -277,6 +277,76 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
 # ------------------------------------------------- held (regression tests)
 
 
+@pytest.mark.parametrize(
+    ("typ", "k1", "k2"),
+    [
+        ("text", "'a'", "'a '"),
+        ("text", "'a'", "'A'"),
+        ("text", "E'\\u00e9'", "E'e\\u0301'"),
+        ("text collate {s}.ci", "'a'", "'A'"),
+        ("citext", "'a'", "'A'"),
+        ("varchar(5)", "''", "' '"),
+        ("uuid", "'00000000-0000-0000-0000-000000000000'", "'ffffffff-ffff-ffff-ffff-ffffffffffff'"),
+        ("numeric", "1.5", "1.50000000001"),
+        ("numeric", "'NaN'", "'Infinity'"),
+        ("money", "1", "1.01"),
+        ("date", "'infinity'", "'-infinity'"),
+        ("timestamptz", "'2024-01-01 00:00:00+00'", "'2024-01-01 00:00:00.000001+00'"),
+        ("timestamp", "'0044-03-15 BC'", "'0044-03-15'"),
+        ("time", "'24:00'", "'00:00'"),
+        ("interval", "'1 mon'", "'30 days'"),
+        ("bytea", "'\\x00'", "'\\x0000'"),
+        ("inet", "'10.0.0.1'", "'10.0.0.1/24'"),
+        ("oid", "0", "4294967295"),
+        ("bigint", "-9223372036854775808", "9223372036854775807"),
+        ("jsonb", "'1'", "'1.0'"),
+    ],
+)
+def test_distinct_keys_of_every_type_stay_distinct(schema, typ, k1, k2):
+    """A holds k1 and k2, B only k1: exactly k2 is only_in_a."""
+    _exec(ADMIN, "create extension if not exists citext",
+          f"create collation {schema}.ci (provider = icu, locale = 'und-u-ks-level2', "
+          "deterministic = false)")
+    t = typ.format(s=schema)
+    _exec(ADMIN, f"create table {schema}.a (k {t}, v int)", f"create table {schema}.b (k {t}, v int)",
+          f"insert into {schema}.a values ({k1}, 1), ({k2}, 2)",
+          f"insert into {schema}.b values ({k1}, 1)")
+    r = _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.b", key="k")
+    assert [d.kind for d in r.diffs] == ["only_in_a"]
+
+
+def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
+    s = schema
+    cols = ", ".join(f"c{i} int" for i in range(600))
+    names = ", ".join(f"c{i}" for i in range(600))
+    _exec(ADMIN,
+          *[f"create table {s}.w{t} (id int primary key, {cols})" for t in "ab"],
+          *[f"insert into {s}.w{t} (id, {names}) select g, {', '.join('g' for _ in range(600))} "
+            "from generate_series(1, 50) g" for t in "ab"],
+          f"update {s}.wb set c599 = -1 where id = 25", f"update {s}.wb set c0 = -1 where id = 26")
+    r = _diff(ADMIN, f"{s}.wa", ADMIN, f"{s}.wb")
+    assert sorted((d.key, tuple(d.columns)) for d in r.diffs) == [(25, ("c599",)), (26, ("c0",))]
+    odd = f'{s} Ödd"q'
+    qodd = '"' + odd.replace('"', '""') + '"'
+    long = "ü" * 31
+    _exec(ADMIN, f"create schema {qodd}",
+          *[f'create table {qodd}."T {t}" ("ID" int primary key, "select ""x""\'y" text, '
+            f'"{long}" text, "order" text)' for t in "ab"],
+          *[f"insert into {qodd}.\"T {t}\" values (1, 'a', 'b', 'c'), (2, 'a', 'b', 'c')" for t in "ab"],
+          f"update {qodd}.\"T b\" set \"order\" = 'X' where \"ID\" = 2")
+    try:
+        r = _diff(ADMIN, f"{odd}.T a", ADMIN, f"{odd}.T b", key="id")
+        assert [(d.key, d.columns) for d in r.diffs] == [(2, ["order"])]
+    finally:
+        _exec(ADMIN, f"drop schema {qodd} cascade")
+    _exec(ADMIN,
+          *[f"create table {s}.h{t} (id int primary key, v text)" for t in "ab"],
+          *[f"insert into {s}.h{t} values (1, repeat('abcdefgh', 1250000)), (2, 'x')" for t in "ab"],
+          f"update {s}.hb set v = overlay(v placing 'Z' from 9999990) where id = 1")
+    r = _diff(ADMIN, f"{s}.ha", ADMIN, f"{s}.hb")
+    assert [(d.key, d.columns) for d in r.diffs] == [(1, ["v"])] and not r.unexplained
+
+
 def test_partitions_generated_columns_and_missing_grants(schema):
     s = schema
     _exec(
