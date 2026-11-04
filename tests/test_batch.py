@@ -49,10 +49,12 @@ class Opener:
     """
 
     def __init__(self, tables: dict[str, object]) -> None:
+        """Serve `tables`, keyed by expanded connection string."""
         self.tables = tables
         self.opened: list[str] = []
 
     def __call__(self, conn: str, side: str = "?", float_scale: int = 6) -> FakeDialect:
+        """Open (or refuse) the fake behind `conn`, recording it."""
         self.opened.append(conn)
         table = self.tables[conn]
         if isinstance(table, BaseException):
@@ -241,6 +243,7 @@ def test_python_310_without_tomli_is_told_to_install_it_or_use_json(
     real = batch.importlib.import_module
 
     def missing(name, *args):
+        """import_module, with neither TOML parser installed."""
         if name in ("tomllib", "tomli"):
             raise ImportError(name)
         return real(name, *args)
@@ -639,6 +642,7 @@ def _qualified_run() -> BatchRun:
 
 
 def _human(run: BatchRun) -> str:
+    """The human summary of `run`, as the CLI streams it."""
     out = io.StringIO()
     report = batch.HumanReport(out)
     for o in run.outcomes:
