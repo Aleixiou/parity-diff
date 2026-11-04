@@ -415,7 +415,7 @@ MUTATIONS: list[Mutation] = [
     m("G4", "BigQuery int_literal plain digits", BQ,
       "return f\"bignumeric '{value}'\"", "return str(value)", false_match=False),
     m("G5", "BigQuery DECIMAL without ROUND", BQ,
-      'expr = f"format({fmt}, round({c}, {s}))"', 'expr = f"format({fmt}, {c})"',
+      'expr = f"format({fmt}, round({num}, {s}))"', 'expr = f"format({fmt}, {num})"',
       false_match=False),
     m("G6", "BigQuery naive datetime rendered as UTC timestamp", BQ,
       "            if column.tz_aware is False:\n", "            if False:\n",

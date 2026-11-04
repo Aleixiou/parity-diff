@@ -5,6 +5,29 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **Cross-engine fuzzer, round H: two false alarms fixed.**
+  - **DuckDB DECIMAL(p,p) keys (RT-HX1).** A decimal with no integer digit
+    printed no leading zero (`.25`, `-.517439`), where the key rule and every
+    other engine say `0.25`, so every fractional key of such a column read as
+    only_in_a plus only_in_b. The zero is restored. **Checksums move** for
+    DuckDB DECIMAL(p,p) key columns only, and for DuckDB DECIMAL values at
+    `--float-scale 38` (rendered through decimal(38,38), the same trap; any
+    value of 1 or more already failed there). Every other DECIMAL key and
+    value renders the SQL it did, compared generated SQL before and after.
+  - **Integer against decimal (RT-HX2).** Snowflake (and Oracle) read
+    NUMBER(p,0) as INTEGER - its INT, BIGINT and NUMBER(19,0) all report as
+    NUMBER with scale 0 - while PostgreSQL numeric(14,0) and DuckDB
+    DECIMAL(14,0) stay DECIMAL, so a faithful migration compared `41886`
+    against `41886.000000` on every row. The same happened for a bigint
+    migrated to numeric(18,0) on any engine pair. An INTEGER column compared
+    against a DECIMAL one now renders through the DECIMAL rule, so the pair
+    compares by value at the float scale, with a note naming the type
+    change. BigQuery casts an INT64 to NUMERIC first (ROUND of an INT64 is
+    FLOAT64). Checksums move only for such mixed pairs, which could not
+    match before; a same-type pair is untouched. An integer key against a
+    decimal key no longer warns that no row can match (a decimal key renders
+    `42` like an integer key since exact keys were introduced).
+
 - **Security/correctness: MySQL red-team round H.** Three false matches fixed:
   - **Legacy character sets (RT-HM1).** Text in sjis, euckr, gbk, big5, ujis,
     gb2312, hebrew, greek, cp125x, tis620, geostd8, swe7, dec8 (any charset

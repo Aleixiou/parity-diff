@@ -256,10 +256,10 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
     shapes = [s for s in KEY_SHAPES if not ("binary" in s and "bigquery" in engines)]
     key_shape = rng.choice(shapes)
     key = [Col(f"k{i}", kind) for i, kind in enumerate(key_shape.split("+"))]
-    # A DECIMAL key with no integer digits (p == s) is RT-HX1 (DuckDB renders
-    # `.25`), kept out of generation so a failure here is always new.
+    # A DECIMAL key with no integer digits (p == s) is generated too: RT-HX1
+    # (DuckDB rendered `.25`) is fixed.
     key = [
-        replace(c, p=(p := rng.randint(2, 30)), s=rng.randint(0, min(p - 1, 8)))
+        replace(c, p=(p := rng.randint(2, 30)), s=rng.randint(0, min(p, 8)))
         if c.kind == "dec"
         else c
         for c in key
@@ -292,11 +292,10 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
         if kind == "dec":
             p = rng.randint(1, 38)
             s = rng.randint(0, min(p, 12))
+            # Scale 0 included: Snowflake reads NUMBER(p,0) as INTEGER and
+            # the other engines DECIMAL(p,0) as DECIMAL, compared by value
+            # since RT-HX2 was fixed.
             p = min(p, s + 38 - fs)
-            if s == 0 and "snowflake" in engines:
-                # RT-HX2: Snowflake NUMBER(p,0) is INTEGER, DECIMAL(p,0)
-                # elsewhere - every row differs. Kept out of generation.
-                s, p = 1, max(p, 2)
             if rng.random() < 0.15:
                 b_kind = "double"
                 p = min(p, s + 34)

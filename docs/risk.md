@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: bd5f529032b91b4e`
+Source fingerprint: `src-sha256: bee758f7ab3d47b3`
 
 ## Summary
 
@@ -84,6 +84,7 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | Columns the login may not read are silently left out (MySQL column-level grants, which hide them from `information_schema`) | **0** — `SELECT *` fails exactly when a column is hidden, and the table is then refused naming the visible columns (round H, RT-HM3, a false match before) | By design (verified live) |
 | Two columns differing only in case are confused | **0** — such a table is refused | By design (tested) |
 | A type mismatch between sides goes unnoticed | **0** — a warning is printed; values compare by canonical text | By design (tested) |
+| An integer column against a decimal one (Snowflake/Oracle NUMBER(p,0) is INTEGER, PostgreSQL/DuckDB DECIMAL(p,0) is not) reads every row as different | **0** false alarms from the type alone since round H (RT-HX2): the INTEGER side renders through the DECIMAL rule, so the pair compares by value at the float scale (an exact integer has nothing to round; BigQuery INT64 goes through NUMERIC, never FLOAT64), and a note names the type change. No new false-match risk: the integer side's text is exact, the decimal side's is the DECIMAL rule it always had | By design (tested, live on Snowflake) |
 | A renamed column (`--map`) paired with the wrong column | **0** — side B's column is re-keyed under side A's name before any other matching, so the compared list, its order (the row text's field order) and the key follow from A's names alone; exact, so no new rendering or checksum risk. Refused: a mapped name absent on its side, one column mapped twice either way, a mapped B column a same-named column would still match, mapped and excluded. Pinned both ways: swapped columns mapped as a swap match except the planted row, unswapped ones differ on every row | By design (tested) |
 
 ### 2b. Row filters (`--where`)
@@ -126,7 +127,7 @@ risk line, scale, filters and caveats, as the reports print them.
 | Risk | Odds | Kind |
 |---|---|---|
 | Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation; DuckDB 2.0 applies collations to `count(distinct)`, so it counts `encode(text)`, RT-HD14) | By design (tested) |
-| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits, as the instant in UTC), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do). This row said 0 for TIMESTAMP before round H too, and was wrong on Snowflake: a TIMESTAMP_TZ key with nanoseconds printed its stored wall clock, so two instants at different offsets merged (RT-HF3, fixed and tested live) | By design (tested) |
+| Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits, as the instant in UTC), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do). This row said 0 for TIMESTAMP before round H too, and was wrong on Snowflake: a TIMESTAMP_TZ key with nanoseconds printed its stored wall clock, so two instants at different offsets merged (RT-HF3, fixed and tested live). A DuckDB DECIMAL(p,p) key printed `.25` where every other engine prints `0.25` - no merge, but every fractional key failed to pair across engines (false alarms, RT-HX1, fixed) | By design (tested) |
 
 ## 4. Rendering each value as canonical text (per engine)
 
@@ -170,7 +171,9 @@ secret leak in the test suite's failure reports. The Oracle sweep (2026-11-04)
 found one value Oracle cannot print (TIMESTAMP WITH LOCAL TIME ZONE at the
 last microsecond of 9999, whose year reads 10000): now refused, naming the
 column. Round H on DuckDB: 14 problems
-(RT-HD1-HD14), 8 of them false matches, all fixed. Earlier campaign: about 30
+(RT-HD1-HD14), 8 of them false matches, all fixed. The round-H cross-engine
+fuzzer: 2 false alarms (RT-HX1 DuckDB DECIMAL(p,p) keys, RT-HX2 integer
+against decimal), both fixed. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range

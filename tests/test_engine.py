@@ -1086,16 +1086,18 @@ def test_a_key_named_twice_in_two_cases_is_one_key():
 @pytest.mark.parametrize(
     "key_b, warned",
     [
-        (Column("id", LogicalType.DECIMAL, "decimal(18,0)"), True),
+        # A decimal key renders its minimal exact text, `1` like the integer
+        # (RT-HX2); it used to render 1.000000 and was warned about.
+        (Column("id", LogicalType.DECIMAL, "decimal(18,0)"), False),
         (Column("id", LogicalType.FLOAT, "double"), True),
         (Column("id", LogicalType.STRING, "varchar"), False),
         (Column("id", LogicalType.INTEGER, "integer"), False),
     ],
 )
 def test_a_key_type_that_cannot_match_is_named(key_b, warned):
-    """RT-A14/B8/E6: an integer key against a decimal or float key renders
-    '1' against '1.000000', so nothing can match. Text against an integer can
-    ('42' is '42'), so it is not warned about."""
+    """RT-A14/B8/E6: an integer key against a float key cannot match (a
+    FLOAT key is refused outright). Text against an integer can ('42' is
+    '42'), and so can a decimal key, so neither is warned about."""
     a = FakeDialect(SyntheticTable(10), side="A")
     b = FakeDialect(SyntheticTable(10, deleted=[3]), side="B", key_type_override=key_b)
     result = diff(a, b, "a.t", "b.t", "id")
