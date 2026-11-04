@@ -283,6 +283,34 @@ def test_a_view_over_an_altered_column_compares_its_real_type(tmp_path):
     "new column, but information_schema lists only the old ones - the new column is "
     "silently never compared, with no warning: a false match",
 )
+@pytest.mark.sample_check_may_disagree
+@pytest.mark.xfail(strict=True, reason="RT-HD13: a view's stale catalog type picks the wrong rule after ALTER TYPE: the difference is rendered away")
+@pytest.mark.parametrize(
+    ("old", "new", "a", "b"),
+    [
+        ("date", "timestamp", "'2020-01-01 00:00:01'", "'2020-01-01 00:00:02'"),  # time of day dropped
+        ("timestamp", "timestamp_ns", "'2020-01-01 00:00:00.000000001'", "'2020-01-01 00:00:00.000000002'"),
+        ("int", "union(n int, s varchar)", "union_value(n := 1)", "union_value(s := '1')"),  # tag dropped
+    ],
+    ids=["date-to-timestamp", "timestamp-to-ns", "int-to-union"],
+)
+def test_a_view_over_a_retyped_column_finds_the_change(tmp_path, old, new, a, b):
+    """The base table finds row 1; the `select *` view over it must too."""
+    def mk(v: str) -> tuple[str, ...]:
+        return (
+            f"create table t (id int, v {old})",
+            "create view vw as select * from t",
+            f"alter table t alter v type {new} using NULL",
+            f"insert into t values (1, {v}), (2, NULL)",
+        )
+
+    pa = duck_file(tmp_path, "a", *mk(a))
+    pb = duck_file(tmp_path, "b", *mk(b))
+    assert found(run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")) == ONE
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
+    assert found(result) == ONE
+
+
 def test_a_view_that_gained_a_column_compares_it(tmp_path):
     """vw returns (id, v, w); w differs; the catalog lists (id, v)."""
     def mk(w: str) -> tuple[str, ...]:
@@ -1002,6 +1030,55 @@ def test_a_parameter_placeholder_in_a_filter_is_a_clear_error(tmp_path, pred):
     p = duck_file(tmp_path, "a", "create table t (id int)", "insert into t values (1)")
     with pytest.raises(ValueError, match=r"\[side A: duckdb\]"):
         run_diff(open_duckdb(p, "A"), open_duckdb(p, "B"), "main.t", "main.t", where_a=pred)
+
+
+# ======================================================================= --map
+
+
+def _map_files(tmp_path: Path) -> tuple[str, str]:
+    """Side B swapped columns a and b, upper-cased the key and changed the
+    case of two quoted columns; rows 3, 4 and 6 really differ."""
+    pa = duck_file(
+        tmp_path, "ma",
+        'create table t (id int, a varchar, b varchar, "Mixed Case" int, "we""ird" int)',
+        "insert into t select i, 'a' || i, 'b' || i, i, i from range(1, 101) r(i)",
+    )
+    pb = duck_file(
+        tmp_path, "mb",
+        'create table t ("ID" int, b varchar, a varchar, "mixed case" int, "WE""IRD" int)',
+        "insert into t select i, 'a' || i, 'b' || i, i, i from range(1, 101) r(i)",
+        "update t set b = 'x' where \"ID\" = 3",
+        "update t set \"mixed case\" = 0 where \"ID\" = 4",
+        "update t set \"WE\"\"IRD\" = 0 where \"ID\" = 6",
+    )
+    return pa, pb
+
+
+@pytest.mark.parametrize(
+    "column_map",
+    [{"a": "b", "b": "a"}, {"a": "B", "b": "A"}, {"id": "ID", "a": "b", "b": "a"}, {"Mixed Case": "MIXED CASE", "a": "b", "b": "a"}],
+)
+def test_map_swaps_columns_with_duckdb_quoting(tmp_path, column_map):
+    """A swap, case-insensitive names, the key itself, quoted names: the
+    three planted changes, reported under side A's names."""
+    pa, pb = _map_files(tmp_path)
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t", column_map=column_map)
+    assert found(result) == [(3, "different", ("a",)), (4, "different", ("Mixed Case",)), (6, "different", ('we"ird',))]
+
+
+def test_without_the_map_the_swap_is_every_row(tmp_path):
+    """The swap unmapped is a difference in every row - never hidden."""
+    pa, pb = _map_files(tmp_path)
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    assert len(result.diffs) == 100 and not result.identical
+
+
+@pytest.mark.parametrize("column_map", [{"a": "b"}, {"a": "b", "b": "b"}, {"a": "nope"}])
+def test_a_map_that_cannot_be_honoured_is_refused(tmp_path, column_map):
+    """Half a swap, two columns onto one, a column B lacks."""
+    pa, pb = _map_files(tmp_path)
+    with pytest.raises(ValueError, match="--map"):
+        run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t", column_map=column_map)
 
 
 # ========================================================= connection strings
