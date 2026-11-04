@@ -331,8 +331,19 @@ EDGE_TEXT = [
 def gen_value(rng: random.Random, c: Col, engines: set[str], fs: int, known: set[str]):
     """One value for column `c`, biased towards edges every engine can store."""
     k = c.kind
-    if k in ("time", "binary", "uuid", "json", "small", "tiny", "ubig", "char",
-             "ascii", "money", "ts3"):
+    if k in (
+        "time",
+        "binary",
+        "uuid",
+        "json",
+        "small",
+        "tiny",
+        "ubig",
+        "char",
+        "ascii",
+        "money",
+        "ts3",
+    ):
         return gen_extra(rng, k, engines)
     if k == "int":
         return rng.choice(
@@ -435,12 +446,29 @@ def gen_json(rng: random.Random, depth: int = 0) -> Any:
     r = rng.random()
     if depth > 2 or r < 0.4:
         return rng.choice(
-            [0, 1, -1, 7, 123456789, True, False, None, "", "a", "é", "日本", "a b",
-             'q"t', "b\\s"]
+            [
+                0,
+                1,
+                -1,
+                7,
+                123456789,
+                True,
+                False,
+                None,
+                "",
+                "a",
+                "é",
+                "日本",
+                "a b",
+                'q"t',
+                "b\\s",
+            ]
         )
     if r < 0.7:
         return [gen_json(rng, depth + 1) for _ in range(rng.randint(0, 3))]
-    keys = rng.sample(["a", "b", "aa", "ab", "id", "x1", "key", "name"], rng.randint(0, 4))
+    keys = rng.sample(
+        ["a", "b", "aa", "ab", "id", "x1", "key", "name"], rng.randint(0, 4)
+    )
     keys.sort(key=lambda k: (len(k.encode()), k.encode()))
     return {k: gen_json(rng, depth + 1) for k in keys}
 
@@ -461,8 +489,12 @@ def gen_extra(rng: random.Random, k: str, engines: set[str]) -> Any:
                 dt.time(23, 59, 59, 999999),
                 dt.time(12, 0, 0, 1),
                 dt.time(0, 0, 0, 999999),
-                dt.time(rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59),
-                        rng.choice([0, rng.randint(0, 999999)])),
+                dt.time(
+                    rng.randint(0, 23),
+                    rng.randint(0, 59),
+                    rng.randint(0, 59),
+                    rng.choice([0, rng.randint(0, 999999)]),
+                ),
             ]
         )
     if k == "binary":
@@ -485,25 +517,60 @@ def gen_extra(rng: random.Random, k: str, engines: set[str]) -> Any:
     if k == "tiny":
         return rng.choice([0, 1, 255, 127, 128, rng.randint(0, 255)])
     if k == "ubig":
-        return rng.choice([0, 1, 2**63 - 1, 2**63, 2**64 - 1, 2**53 + 1,
-                           rng.randint(0, 2**64 - 1)])
+        return rng.choice(
+            [0, 1, 2**63 - 1, 2**63, 2**64 - 1, 2**53 + 1, rng.randint(0, 2**64 - 1)]
+        )
     if k == "char":
         # No trailing spaces: char(n) cannot hold them apart from padding.
-        v = rng.choice(["", "a", "A", " a", "abc", "é", "日本", "x" * 12, "a b",
-                        "".join(rng.choice("abcXYZ 0é") for _ in range(rng.randint(0, 12)))])
+        v = rng.choice(
+            [
+                "",
+                "a",
+                "A",
+                " a",
+                "abc",
+                "é",
+                "日本",
+                "x" * 12,
+                "a b",
+                "".join(rng.choice("abcXYZ 0é") for _ in range(rng.randint(0, 12))),
+            ]
+        )
         return v.rstrip(" ")
     if k == "ascii":
-        return rng.choice(["", " ", "a", "A", "a ", "it's", "back\\slash", "%_",
-                           "".join(chr(rng.randint(32, 126)) for _ in range(rng.randint(0, 30)))])
+        return rng.choice(
+            [
+                "",
+                " ",
+                "a",
+                "A",
+                "a ",
+                "it's",
+                "back\\slash",
+                "%_",
+                "".join(chr(rng.randint(32, 126)) for _ in range(rng.randint(0, 30))),
+            ]
+        )
     if k == "money":
         top = 922337203685476  # money max is ...477.5807
-        return Decimal(rng.choice([0, 1, -1, top, -top, rng.randint(-top, top),
-                                   rng.randint(-10**6, 10**6)])) + Decimal(
-            rng.choice([0, 5, 9999, 5000, rng.randint(0, 9999)])
-        ).scaleb(-4)
+        return Decimal(
+            rng.choice(
+                [
+                    0,
+                    1,
+                    -1,
+                    top,
+                    -top,
+                    rng.randint(-top, top),
+                    rng.randint(-(10**6), 10**6),
+                ]
+            )
+        ) + Decimal(rng.choice([0, 5, 9999, 5000, rng.randint(0, 9999)])).scaleb(-4)
     if k == "ts3":
         base = dt.datetime(1900, 1, 1) + dt.timedelta(seconds=rng.randint(0, 6 * 10**9))
-        return base.replace(microsecond=rng.choice([0, 1, 999, 500, rng.randint(0, 999)]) * 1000)
+        return base.replace(
+            microsecond=rng.choice([0, 1, 999, 500, rng.randint(0, 999)]) * 1000
+        )
     raise AssertionError(k)
 
 
@@ -650,13 +717,22 @@ def gen_key(rng: random.Random, key: list[Col], n: int, engines: set[str]) -> li
                 base = dt.datetime(2000, 1, 1) + dt.timedelta(
                     seconds=rng.randint(0, 10**9)
                 )
-                vals.append(base.replace(microsecond=rng.choice([0, 1, 999999,
-                                                                 rng.randint(0, 999999)])))
+                vals.append(
+                    base.replace(
+                        microsecond=rng.choice([0, 1, 999999, rng.randint(0, 999999)])
+                    )
+                )
             elif c.kind == "uuid":
                 vals.append(uuid.UUID(int=rng.getrandbits(128)))
             elif c.kind == "time":
-                vals.append(dt.time(rng.randint(0, 23), rng.randint(0, 59),
-                                    rng.randint(0, 59), rng.randint(0, 999999)))
+                vals.append(
+                    dt.time(
+                        rng.randint(0, 23),
+                        rng.randint(0, 59),
+                        rng.randint(0, 59),
+                        rng.randint(0, 999999),
+                    )
+                )
             elif c.kind == "binary":
                 vals.append(bytes(rng.randrange(256) for _ in range(rng.randint(1, 6))))
             else:
@@ -866,8 +942,13 @@ def _mutate_cell(rng: random.Random, op: str, c: Col, v: Any, fs: int, engines: 
         return nv if nv != v else _SKIP
     if op == "bytes_tweak" and k == "binary" and v is not None:
         return rng.choice(
-            [v + b"\x00", b"\x00" + v, v[:-1], v.upper() if v.upper() != v else v + b"a",
-             bytes([v[0] ^ 1]) + v[1:] if v else b"\x00"]
+            [
+                v + b"\x00",
+                b"\x00" + v,
+                v[:-1],
+                v.upper() if v.upper() != v else v + b"a",
+                bytes([v[0] ^ 1]) + v[1:] if v else b"\x00",
+            ]
         )
     if op == "uuid_tweak" and k == "uuid" and v is not None:
         return uuid.UUID(int=v.int ^ (1 << rng.randrange(128)))
@@ -1050,8 +1131,12 @@ def logical(v: Any, kind: str, fs: int) -> Any:
     if kind == "time":
         if isinstance(v, dt.timedelta):  # MySQL's driver reads TIME as a duration
             us = v // dt.timedelta(microseconds=1)
-            return dt.time(us // 3_600_000_000, us // 60_000_000 % 60,
-                           us // 1_000_000 % 60, us % 1_000_000)
+            return dt.time(
+                us // 3_600_000_000,
+                us // 60_000_000 % 60,
+                us // 1_000_000 % 60,
+                us % 1_000_000,
+            )
         if isinstance(v, str):
             return dt.time.fromisoformat(v)
         return v
