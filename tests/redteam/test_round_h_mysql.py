@@ -1041,3 +1041,124 @@ def test_rt_hm15_unreadable_table_is_not_called_missing(root80, tables):
             run_diff(get_dialect(url, side="A"), get_dialect(USER80, side="B"), t, t)
     finally:
         mysql_run(root80, f"drop user if exists {user}@'%'")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM16: Ctrl-C cannot stop a MySQL query when the login is at max_user_connections",
+)
+def test_rt_hm16_cancel_works_at_the_connection_limit(root80):
+    """`cancel` (Ctrl-C) opens a second connection as the same login to KILL
+    QUERY. A login whose max_user_connections is already used up - common
+    for service accounts, and reached whenever both sides use one login with
+    a limit of 2 - cannot open it, the failure is swallowed, and the running
+    checksum continues to its end: a Ctrl-C that does nothing for as long as
+    a full-table hash pass takes. Interrupting through the connection's own
+    socket, or keeping the KILL connection open from the start, would not
+    need a free slot."""
+    import threading
+    import time
+
+    user = f"rth_mc_{RUN}"
+    mysql_run(
+        root80,
+        f"drop user if exists {user}@'%'",
+        f"create user {user}@'%' identified by 'rthmc' with max_user_connections 1",
+        f"grant select on rth.* to {user}@'%'",
+    )
+    try:
+        d = get_dialect(f"mysql://{user}:rthmc@127.0.0.1:13480/rth", side="A")
+        try:
+            timer = threading.Timer(0.5, d.cancel)
+            timer.start()
+            t0 = time.monotonic()
+            d.query("select sleep(8)")
+            elapsed = time.monotonic() - t0
+            timer.join()
+        finally:
+            d.close()
+    finally:
+        mysql_run(root80, f"drop user if exists {user}@'%'")
+    assert elapsed < 4
+
+
+def test_cancel_stops_a_running_query(root80):
+    """The control for RT-HM16: with a free connection slot, KILL QUERY lands
+    within a second (a killed SLEEP returns 1 rather than raising)."""
+    import threading
+    import time
+
+    d = get_dialect(USER80, side="A")
+    try:
+        timer = threading.Timer(0.5, d.cancel)
+        timer.start()
+        t0 = time.monotonic()
+        d.query("select sleep(8)")
+        elapsed = time.monotonic() - t0
+        timer.join()
+    finally:
+        d.close()
+    assert elapsed < 4
+
+
+ESCAPE_COLLATIONS = [
+    "utf8mb4_0900_ai_ci",
+    "utf8mb4_0900_as_cs",
+    "utf8mb4_ja_0900_as_cs_ks",
+    "utf8mb4_general_ci",
+    "utf8mb4_unicode_520_ci",
+    "utf8mb4_de_pb_0900_ai_ci",
+    "utf8mb4_tr_0900_ai_ci",
+    "utf8mb4_bin",
+    "character set latin1 collate latin1_german2_ci",
+    "character set utf8mb3 collate utf8mb3_general_ci",
+    "character set ucs2 collate ucs2_general_ci",
+    "character set utf16 collate utf16_unicode_ci",
+    "character set utf32 collate utf32_bin",
+]
+
+
+@pytest.mark.parametrize("coll", ESCAPE_COLLATIONS)
+def test_escaping_holds_under_every_collation(tables, mysql_url, coll):
+    """REPLACE is byte-exact under every collation tried, ignorable-character
+    and accent-blind ones included, so the separator and the sentinel stay
+    unforgeable: `x<US>y` against `x\\sy`, `\\N` against NULL, and a
+    backslash pair, each planted on its own row."""
+    spec = coll if coll.startswith("character") else f"collate {coll}"
+    ddl = f"id int primary key, v varchar(20) {spec}"
+    ins = "insert into {t} values (%s, %s)"
+    a = [(1, "x\x1fy"), (2, "\\N"), (3, "a\\\\b"), (4, "same")]
+    b = [(1, "x\\sy"), (2, None), (3, "a\\b"), (4, "same")]
+    r = _mysql_pair(
+        tables, mysql_url, ddl, [(ins, row) for row in a], [(ins, row) for row in b],
+        tag="esc",
+    )  # fmt: skip
+    assert found(r) == [(k, "different", ("v",)) for k in (1, 2, 3)]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HM17: a view over a MyISAM table carries no no-snapshot caveat",
+)
+@pytest.mark.parametrize("engine", ["myisam", "memory"])
+def test_rt_hm17_view_over_a_non_transactional_table_says_so(tables, mysql_url, engine):
+    """The no-snapshot caveat (RT-D3) is read from information_schema.tables
+    for the named table only, and a view reports engine NULL - so diffing a
+    view over a MyISAM or MEMORY table prints nothing, though every level
+    reads the base table afresh and a write mid-walk can make the result
+    wrong. The view's base tables (information_schema.view_table_usage, 8.0.13+)
+    should carry the caveat through."""
+    base = tables(mysql_url, f"vb_{engine}", f"id int primary key, v int) engine={engine} -- ",
+                  "insert into {t} values (1, 1), (2, 2)")  # fmt: skip
+    other = tables(mysql_url, "vo", "id int primary key, v int",
+                   "insert into {t} values (1, 1), (2, 3)")  # fmt: skip
+    view = f"rth_mysql_view_{engine}_{RUN}"
+    conn = mysql_connect(mysql_url)
+    try:
+        mysql_run(conn, f"create or replace view `{view}` as select * from `{base}`")
+        r = run_diff(get_dialect(mysql_url, side="A"), get_dialect(mysql_url, side="B"), view, other)
+    finally:
+        mysql_run(conn, f"drop view if exists `{view}`")
+        conn.close()
+    assert found(r) == [(2, "different", ("v",))]
+    assert any(engine.upper() in w.upper() and "snapshot" in w for w in r.warnings)
