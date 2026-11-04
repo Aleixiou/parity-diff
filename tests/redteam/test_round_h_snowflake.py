@@ -475,6 +475,53 @@ def test_rt_hf5_a_row_access_policy_is_never_a_silent_match(policies):
     )
 
 
+@pytest.mark.parametrize(
+    ("ddl", "message"),
+    [
+        (
+            (
+                "create or replace aggregation policy RTH_SF_AGP as () returns "
+                "aggregation_constraint -> aggregation_constraint(min_group_size => 50)"
+            ),
+            "aggregation policy",
+        ),
+        (
+            (
+                "create or replace projection policy RTH_SF_PJP as () returns "
+                "projection_constraint -> projection_constraint(allow => false)"
+            ),
+            "projection policy",
+        ),
+    ],
+)
+def test_aggregation_and_projection_policies_fail_loudly(sfh, ddl, message):
+    """Unlike masking and row access policies, these two make Snowflake
+    refuse the tool's queries outright, naming the side: no verdict at all,
+    never a wrong one. (An aggregation policy fails on key_stats' MIN.)"""
+    name = "RTH_SF_AG" if "aggregation" in ddl else "RTH_SF_PJ"
+    _pair(
+        sfh,
+        name,
+        "id int, v varchar",
+        "select seq4(), 'x' from table(generator(rowcount => 200))",
+        "select seq4(), case when seq4() = 77 then 'y' else 'x' end "
+        "from table(generator(rowcount => 200))",
+    )
+    policy = "RTH_SF_AGP" if "aggregation" in ddl else "RTH_SF_PJP"
+    attach = (
+        "alter table {t} set aggregation policy RTH_SF_AGP"
+        if "aggregation" in ddl
+        else "alter table {t} modify column v set projection policy RTH_SF_PJP"
+    )
+    _exec(sfh, ddl, attach.format(t=name + "A"), attach.format(t=name + "B"))
+    try:
+        with pytest.raises(ValueError, match=rf"side A.*(?i:{message})"):
+            _diff(sfh, name + "A", name + "B", "id")
+    finally:
+        _exec(sfh, f"drop table {name}A", f"drop table {name}B")
+        _exec(sfh, f"drop {message} if exists {policy}")
+
+
 # --- RT-HF6: STRICT_JSON_OUTPUT ---------------------------------------------------
 
 
@@ -1130,6 +1177,74 @@ def test_map_pairs_a_renamed_mixed_case_column(sfh):
     )
     assert _found(result) == {9: ("different", ["AMOUNT"])}
     assert not result.schema_differences
+
+
+_SPECIAL_FLOATS = [
+    "0.0", "-0.0", "'nan'", "'inf'", "'-inf'", "5e-324", "2.2250738585072014e-308",
+    "9007199254740992", "9007199254740993", "4503599627370496.5", "1e15+0.5", "0.1",
+    "1e34", "-123456.0000005", "2.0000005",
+]  # fmt: skip
+_SPECIAL_TEXT = [
+    "", " ", "a" + chr(0x301), chr(0xE1), "\U0001f600", "שלום",
+    "\U00010348", chr(0xFEFF), "tab\there", "\\", "\\\\N", chr(0x2028),
+]  # fmt: skip
+
+
+def test_specials_against_duckdb(sfh, tmp_path):
+    """Snowflake against DuckDB: -0, NaN, +-Infinity, subnormals, 2^53 and
+    its neighbours, a 1e15 + 0.5 tie, combining marks against precomposed,
+    astral and RTL text, a BOM, U+2028, backslashes, TIME(9) (truncated to
+    microseconds, with the caveat), TIMESTAMP_NTZ(3) and TIMESTAMP_TZ at
+    nine offsets. One planted text change is the only difference."""
+    from conftest import duckdb_write, open_duckdb
+
+    rows = []
+    for i, f in enumerate(_SPECIAL_FLOATS):
+        s = _SPECIAL_TEXT[i % len(_SPECIAL_TEXT)].replace("'", "''").replace("\\", "\\\\")
+        rows.append(
+            f"select {i}, {f}::float, '{s}', '12:34:56.{i:09d}'::time(9), "
+            f"'2024-01-01 00:00:0{i % 10}.{i:03d}'::timestamp_ntz(3), "
+            f"'2024-06-0{1 + i % 9} 10:00:00.{i:06d} +0{i % 10}:00'::timestamp_tz(6)"
+        )
+    _exec(
+        sfh,
+        "create or replace table RTH_SF_XA (id int, f float, s varchar, t time(9), "
+        "ts timestamp_ntz(3), tz timestamp_tz(6))",
+        "insert into RTH_SF_XA " + " union all ".join(rows),
+    )
+    path = str(tmp_path / "x.duckdb")
+    con = duckdb_write(path)
+    try:
+        con.execute("set TimeZone='UTC'")
+        con.execute(
+            "create table x (id bigint, f double, s varchar, t time, ts timestamp, "
+            "tz timestamptz)"
+        )
+        for i, f in enumerate(_SPECIAL_FLOATS):
+            ff = {"'nan'": "'nan'::double", "'inf'": "'inf'::double"}.get(f, f)
+            ff = "'-inf'::double" if f == "'-inf'" else ff
+            con.execute(
+                f"insert into x values (?, {ff}, ?, ?::time, ?::timestamp, ?::timestamptz)",
+                [
+                    i,
+                    _SPECIAL_TEXT[i % len(_SPECIAL_TEXT)],
+                    f"12:34:56.{i:09d}"[:15],
+                    f"2024-01-01 00:00:0{i % 10}.{i:03d}",
+                    f"2024-06-0{1 + i % 9} 10:00:00.{i:06d}+0{i % 10}:00",
+                ],
+            )
+        con.execute("update x set s = s || '!' where id = 3")
+    finally:
+        con.close()
+    a = _open(sfh, "A")
+    b = open_duckdb(path, side="B")
+    try:
+        result = diff(a, b, "RTH_SF_XA", "main.x", "id")
+    finally:
+        a.close()
+        b.close()
+    assert _found(result) == {3: ("different", ["S"])}
+    assert any("nanoseconds" in w for w in result.warnings)
 
 
 # --- CLI end to end ------------------------------------------------------------------
