@@ -250,7 +250,7 @@ value as `''` and an unconvertible character as `?`; MySQL zero dates, read
 as text because the connector returns them as None; SQL Server NULs, 7-digit times and sql_variant base
 types, PostgreSQL and DuckDB infinite and BC dates and interval months,
 DuckDB TIMETZ offsets, Oracle NUMBER as Decimal, LOBs as text, BC and
-nanosecond timestamps as text, intervals as their components). Measured: on the full live suite (1,620 tests, default sample 10,000) the check
+nanosecond timestamps as text, intervals as their components). Measured: on the full live suite (2,601 tests run on PostgreSQL, MySQL, SQL Server, Oracle and DuckDB, 2026-11-04; default sample 10,000) the check
 raised no false disagreement; every disagreement it raised was a planted
 walk defect or a table changed mid-run.
 

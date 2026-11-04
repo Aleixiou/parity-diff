@@ -23,6 +23,7 @@ import datetime as dt
 import json
 import math
 import os
+import time
 import uuid as uuidlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -1282,6 +1283,8 @@ class OracleCov(CovEngine):
         self.url = url
         self.con = oracledb.connect(**parse_oracle_url(url))
         self.tables: list[str] = []
+        #: When `build` last wrote; see `open`.
+        self._last_write = 0.0
 
     def natives(self) -> list[Native]:
         """Every Oracle type `map_type_oracle` covers, plus UNKNOWN ones.
@@ -1431,6 +1434,7 @@ class OracleCov(CovEngine):
             x = x.value if isinstance(x, OraBind) else x
             if isinstance(x, (str, bytes)) and len(x) == 0:
                 bad.setdefault(int(r[0]), "Oracle stores the empty string as NULL")
+        self._last_write = time.monotonic()
         return bad
 
     def ref(self, table):
@@ -1438,7 +1442,16 @@ class OracleCov(CovEngine):
         return table
 
     def open(self, scale):
-        """A read-only parity dialect."""
+        """A read-only parity dialect, three seconds after the last write.
+
+        A READ ONLY snapshot taken within about 1.5 s of a table's creation
+        or first insert cannot read it (ORA-01466; see `settle` in
+        tests/test_oracle.py): the dialect refuses loudly, so a sweep opened
+        at once failed on whichever tables were newest.
+        """
+        wait = self._last_write + 3.0 - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
         return get_dialect(self.url, side="A", float_scale=scale)
 
     def drop_all(self):
