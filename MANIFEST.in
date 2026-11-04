@@ -6,5 +6,7 @@ include LICENSE
 include README.md
 include CONTRIBUTING.md
 recursive-include tests *.py
+# tests/test_risk_doc.py checks docs/risk.md against the code and docs/coverage.md.
+include docs/*.md
 prune demo/data
 global-exclude __pycache__ *.py[cod]
