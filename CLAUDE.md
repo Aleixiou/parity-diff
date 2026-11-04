@@ -143,6 +143,33 @@ BigQuery's instant type is plainly `TIMESTAMP` (its naive one is `DATETIME`), th
 opposite of what that name means elsewhere, so the dialect sets
 `Column.tz_aware` explicitly instead of letting the engine infer it from the name.
 
+Round H (2026-11-04, `tests/redteam/test_round_h_bigquery.py`,
+`tests/test_bigquery_nested.py`), each verified live:
+
+- **Never `FORMAT('%t')` for a value that holds text.** It prints strings
+  unquoted, so `['a, b']` equalled `['a', 'b']`, `['']` equalled `[]`,
+  `('a, b', 'c')` equalled `('a', 'b, c')` and a NULL field equalled the
+  string `'NULL'` - false matches. ARRAY now follows the LIST rule
+  (`string_agg` over `unnest(c) with offset`, ordered), and is a LIST - so the
+  sample check reads it - when its element has a rule. STRUCT follows
+  `canonical_struct_text` (base.py: `{name\=value\,...}`, each field by its
+  own rule, read through `unnest([c])`) and stays UNKNOWN; anonymous fields
+  (views only) fall back to `TO_JSON_STRING`. GEOGRAPHY is `to_hex(st_asbinary(c))`:
+  WKT kept 15 digits. Only INTERVAL and RANGE still use `%t`.
+- **FLOAT is one `WITH(...)` expression** (1,261 characters, was 2,214, so
+  ~460 FLOAT64 columns passed the 1,024K-character query limit). WITH binds
+  eagerly, so the BIGNUMERIC is NULL outside the band that needs it - CAST
+  raises on Inf/NaN/huge, ROUND past 38 places. Byte-identical on the 1,565
+  sample at scales 0, 6, 20.
+- Hidden columns (`is_hidden`: `_PARTITIONTIME`) are not data. A `CLONE` is
+  pinned like a base table (verified); a `SNAPSHOT` is immutable, no caveat.
+  Backticked names (whole or per part) and `example.com:proj` projects are
+  parsed; a dataset in another location is named with its `?location=`.
+- A read-only *script* does run under the read-only scope (only writes are
+  refused); the dialect never sends one.
+- `current_timestamp()` is per query even under the pinned snapshot; the
+  `--where` caveat says so.
+
 **SQL Server** (verified live 2026-11-02 against SQL Server 2022 CU27 in a
 Linux container, byte-for-byte with DuckDB over 5,000 mixed-type rows, in a
 UTF-8, a Latin1 and a case-sensitive database; `tests/test_mssql.py`). Every
@@ -618,7 +645,8 @@ BigQuery has no multi-statement snapshot, so every read of a **base table** uses
 `FOR SYSTEM_TIME AS OF` the server time captured by the first metadata query -
 verified live: a row inserted mid-walk stays invisible. BigQuery silently ignores
 time travel on a **view** (verified: it returned the live count), so views are read
-live at every level, as on Snowflake (READ COMMITTED only). Documented in the README,
+live at every level, as on Snowflake (READ COMMITTED only). A table **clone** honours
+time travel and is pinned (verified); a table **snapshot** cannot change. Documented in the README,
 pinned by a live test. The dialect also requests the `bigquery.readonly` OAuth scope,
 so the server itself refuses any write - verified for INSERT, DELETE, CREATE, DROP.
 

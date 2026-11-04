@@ -5,6 +5,31 @@ with the caveat that 0.x means the CLI surface may still move.
 
 ## Unreleased
 
+- **BigQuery false matches fixed (red-team round H).** ARRAY, STRUCT and
+  GEOGRAPHY rendered through `FORMAT('%t')` or WKT: `['a, b']` equalled
+  `['a', 'b']`, `['']` equalled `[]` (ARRAY<BYTES> too), `('a, b', 'c')`
+  equalled `('a', 'b, c')`, a NULL struct field equalled the string `'NULL'`,
+  and two points stored with different coordinates compared identical
+  (RT-HB1..HB3). ARRAY now follows the shared list rule - so it matches
+  PostgreSQL arrays and DuckDB lists, and the sample check reads it; STRUCT
+  renders each field by its own rule, named (`canonical_struct_text`);
+  GEOGRAPHY renders its WKB. **Checksums of BigQuery ARRAY, STRUCT and
+  GEOGRAPHY columns move**; no other checksum does.
+- **BigQuery:** a table of more than ~460 FLOAT64 columns no longer exceeds
+  the 1,024K-character query limit - the FLOAT rendering is one `WITH`
+  expression, byte-identical, 40% shorter (RT-HB9). The ingestion-time
+  pseudo-column `_PARTITIONTIME` is no longer compared (RT-HB4). A table
+  clone is read at the run's snapshot, and a table snapshot without the
+  view caveat (RT-HB5). Names copied from the console in backticks and
+  domain-scoped projects (`example.com:proj.ds.t`) are read (RT-HB7, HB10). A
+  dataset in another location is reported with its location and the
+  `?location=` to use (RT-HB8).
+- **`--where` scanner** (all engines): `[` is now read both as a SQL Server
+  identifier and as code, and a predicate is refused if either reading lets
+  it escape its parentheses. Reading it only as an identifier let
+  `']' in unnest([']'])) or (true ...` escape the bucket bounds on BigQuery
+  (RT-HB6). The filter caveat names `current_timestamp()`: BigQuery's
+  snapshot does not pin the clock (RT-HB11).
 - **Behaviour change: a sample check that cannot run is no longer
   "identical".** If the independent sample check was asked for (the default)
   and its fetch failed, the result used to stay identical with exit 0 and

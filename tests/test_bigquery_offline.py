@@ -400,7 +400,8 @@ def test_an_unreadable_dataset_is_explained_not_passed_through():
 
 
 def test_map_type_covers_what_information_schema_reports():
-    """The spellings verified live, parameters stripped, composites unknown."""
+    """The spellings verified live, parameters stripped, ARRAY a LIST when its
+    element has a rule, other composites unknown."""
     expected = {
         "INT64": LogicalType.INTEGER,
         "NUMERIC(12, 2)": LogicalType.DECIMAL,
@@ -415,7 +416,8 @@ def test_map_type_covers_what_information_schema_reports():
         "BYTES": LogicalType.BINARY,
         "TIME": LogicalType.TIME,
         "JSON": LogicalType.JSON,
-        "ARRAY<INT64>": LogicalType.UNKNOWN,
+        "ARRAY<INT64>": LogicalType.LIST,  # the list rule (RT-HB1)
+        "ARRAY<STRUCT<x INT64>>": LogicalType.UNKNOWN,
         "STRUCT<x INT64, y STRING>": LogicalType.UNKNOWN,
     }
     for raw, logical in expected.items():
