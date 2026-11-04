@@ -59,9 +59,14 @@ def bq(bigquery_url):
 
     ds = f"`{project}`.`{dataset}`"
     yield run, name, ds, client
+    failed = []
     for n in reversed(made):
-        client.delete_table(f"{project}.{dataset}.{n}", not_found_ok=True)
+        try:
+            client.delete_table(f"{project}.{dataset}.{n}", not_found_ok=True)
+        except Exception:  # keep deleting the rest, then say what is left
+            failed.append(n)
     client.close()
+    assert not failed, f"could not delete {failed}"
 
 
 @pytest.fixture
@@ -125,7 +130,10 @@ def _bq_duck(url, path, a_table, b_table, **kw):
 
 def _found(result):
     """(key, kind, sorted changed columns) per reported difference."""
-    return [(d.key, d.kind, sorted(d.columns) if d.columns else d.columns) for d in result.diffs]
+    return [
+        (d.key, d.kind, sorted(d.columns) if d.columns else d.columns)
+        for d in result.diffs
+    ]
 
 
 def _render(raw_type: str, literal: str, scale: int = 6) -> str:
@@ -155,7 +163,9 @@ def nested(bq):
         "struct(3, cast([] as array<string>), struct('NULL', 'z'), st_geogpoint(3, 3))",
     ]
     for t, rows in ((a, rows_a), (b, rows_b)):
-        run(f"create or replace table {ds}.`{t}` as select * from unnest([{', '.join(rows)}])")
+        run(
+            f"create or replace table {ds}.`{t}` as select * from unnest([{', '.join(rows)}])"
+        )
     return a, b
 
 
@@ -227,9 +237,14 @@ def test_geography_points_that_are_stored_differently_differ(bigquery_url, neste
 def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tmp_path):
     run, name, ds, _ = bq
     t = name("ingest")
-    run(f"create or replace table {ds}.`{t}` (id INT64, v STRING) partition by _PARTITIONDATE")
+    run(
+        f"create or replace table {ds}.`{t}` (id INT64, v STRING) partition by _PARTITIONDATE"
+    )
     run(f"insert into {ds}.`{t}` (id, v) values (1, 'a'), (2, 'b'), (3, 'c')")
-    path = _duck(tmp_path, "create table t as select * from (values (1, 'a'), (2, 'B'), (3, 'c')) v(id, v)")
+    path = _duck(
+        tmp_path,
+        "create table t as select * from (values (1, 'a'), (2, 'B'), (3, 'c')) v(id, v)",
+    )
     result = _bq_duck(bigquery_url, path, t, "t")
     # Exactly the planted change; no `_PARTITIONTIME` schema difference.
     assert result.schema_differences == []
@@ -244,7 +259,9 @@ def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tm
 def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
     run, name, ds, _ = bq
     base, clone = name("cl_base"), name("cl_clone")
-    run(f"create or replace table {ds}.`{base}` as select i as id from unnest(generate_array(1, 10)) i")
+    run(
+        f"create or replace table {ds}.`{base}` as select i as id from unnest(generate_array(1, 10)) i"
+    )
     run(f"create table {ds}.`{clone}` clone {ds}.`{base}`")
     a = open_bigquery(bigquery_url)
     try:
@@ -307,7 +324,9 @@ def test_float_sample_renders_exactly_the_spec_at_three_scales(bq):
 
     run, *_ = bq
     values = [
-        x for x in adversarial_doubles() if x == x and abs(x) < 2.0**116 and x not in (float("inf"), -float("inf"))
+        x
+        for x in adversarial_doubles()
+        if x == x and abs(x) < 2.0**116 and x not in (float("inf"), -float("inf"))
     ]
     for scale in (0, 6, 20):
         d = BigQueryDialect(float_scale=scale)
@@ -315,7 +334,10 @@ def test_float_sample_renders_exactly_the_spec_at_three_scales(bq):
         bad = []
         for i in range(0, len(values), 400):
             chunk = values[i : i + 400]
-            lits = ", ".join(f"struct({j} as i, cast('{x!r}' as float64) as c)" for j, x in enumerate(chunk))
+            lits = ", ".join(
+                f"struct({j} as i, cast('{x!r}' as float64) as c)"
+                for j, x in enumerate(chunk)
+            )
             rows = run(f"select i, {expr} from unnest([{lits}]) order by i")
             bad += [
                 (chunk[j], got, canonical_float_text(chunk[j], scale))
@@ -325,7 +347,9 @@ def test_float_sample_renders_exactly_the_spec_at_three_scales(bq):
         assert not bad, bad[:5]
 
 
-def test_text_keys_differing_only_by_case_are_distinct_under_und_ci(bigquery_url, bq, tmp_path):
+def test_text_keys_differing_only_by_case_are_distinct_under_und_ci(
+    bigquery_url, bq, tmp_path
+):
     """A STRING COLLATE 'und:ci' key: 'a', 'A' and 'a ' are three keys (the
     uniqueness count is not under the collation), and a change on 'A' alone is
     found under its real text. The value column is case-insensitive too, and
@@ -335,13 +359,18 @@ def test_text_keys_differing_only_by_case_are_distinct_under_und_ci(bigquery_url
     run(
         f"create or replace table {ds}.`{t}` (k STRING COLLATE 'und:ci', v STRING COLLATE 'und:ci')"
     )
-    run(f"insert into {ds}.`{t}` values ('a', 'x'), ('A', 'y'), ('a ', 'z'), ('b', 'ABC')")
+    run(
+        f"insert into {ds}.`{t}` values ('a', 'x'), ('A', 'y'), ('a ', 'z'), ('b', 'ABC')"
+    )
     path = _duck(
         tmp_path,
         "create table t as select * from (values ('a', 'x'), ('A', 'Y'), ('a ', 'z'), ('b', 'abc')) v(k, v)",
     )
     result = _bq_duck(bigquery_url, path, t, "t", key="k")
-    assert sorted(_found(result)) == [("A", "different", ["v"]), ("b", "different", ["v"])]
+    assert sorted(_found(result)) == [
+        ("A", "different", ["v"]),
+        ("b", "different", ["v"]),
+    ]
 
 
 def test_mixed_type_composite_key_matches_postgres_exactly(bigquery_url, bq, pgw):
@@ -357,14 +386,19 @@ def test_mixed_type_composite_key_matches_postgres_exactly(bigquery_url, bq, pgw
         "struct('x', date '9999-12-31', numeric '-0.000000001', b'', timestamp '0001-01-01 00:00:00+00', "
         "datetime '2024-01-01 00:00:00')])"
     )
-    p = pgw.table("ckey", "s text, d date, n numeric, b bytea, ts timestamptz, v timestamp")
+    p = pgw.table(
+        "ckey", "s text, d date, n numeric, b bytea, ts timestamptz, v timestamp"
+    )
     pgw.execute(
         f"insert into {p} values ('x', '0001-01-01', 1.5, '\\x00', '9999-12-31 23:59:59.999999+00', "
         "'2024-01-01 00:00:00.000002'), ('x', '9999-12-31', -0.000000001, '', "
         "'0001-01-01 00:00:00+00', '2024-01-01 00:00:00')"
     )
     result = _diff(
-        open_bigquery(bigquery_url, "A"), open_pg(PG_URL, "B"), t, f"public.{p}",
+        open_bigquery(bigquery_url, "A"),
+        open_pg(PG_URL, "B"),
+        t,
+        f"public.{p}",
         key=["s", "d", "n", "b", "ts"],
     )
     assert len(result.diffs) == 1
@@ -372,7 +406,9 @@ def test_mixed_type_composite_key_matches_postgres_exactly(bigquery_url, bq, pgw
     assert "0001-01-01" in str(result.diffs[0].key) and "1.5" in str(result.diffs[0].key)
 
 
-def test_bignumeric_extremes_match_postgres_and_a_last_digit_differs(bigquery_url, bq, pgw):
+def test_bignumeric_extremes_match_postgres_and_a_last_digit_differs(
+    bigquery_url, bq, pgw
+):
     """BIGNUMERIC at its maximum (39 integer digits, 38 places) against
     PostgreSQL numeric: a key that wide renders exactly, a value at the float
     scale agrees, and a change in the 6th place is found."""
@@ -390,11 +426,17 @@ def test_bignumeric_extremes_match_postgres_and_a_last_digit_differs(bigquery_ur
         f"insert into {p} values ({big}, {big}), (-{big}, 0), "
         "(1e-38, 12345678901234567890123456789012345678.123457)"
     )
-    result = _diff(open_bigquery(bigquery_url, "A"), open_pg(PG_URL, "B"), t, f"public.{p}")
-    assert _found(result) == [("0.00000000000000000000000000000000000001", "different", ["v"])]
+    result = _diff(
+        open_bigquery(bigquery_url, "A"), open_pg(PG_URL, "B"), t, f"public.{p}"
+    )
+    assert _found(result) == [
+        ("0.00000000000000000000000000000000000001", "different", ["v"])
+    ]
 
 
-def test_parameterised_numeric_and_string_types_compare_by_value(bigquery_url, bq, tmp_path):
+def test_parameterised_numeric_and_string_types_compare_by_value(
+    bigquery_url, bq, tmp_path
+):
     """NUMERIC(10, 2), NUMERIC(5), BIGNUMERIC(50, 20), STRING(10), BYTES(4)
     against DuckDB's plain types: equal values match, one planted change in
     each column is found."""
@@ -469,12 +511,16 @@ def test_json_documents_against_postgres_jsonb(bigquery_url, bq, pgw):
     t = name("json")
     run(
         f"create or replace table {ds}.`{t}` as select * from unnest(["
-        "struct(1 as id, json '{\"b\": [1, 2], \"a\": \"x\"}' as j), "
+        'struct(1 as id, json \'{"b": [1, 2], "a": "x"}\' as j), '
         "struct(2, json '{\"n\": 3}'), struct(3, cast(null as json))])"
     )
     p = pgw.table("json", "id bigint, j jsonb")
-    pgw.execute(f"insert into {p} values (1, '{{\"a\":\"x\",\"b\":[1,2]}}'), (2, '{{\"n\": 4}}'), (3, 'null')")
-    result = _diff(open_bigquery(bigquery_url, "A"), open_pg(PG_URL, "B"), t, f"public.{p}")
+    pgw.execute(
+        f'insert into {p} values (1, \'{{"a":"x","b":[1,2]}}\'), (2, \'{{"n": 4}}\'), (3, \'null\')'
+    )
+    result = _diff(
+        open_bigquery(bigquery_url, "A"), open_pg(PG_URL, "B"), t, f"public.{p}"
+    )
     assert _found(result) == [(2, "different", ["j"]), (3, "different", ["j"])]
 
 
@@ -490,7 +536,9 @@ def test_require_partition_filter_fails_naming_the_side_and_where_satisfies_it(
         f"create or replace table {ds}.`{t}` (id INT64, d DATE, v STRING) partition by d "
         "cluster by v options(require_partition_filter=true)"
     )
-    run(f"insert into {ds}.`{t}` values (1, '2024-01-01', 'a'), (2, '2024-01-02', 'b'), (3, '2024-01-03', 'c')")
+    run(
+        f"insert into {ds}.`{t}` values (1, '2024-01-01', 'a'), (2, '2024-01-02', 'b'), (3, '2024-01-03', 'c')"
+    )
     path = _duck(
         tmp_path,
         "create table t as select * from (values (1, date '2024-01-01', 'a'), (2, date '2024-01-02', 'B'), (3, date '2024-01-03', 'c')) v(id, d, v)",
@@ -509,7 +557,9 @@ def test_materialized_view_is_read_live_and_compared(bigquery_url, bq, tmp_path)
     lacks bigquery.tables.deleteSnapshot, so they could not be cleaned up.)"""
     run, name, ds, _ = bq
     base, mv = name("mvbase"), name("mv")
-    run(f"create or replace table {ds}.`{base}` as select i as id, cast(i as string) as v from unnest(generate_array(1, 5)) i")
+    run(
+        f"create or replace table {ds}.`{base}` as select i as id, cast(i as string) as v from unnest(generate_array(1, 5)) i"
+    )
     run(f"create materialized view {ds}.`{mv}` as select id, v from {ds}.`{base}`")
     path = _duck(
         tmp_path,
@@ -566,7 +616,7 @@ def test_every_write_or_script_is_refused_by_the_server(bigquery_url, bq, statem
     t = f"{ds}.`{_shared_rw_table(bq)}`"
     a = open_bigquery(bigquery_url)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match=r"(?i)scope|permission|denied"):
             a.query(statement.format(t=t))
     finally:
         a.close()
@@ -606,7 +656,9 @@ def _shared_rw_table(bq) -> str:
     if not _RW_TABLE:
         run, name, ds, _ = bq
         t = name("rwprobe")
-        run(f"create or replace table {ds}.`{t}` as select i as id, 'v' as v from unnest([1, 2, 3]) i")
+        run(
+            f"create or replace table {ds}.`{t}` as select i as id, 'v' as v from unnest([1, 2, 3]) i"
+        )
         _RW_TABLE.append(t)
     return _RW_TABLE[0]
 
@@ -624,7 +676,7 @@ def _shared_rw_table(bq) -> str:
         ("'a\\'' = 'a'", True),
         ("id > 1; delete from t where true", True),
         ("id > 1) or (true", True),
-        ("r\"\\\" = r\"\\\"", True),
+        ('r"\\" = r"\\"', True),
     ],
 )
 def test_where_with_bigquery_quoting(bigquery_url, bq, tmp_path, predicate, refused):
@@ -653,7 +705,9 @@ def _where_table(bq) -> str:
     if not _WHERE_TABLE:
         run, name, ds, _ = bq
         t = name("where")
-        run(f"create or replace table {ds}.`{t}` as select * from unnest([struct(1 as id, 'a' as v), struct(2, 'b'), struct(3, 'c')])")
+        run(
+            f"create or replace table {ds}.`{t}` as select * from unnest([struct(1 as id, 'a' as v), struct(2, 'b'), struct(3, 'c')])"
+        )
         _WHERE_TABLE.append(t)
     return _WHERE_TABLE[0]
 
@@ -673,7 +727,9 @@ def test_odd_identifiers_columns_and_map(bigquery_url, bq, tmp_path):
         'create table t ("id" bigint, "my col-1" varchar, "select" bigint, mixedcase varchar, new_name varchar)',
         "insert into t values (1, 'a', 1, 'm', 'o'), (2, 'b', 2, 'n', 'q')",
     )
-    result = _bq_duck(bigquery_url, path, t, "t", key="id", column_map={"old_name": "new_name"})
+    result = _bq_duck(
+        bigquery_url, path, t, "t", key="id", column_map={"old_name": "new_name"}
+    )
     assert _found(result) == [(2, "different", ["old_name"])]
 
 
@@ -682,12 +738,33 @@ def test_cli_end_to_end_json_exit_code_and_no_credentials(bigquery_url, bq, tmp_
     JSON verdict naming it, and nothing credential-like in the output."""
     run, name, ds, _ = bq
     t = _where_table(bq)
-    path = _duck(tmp_path, "create table t as select * from (values (1, 'a'), (2, 'b'), (3, 'Z')) v(id, v)")
+    path = _duck(
+        tmp_path,
+        "create table t as select * from (values (1, 'a'), (2, 'b'), (3, 'Z')) v(id, v)",
+    )
     env = dict(os.environ)
-    proc = subprocess.run(
-        [sys.executable, "-m", "parity.cli", "diff", "--a", bigquery_url, "--a-table", t,
-         "--b", f"duckdb:///{path}", "--b-table", "t", "--key", "id", "--json"],
-        capture_output=True, text=True, env=env, timeout=600,
+    proc = subprocess.run(  # noqa: S603 - our own interpreter and arguments
+        [
+            sys.executable,
+            "-m",
+            "parity.cli",
+            "diff",
+            "--a",
+            bigquery_url,
+            "--a-table",
+            t,
+            "--b",
+            f"duckdb:///{path}",
+            "--b-table",
+            "t",
+            "--key",
+            "id",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
     )
     assert proc.returncode == 1, proc.stderr[-2000:]
     out = json.loads(proc.stdout)
@@ -708,7 +785,9 @@ def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path
     n = 500
     t = name("widef")
     cols = ", ".join(f"cast(i * {k} as float64) / 7 as f{k}" for k in range(n))
-    run(f"create or replace table {ds}.`{t}` as select i as id, {cols} from unnest(generate_array(1, 3)) i")
+    run(
+        f"create or replace table {ds}.`{t}` as select i as id, {cols} from unnest(generate_array(1, 3)) i"
+    )
     dcols = ", ".join(f"(i * {k})::double / 7 as f{k}" for k in range(n))
     path = _duck(
         tmp_path,
@@ -742,7 +821,9 @@ def test_schema_changes_and_replacement_mid_walk_stay_invisible(bigquery_url, bq
     fresh dialect sees the change (the control)."""
     run, name, ds, _ = bq
     t = name(f"sch{abs(hash(ddl)) % 10_000}")
-    run(f"create or replace table {ds}.`{t}` as select i as id, cast(i as string) as v from unnest(generate_array(1, 10)) i")
+    run(
+        f"create or replace table {ds}.`{t}` as select i as id, cast(i as string) as v from unnest(generate_array(1, 10)) i"
+    )
     a = open_bigquery(bigquery_url)
     try:
         cols = a.columns(t)
@@ -807,13 +888,21 @@ def test_unicode_and_control_text_against_duckdb(bigquery_url, bq, tmp_path):
     matches DuckDB, and NFC against NFD is a difference (bytes differ)."""
     run, name, ds, _ = bq
     vals = [
-        "a\x00b", "a\x1fb", "\\N", "\U0001F600", "\U0010FFFF", "שלום",
-        "é", " \t ", "",
+        "a\x00b",
+        "a\x1fb",
+        "\\N",
+        "\U0001f600",
+        "\U0010ffff",
+        "שלום",
+        "é",
+        " \t ",
+        "",
     ]
     t = name("uni")
     lits = ", ".join(
         f"struct({i} as id, code_points_to_string([{', '.join(str(ord(ch)) for ch in v)}]) as s)"
-        if v else f"struct({i} as id, '' as s)"
+        if v
+        else f"struct({i} as id, '' as s)"
         for i, v in enumerate(vals, 1)
     )
     run(f"create or replace table {ds}.`{t}` as select * from unnest([{lits}])")
@@ -853,3 +942,106 @@ def test_200k_rows_with_first_last_and_middle_plants(bigquery_url, bq, tmp_path)
         (200000, "different", ["v"]),
     ]
     assert result.stats.rows_downloaded < 10_000
+
+
+def test_current_timestamp_in_a_filter_moves_under_the_pinned_snapshot(bigquery_url, bq):
+    """The live half of RT-HB11: the table is read at one snapshot, but
+    `current_timestamp()` in --where is each query's own clock - so the same
+    pinned dialect counts a row that crossed the boundary between queries."""
+    import time
+
+    run, name, ds, _ = bq
+    t = name("clock")
+    run(
+        f"create or replace table {ds}.`{t}` as select i as id, "
+        "timestamp_add(current_timestamp(), interval i * 45 second) as ts "
+        "from unnest(generate_array(1, 3)) i"
+    )
+    a = open_bigquery(bigquery_url)
+    try:
+        key = a.key_spec(t, "id")
+        where = "ts < current_timestamp()"
+        first = a.key_stats(t, key, where).rows
+        assert first < 3
+        time.sleep(50)
+        second = a.key_stats(t, key, where).rows
+        assert second > first  # one snapshot, two different filtered row sets
+    finally:
+        a.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HB11: the --where caveat says now()/current_date are a risk only "
+    "'on an engine without one snapshot', but BigQuery's base-table snapshot "
+    "does not pin current_timestamp(): each query has its own clock",
+)
+def test_the_filter_caveat_warns_about_bigquery_clock_functions():
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+    from parity.engine import _filter_caveats
+
+    where = "ts < current_timestamp()"
+    notes = _filter_caveats(
+        BigQueryDialect(side="A"), DuckDBDialect(side="B"), where, None
+    )
+    # The caveat quotes the predicate; look at its own words only.
+    assert "current_timestamp" in notes[0].replace(where, "")
+
+
+def test_a_public_table_in_another_project_and_region(bigquery_url, bq, tmp_path):
+    """Three-part name, another project, another region (`?location=US`), a
+    composite STRING key over 164k real rows: copied to DuckDB for free
+    (tabledata.list bills nothing), two planted changes and a deleted row
+    are found exactly."""
+    *_, client = bq
+    rows = [
+        (r["word"], r["word_count"], r["corpus"], r["corpus_date"])
+        for r in client.list_rows("bigquery-public-data.samples.shakespeare")
+    ]
+    assert len(rows) > 150_000
+    path = str(tmp_path / "shakespeare.duckdb")
+    con = duckdb_write(path)
+    try:
+        import csv
+
+        csv_path = tmp_path / "shakespeare.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(rows)
+        # executemany of 164k rows takes many minutes in DuckDB; a CSV is instant.
+        con.execute(
+            "create table t as select * from read_csv(?, header = false, quote = '\"', "
+            "columns = {'word': 'varchar', 'word_count': 'bigint', 'corpus': 'varchar', "
+            "'corpus_date': 'bigint'})",
+            [str(csv_path)],
+        )
+        assert con.execute("select count(*) from t").fetchone()[0] == len(rows)
+        (w1, _, c1, _), (w2, _, c2, _), (w3, _, c3, _) = rows[7], rows[80_000], rows[-3]
+        con.execute(
+            "update t set word_count = word_count + 1 where word = ? and corpus = ?",
+            [w1, c1],
+        )
+        con.execute(
+            "update t set corpus_date = -1 where word = ? and corpus = ?", [w2, c2]
+        )
+        con.execute("delete from t where word = ? and corpus = ?", [w3, c3])
+        assert con.execute("select count(*) from t").fetchone()[0] == len(rows) - 1
+    finally:
+        con.close()
+    result = _diff(
+        open_bigquery(bigquery_url + "?location=US", "A"),
+        open_duckdb(path, "B"),
+        "bigquery-public-data.samples.shakespeare",
+        "t",
+        key=["word", "corpus"],
+        threshold=1000,
+        bisection_factor=16,
+    )
+    got = sorted((str(d.key), d.kind, d.columns) for d in result.diffs)
+    assert len(got) == 3, got
+    kinds = sorted(k for _, k, _ in got)
+    assert kinds == ["different", "different", "only_in_a"]
+    assert any(w3 in k and c3 in k for k, kind, _ in got if kind == "only_in_a")
+    assert sorted(c for _, kind, cols in got if kind == "different" for c in cols) == [
+        "corpus_date",
+        "word_count",
+    ]
