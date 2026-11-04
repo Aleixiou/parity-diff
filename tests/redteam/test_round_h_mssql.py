@@ -977,6 +977,47 @@ def test_rt_hs10_a_filter_selecting_nothing_is_not_silently_identical(db):
     )
 
 
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "ts >= '2024-06-01T00:00:00+00:00'",
+        "u <> 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'",
+        "s collate Latin1_General_BIN2 like N'K%'",
+        "s = N'Köß' or s = N'K\U0001f600'",
+        "m > $1.50",
+        "d2 > convert(datetime2(7), '2024-01-01 00:00:00.0000001', 121)",
+        "b = 1",
+        "f > 0.5e0",
+        "len(s) > 1 and datalength(s) >= 4",
+        "x.exist('/a[@k=''2'']') = 1",
+    ],
+)
+def test_filters_on_every_type_select_exactly_their_rows(db, predicate):
+    """Rows 2 and 4 differ (one value each); the filter on each type selects
+    row 2 and not row 4, so exactly row 2 is reported."""
+    ddl = (
+        "id int primary key, ts datetimeoffset, u uniqueidentifier, s nvarchar(10), "
+        "m money, d2 datetime2(7), b bit, f float, x xml, v int"
+    )
+    sel = (
+        "'2024-06-02 00:00 +02:00', 'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', "
+        "N'Köß', 2.00, '2024-01-01 00:00:00.0000002', 1, 0.75, '<a k=\"2\"/>'"
+    )
+    out = (
+        "'2024-05-31 00:00 +00:00', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', "
+        "N'a', 1.00, '2024-01-01', 0, 0.25, '<a k=\"1\"/>'"
+    )
+    ta, tb = pair(
+        DB,
+        ddl,
+        [f"(1, {out}, 1)", f"(2, {sel}, 2)", f"(3, {sel}, 3)", f"(4, {out}, 4)"],
+        [f"(1, {out}, 1)", f"(2, {sel}, -2)", f"(3, {sel}, 3)", f"(4, {out}, -4)"],
+        "wt",
+    )
+    r = run(db, db, ta, tb, where_a=predicate, where_b=predicate, columns=["v"])
+    assert found(r) == [(2, "different", ("v",))]
+
+
 def test_column_map_swaps_and_renames_bracketed_names(db):
     """`--map` on SQL Server: two columns swap names and one is renamed to a
     name holding `]`, a quote, a space. Only the planted differences are
@@ -1211,3 +1252,77 @@ def test_a_1100_column_sparse_table_finds_the_last_column(db):
     assert found(run(db, db, "dbo.sp_a", "dbo.sp_b", exclude=["cs"])) == [
         (2, "different", (f"c{n - 1}",))
     ]
+
+
+# ============================================================ cross-engine
+
+PG_URL = os.environ.get("PARITY_TEST_PG", "postgres://parity:parity@127.0.0.1:5432/parity")
+
+
+def test_a_mixed_composite_key_against_postgres(db):
+    """(uniqueidentifier, datetime2(7), decimal, CI nvarchar) against PostgreSQL
+    (uuid, timestamp, numeric, text). Same-instant datetimeoffset against
+    timestamptz in another offset, money against numeric, bit against
+    boolean, float against double, an upper-case GUID against a lower-case
+    uuid: all equal. Planted: one value (row 2's float), one row PostgreSQL
+    lacks (row 3), and a key that differs only in case ('Ab' / 'ab'), which
+    is two rows - one on each side."""
+    psycopg = pytest.importorskip("psycopg")
+    try:
+        pg = psycopg.connect(PG_URL.replace("postgres://", "postgresql://"), autocommit=True)
+    except Exception as exc:  # pragma: no cover - depends on the machine
+        pytest.skip(f"no PostgreSQL: {type(exc).__name__}")
+    u = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"
+    rows_ms = [
+        f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'x', N'v1', 1.25, "
+        "'2024-06-01 12:00:00 +02:00', 12.3400, 1)",
+        f"('{u}', '2024-01-01 12:00:00.1234560', 1.5000, N'y', N'v2', 0.1, "
+        "'2024-06-01 12:00:00 +00:00', 0, 0)",
+        f"('{u}', '2024-01-01 12:00:00', 2, N'z', N'v3', null, null, null, null)",
+        f"('{u}', '2024-01-01 12:00:00', 2, N'Ab', N'v4', null, null, null, null)",
+    ]
+    ex(DB, "drop table if exists ck_mix")
+    ex(
+        DB,
+        "create table ck_mix (u uniqueidentifier not null, t datetime2(7) not null, "
+        "d decimal(18,4) not null, s nvarchar(10) collate Latin1_General_CI_AS not null, "
+        "v nvarchar(10), f float, ts datetimeoffset(3), m money, b bit, "
+        "primary key (u, t, d, s))",
+        *(f"insert ck_mix values {r}" for r in rows_ms),
+    )
+    try:
+        cur = pg.cursor()
+        cur.execute("create schema if not exists rth_mssql_pg")
+        cur.execute("drop table if exists rth_mssql_pg.ck_mix")
+        cur.execute(
+            "create table rth_mssql_pg.ck_mix (u uuid, t timestamp, d numeric(10,2), s text, "
+            "v text, f double precision, ts timestamptz, m numeric(19,4), b boolean, "
+            "primary key (u, t, d, s))"
+        )
+        lu = u.lower()
+        cur.execute(
+            "insert into rth_mssql_pg.ck_mix values "
+            f"('{lu}', '2024-01-01 12:00:00.123456', 1.5, 'x', 'v1', 1.25, "
+            "'2024-06-01 10:00:00+00', 12.34, true), "
+            f"('{lu}', '2024-01-01 12:00:00.123456', 1.50, 'y', 'v2', 0.100002, "
+            "'2024-06-01 21:00:00+09', 0, false), "
+            f"('{lu}', '2024-01-01 12:00:00', 2.00, 'ab', 'v4', null, null, null, null)"
+        )
+        r = run(
+            db, PG_URL, "dbo.ck_mix", "rth_mssql_pg.ck_mix", key=["u", "t", "d", "s"]
+        )
+    finally:
+        pg.cursor().execute("drop schema if exists rth_mssql_pg cascade")
+        pg.close()
+    kinds = sorted((d.kind, tuple(sorted(d.columns))) for d in r.diffs)
+    assert len(r.diffs) == 4, found(r)
+    assert kinds == sorted(
+        [
+            ("different", ("f",)),
+            ("only_in_a", ("b", "f", "m", "ts", "v")),
+            ("only_in_a", ("b", "f", "m", "ts", "v")),
+            ("only_in_b", ("b", "f", "m", "ts", "v")),
+        ]
+    )
+    texts = " ".join(str(d.key) for d in r.diffs)
+    assert "Ab" in texts and "ab" in texts and "z" in texts
