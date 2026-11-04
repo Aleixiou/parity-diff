@@ -101,6 +101,24 @@ def test_a_macro_shadowing_a_builtin_cannot_hide_a_change(tmp_path, name):
     assert found(result) == [(4242, "different", ("v",))]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="RT-HD1: `create type json as varchar` in the file shadows the JSON type the "
+    "UNION rendering casts through, so a UNION loses its tag: 1::int = '1', a false match",
+)
+def test_a_user_type_named_json_cannot_hide_a_union_tag(tmp_path):
+    """DuckDB refuses to shadow core types (below) but not `json`."""
+    ddl = "create table t (id int, v union(n int, s varchar))"
+    shadow = "create type json as varchar"
+    pa = duck_file(tmp_path, "a", ddl, "insert into t values (1, union_value(n := 1)), (2, union_value(n := 2))", shadow)
+    pb = duck_file(tmp_path, "b", ddl, "insert into t values (1, union_value(s := '1')), (2, union_value(n := 2))", shadow)
+    try:
+        result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    except ValueError:
+        return
+    assert found(result) == ONE
+
+
 def test_a_macro_on_one_side_only_does_not_hide_a_change(tmp_path):
     """The shadowing macro on one side only: its hashes differ from the honest
     side's, so the walk cannot call the tables identical (it reports noise)."""
@@ -147,6 +165,12 @@ def test_a_sqlite_file_is_refused_without_loading_an_extension(tmp_path):
     wrote `.duckdb/extensions/v1.5.5/windows_amd64/sqlite_scanner.duckdb_extension`
     there - downloaded during `get_dialect`. The dialect must refuse a file
     that is not a DuckDB database, naming the side, before any extension loads."""
+    installed = list(
+        (Path.home() / ".duckdb" / "extensions" / f"v{duckdb.__version__}").glob("*/sqlite_scanner.duckdb_extension")
+    )
+    if not installed and os.environ.get("PARITY_RTHD_ALLOW_NETWORK") != "1":
+        # Without it installed, reproducing the bug *is* the download.
+        pytest.skip("sqlite_scanner not installed; set PARITY_RTHD_ALLOW_NETWORK=1 to let the bug download it")
     path = _sqlite_file(tmp_path)
     loaded: list = []
     try:
@@ -725,6 +749,26 @@ def test_a_fixed_size_decimal_array_is_compared(tmp_path, typ):
     assert found(result) == ONE
 
 
+def test_a_700_column_table_with_odd_names_and_5mb_rows(tmp_path):
+    """700 columns named with spaces, quotes and Unicode, plus a 5 MB string:
+    a change in the last column and one in the last byte of the big string."""
+    n = 700
+    cols = ", ".join(f'"c {i} ""q"" ü" varchar' for i in range(n))
+    ins = ", ".join(f"'v{i}_' || i" for i in range(n))
+    mk = (
+        f"create table t (id int, {cols}, big varchar)",
+        f"insert into t select i, {ins}, repeat('x', 5000000) from range(1, 21) r(i)",
+    )
+    pa = duck_file(tmp_path, "a", *mk)
+    pb = duck_file(
+        tmp_path, "b", *mk,
+        f"update t set \"c {n - 1} \"\"q\"\" ü\" = 'changed' where id = 7",
+        "update t set big = repeat('x', 4999999) || 'y' where id = 9",
+    )
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    assert found(result) == [(7, "different", (f'c {n - 1} "q" ü',)), (9, "different", ("big",))]
+
+
 # ======================================================================= keys
 
 #: (type, k1, k2, k3, k4): side A holds k1..k3, side B changes k2's value,
@@ -1095,7 +1139,10 @@ def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(request,
     held = [duckdb.connect(p, read_only=True) for p in (pa, pb)]
     try:
         for con in held:
-            con.execute(setting)
+            try:
+                con.execute(setting)
+            except duckdb.Error as exc:
+                pytest.skip(f"not a global setting in DuckDB {duckdb.__version__}: {exc}")
         by_id = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
         by_k = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t", key="k")
     finally:
@@ -1103,6 +1150,19 @@ def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(request,
             con.close()
     assert found(by_id) == [(5, "different", ("s",)), (1000, "different", ("s",))]
     assert found(by_k) == [("A", "different", ("s",)), ("k5", "different", ("s",))]
+
+
+def test_an_in_process_writer_is_refused_naming_the_side(tmp_path):
+    """A library caller holding the file read-write in the same process: the
+    read-only side cannot share that instance and says so - it never reads a
+    table the writer is changing under it."""
+    p = duck_file(tmp_path, "a", "create table t (id int)", "insert into t values (1)")
+    rw = duckdb.connect(p)
+    try:
+        with pytest.raises(ValueError, match=r"^\[side A: duckdb\] could not connect"):
+            open_duckdb(p, "A")
+    finally:
+        rw.close()
 
 
 def test_a_locked_configuration_is_refused_naming_the_side(tmp_path):
