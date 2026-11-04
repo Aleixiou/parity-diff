@@ -823,6 +823,19 @@ def diff(
                     f"distinct keys. Rows cannot be compared one-to-one."
                 )
         stats.rows_compared_a, stats.rows_compared_b = ks_a.rows, ks_b.rows
+        # Zero rows on a side is legitimate (an empty table is identical to
+        # another), but it is also what a mistyped filter or the wrong table
+        # looks like, so it is said on every run (RT-HS10).
+        for side, table, ks in (("A", a_table, ks_a), ("B", b_table, ks_b)):
+            if not ks.rows:
+                warnings.append(
+                    f"0 rows compared on side {side} ({table}): "
+                    + (
+                        "no row matches its filter"
+                        if (wa, wb)[side == "B"]
+                        else "it is empty"
+                    )
+                )
 
         diffs: list[RowDiff] = []
         truncated = False

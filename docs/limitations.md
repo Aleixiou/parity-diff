@@ -102,6 +102,11 @@ list, grouped by topic. The error odds of each step are in
   MySQL's `CHAR` are: a `char(10)` holding `abc` matches `abc` on the other
   side. Nothing is lost, since the column cannot tell `abc` from `abc ` itself.
   SQL Server GUIDs compare in lower case.
+- **Bytes that are no character are compared as bytes.** A SQL Server
+  `varchar` in a Japanese, Chinese or Korean code page can hold a byte pair
+  that converts to `・` or `?`; such a value compares as `parity: invalid code
+  page bytes 0x…`, so it never matches another value or a real `?`. SQL
+  Server `geometry`/`geography` compare as their SRID and exact WKB.
 
 ## Dates, times and time zones
 
@@ -237,7 +242,15 @@ The per-type, per-engine evidence is [`coverage.md`](coverage.md).
 
 - **What the reading login cannot see is not compared.** PostgreSQL row-level
   security that filters the reading role is named in the output as a caveat;
-  diff as a role with BYPASSRLS for a complete result.
+  diff as a role with BYPASSRLS for a complete result. SQL Server security
+  policies with an enabled filter predicate get the same caveat (and, when
+  the login lacks `VIEW DEFINITION` to see the policies, a caveat that RLS
+  cannot be ruled out). SQL Server has no bypass: diff as a user the
+  predicates let read every row.
+- **Masked values are never compared as masks.** A SQL Server column under
+  dynamic data masking reads as its mask for a login without `UNMASK`, so
+  such a compared column is refused (naming it; `GRANT UNMASK` or
+  `--exclude` it), and a view reading one is refused as a whole.
 - Settings that cap result rows (MySQL `sql_select_limit`, Snowflake
   `ROWS_PER_RESULTSET`) are reset for the session, and if a side's checksums
   ever cover fewer rows than it holds, the run is not identical.
@@ -251,7 +264,7 @@ value renders, or which rows a query returns, is pinned at connect:
 |---|---|
 | PostgreSQL | `TimeZone` UTC, `extra_float_digits = 1`, `standard_conforming_strings`, `IntervalStyle`, `DateStyle`, `bytea_output`, `lc_monetary`, `client_encoding` UTF8, `search_path = pg_catalog` (so no user function can shadow a built-in), `quote_all_identifiers` off, and `idle_in_transaction_session_timeout` / (17+) `transaction_timeout` off so a role default cannot kill the held snapshot mid-run; then a read-only REPEATABLE READ transaction |
 | MySQL | `time_zone` UTC, `sql_mode`, `sql_select_limit` (reset to no limit), then REPEATABLE READ, READ ONLY |
-| SQL Server | isolation (SNAPSHOT where allowed, else READ COMMITTED), `NUMERIC_ROUNDABORT` off; never commits |
+| SQL Server | isolation (SNAPSHOT where allowed, else READ COMMITTED; a memory-optimized table is read `WITH (SNAPSHOT)` at READ COMMITTED), `NUMERIC_ROUNDABORT` off; never commits |
 | Snowflake | `TIMEZONE` UTC, `ROWS_PER_RESULTSET = 0` (no limit) |
 | DuckDB | `TimeZone` UTC, extension auto-install and auto-load off; the file is opened read-only |
 | BigQuery | read-only OAuth scope; base tables read `FOR SYSTEM_TIME AS OF` the first query |

@@ -196,7 +196,10 @@ Encryption is on by default and the certificate is checked: use
 self-signed certificate.
 
 **Tables.** Unqualified names mean the login's default schema (normally
-`dbo`).
+`dbo`). A name holding a dot is bracketed: `dbo.[orders.2024]` (`]]` inside
+brackets is a `]`). A synonym for an object in the same database is read
+through its base table's columns; one pointing into another database or
+server is refused, naming its target.
 
 **Minimum permissions.** SQL Server has no read-only session, so the tool
 issues only `SELECT`, refuses anything else before it reaches the server, and
@@ -208,11 +211,33 @@ create login parity_reader with password = '…';
 -- in the database:
 create user parity_reader for login parity_reader;
 alter role db_datareader add member parity_reader;   -- or: grant select on dbo.orders to parity_reader;
+grant view definition to parity_reader;            -- metadata only: lets the masking and row-level security checks see policies and view sources
+grant unmask to parity_reader;                       -- only where dynamic data masking is used
 ```
 
+- **Dynamic data masking.** A login without `UNMASK` reads a masked column
+  as its mask (`aXXX@XXXX.com`, `0`), and every expression over it too, so
+  two tables whose masked values differ would compare equal. A compared
+  column that is masked for this login is therefore **refused**, naming the
+  side, table and column: `GRANT UNMASK` (database-wide, or on 2022 per
+  schema, table or column), or leave it out with `--exclude`. A view reading
+  a masked column the login cannot unmask is refused as a whole (which view
+  column carries it is not in the catalog), and so is a view the login lacks
+  `VIEW DEFINITION` on, in a database holding such columns.
+- **Row-level security.** A security policy's filter predicate silently
+  hides rows from the reading user, and those rows are not compared. When
+  an enabled filter predicate applies to the table (or to a table a view
+  reads) every run's output says so. Policies are visible only with
+  `VIEW DEFINITION` on the database (on the table is not enough); without it the output says RLS cannot be
+  ruled out. SQL Server has no BYPASSRLS: diff as a user the predicates let
+  read every row.
+
 The tool also reads `INFORMATION_SCHEMA.COLUMNS`, `sys.databases` (the current
-database's snapshot setting and compatibility level), `sys.fn_helpcollations()`
-and `SERVERPROPERTY('EngineEdition')`, all readable by any database user.
+database's snapshot setting and compatibility level), `sys.fn_helpcollations()`,
+`SERVERPROPERTY('EngineEdition')`, `sys.objects`, `sys.tables`,
+`sys.synonyms`, `sys.masked_columns`, `sys.security_policies`,
+`sys.security_predicates` and `sys.sql_expression_dependencies` (each shows
+what this login may see) and `HAS_PERMS_BY_NAME`.
 
 **Consistency.** With `ALLOW_SNAPSHOT_ISOLATION ON` the diff runs in one
 SNAPSHOT transaction and does not block writers. Without it the run stays at
@@ -220,7 +245,17 @@ READ COMMITTED and prints a warning on every run. It never uses REPEATABLE
 READ or SERIALIZABLE (their locks would stall writers on a live system for
 the whole diff) or NOLOCK (dirty reads invent differences). To enable
 snapshots: `ALTER DATABASE … SET ALLOW_SNAPSHOT_ISOLATION ON` (a DBA
-decision: it adds row versioning in tempdb).
+decision: it adds row versioning in tempdb). A **memory-optimized** table is
+read with the table hint `WITH (SNAPSHOT)` - In-Memory OLTP's own snapshot,
+which refuses a SNAPSHOT session - so it too is read at one point in time,
+whatever `ALLOW_SNAPSHOT_ISOLATION` says.
+
+**Load on a live server.** The checksum query is one full scan and hash per
+side; on a busy legacy server cap it with Resource Governor (a workload group
+for the parity login with `MAX_DOP` and `REQUEST_MAX_MEMORY_GRANT_PERCENT`)
+rather than per-query hints. Under SNAPSHOT the reads take no row locks, so
+the diff does not block writers; at READ COMMITTED a read waits for a
+writer's lock as any query does (the driver has no query timeout).
 
 **Caveats.**
 
@@ -230,6 +265,17 @@ decision: it adds row versioning in tempdb).
   case.
 - FLOAT columns need compatibility level 130+; `--float-scale` above 18 is
   refused for them.
+- `geometry` / `geography` compare as their SRID and exact extended WKB
+  (`SRID=4326;0101…`), so a changed reference system is a difference;
+  `hierarchyid` as its path. No other engine has them.
+- `varchar`/`char`/`text` in a Japanese, Chinese or Korean code page (932,
+  936, 949, 950) may hold byte pairs that are no character; such a value
+  compares as a marker and its bytes, never as the `?` or `・` the
+  conversion makes of it.
+- A `decimal(38,0)` with more than 32 integer digits compares exactly at the
+  default scale (its own text, padded with zeros).
+- `--where` on SQL Server also refuses table and query hints (`with (...)`,
+  `option (...)`) and ODBC escape braces (`{fn ...}`) outside literals.
 - Ctrl-C waits for the query in flight: the driver cannot cancel one.
 - Fabric and Synapse are refused at connect.
 

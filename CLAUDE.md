@@ -772,6 +772,25 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   (UTF-8 conversion turned them all into U+FFFD); downloads fetch the canonical
   text as `varbinary` UTF-8 bytes; `sql_variant` renders `<BaseType>:<exact>`;
   the SELECT guard accepts one plain SELECT only.
+- **SQL Server, round H (RT-HS1-11, verified live on 2022):** a column under
+  dynamic data masking that the login cannot UNMASK
+  (`sys.masked_columns`, `HAS_PERMS_BY_NAME(..., 'UNMASK', col, 'COLUMN')`,
+  else the database grant) is refused in `normalize`, and a view reading one
+  is refused in `columns()` - masks hashed alike, a false match. An enabled
+  security-policy filter predicate (on the table, or what a view reads via
+  `sys.dm_sql_referenced_entities`, which needs VIEW DEFINITION on the view only) is a caveat; without database-level VIEW DEFINITION
+  the policies are invisible to the login, and the caveat says RLS cannot be
+  ruled out. Spatial renders `SRID=<n>;` + `AsBinaryZM()` hex (ToString has
+  no SRID). varchar/char/text in code pages 932/936/949/950 (`raw_type`
+  `varchar(cp932)`) goes through `_dbcs_safe`: bytes that do not round-trip
+  through nvarchar render a marker + hex (the round trip must be compared by
+  length too). `--where` is re-scanned as T-SQL (`]]` escapes `]` in
+  brackets) and refuses `with (`/`option (` hints and `{` braces. A
+  memory-optimized table is read `WITH (SNAPSHOT)` with the session at READ
+  COMMITTED - set with autocommit **on**: set inside mssql-python's implicit
+  transaction it is reported but the next access still fails 41332.
+  `decimal(p,s)` with `s < scale` and `p - s > 38 - scale` renders its own
+  text padded with zeros (byte-identical where the cast fits).
 - **DuckDB:** extension autoinstall/autoload are off (no network, §6);
   HUGEINT key spans past 2^127 bucket exactly in UHUGEINT.
 - **Snowflake changes are verified live** (2026-11-03, `tests/test_snowflake.py`):

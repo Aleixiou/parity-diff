@@ -468,6 +468,10 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             f"{sym['bad']} not proven: the independent sample check could not "
             f"run: {_escape(result.verification.error)}"
         )
+    elif total == 0:
+        # Two empty sides are identical, but "no differences" over nothing is
+        # how a mistyped filter or the wrong table reads (RT-HS10): say it.
+        headline = f"{sym['ok']} no differences - 0 rows compared, both sides are empty"
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
     if result.filtered:

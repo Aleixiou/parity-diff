@@ -179,11 +179,6 @@ def _scratch() -> Iterator[None]:
 # =================================================== permissions: the reader
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS1: dynamic data masking - a login without UNMASK hashes the "
-    "masks, so different masked values compare identical (false match)",
-)
 def test_rt_hs1_masked_columns_are_not_compared_as_their_masks(db):
     """A masked column read by a login without UNMASK returns the mask, and
     every expression over it is masked too: two tables whose emails, numbers
@@ -213,11 +208,6 @@ def test_rt_hs1_masked_columns_are_not_compared_as_their_masks(db):
     assert not result.identical
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS2: row-level security silently filters the reading login's "
-    "rows and no caveat says so (false match); PostgreSQL warns",
-)
 def test_rt_hs2_row_level_security_is_reported(db):
     """A security policy hides rows owned by other users from the reader.
     The hidden row differs between the tables; the reader's verdict is
@@ -290,11 +280,6 @@ def test_the_reader_login_cannot_write_and_the_diff_still_finds_the_row(db):
 # ====================================================== types and values
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS3: geometry/geography render through ToString(), which drops "
-    "the SRID - the same coordinates in two reference systems match (false match)",
-)
 def test_rt_hs3_spatial_srid_is_compared(db):
     """`ToString()` is WKT and has no SRID: POINT(1 2) in SRID 0 and in 4326,
     or a geography point in WGS 84 (4326) and in NAD 83 (4269), render
@@ -346,11 +331,6 @@ def test_spatial_and_hierarchyid_coordinates_are_exact(db):
     assert any("unmapped types" in w for w in result.warnings)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS4: varchar in a DBCS code page (cp932): distinct invalid byte "
-    "sequences all decode to U+30FB and hash alike (false match)",
-)
 def test_rt_hs4_invalid_dbcs_bytes_are_distinct():
     """A Japanese_CI_AS varchar stores bytes; 0x8120 and 0x8121 are both an
     invalid lead/trail pair in code page 932, and the conversion to nvarchar
@@ -382,11 +362,6 @@ def test_rt_hs4_invalid_dbcs_bytes_are_distinct():
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS4: varchar in a DBCS code page (cp949/950/936): every invalid "
-    "byte pair decodes to '?' and hashes like a real '?' (false match)",
-)
 @pytest.mark.parametrize(
     "collation", ["Korean_Wansung_CI_AS", "Chinese_Taiwan_Stroke_CI_AS", "Chinese_PRC_CI_AS"]
 )
@@ -409,11 +384,6 @@ def test_rt_hs4_invalid_dbcs_bytes_are_distinct_in_korean_and_chinese(collation)
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS7: a DECIMAL with more than 38 - scale integer digits kills "
-    "the diff with a bare 'Arithmetic overflow', naming no column or value",
-)
 def test_rt_hs7_a_decimal_too_wide_for_the_scale_names_the_column(db):
     """decimal(38,0) holds 38 integer digits; the rendering cast to
     decimal(38,6) holds 32, so 10^38 - 1 overflows. PostgreSQL renders it,
@@ -620,11 +590,6 @@ def test_random_doubles_render_the_canonical_float_text(db):
 # ================================================================== schema
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS6: memory-optimized tables cannot be read in the dialect's "
-    "SNAPSHOT transaction - the diff dies on error 41332",
-)
 def test_rt_hs6_memory_optimized_tables_can_be_diffed():
     """In-Memory OLTP tables refuse a session whose isolation level is
     SNAPSHOT (41332), and refuse READ COMMITTED inside an explicit or
@@ -675,11 +640,6 @@ def test_memory_optimized_tables_with_elevate_to_snapshot_and_snapshot_off():
     assert found(run(url, url, "dbo.mo_a", "dbo.mo_b")) == [(2, "different", ("v",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS9: a synonym is reported as 'table not found ... may lack "
-    "SELECT', though it exists and is readable",
-)
 def test_rt_hs9_a_synonym_is_diffed_or_named(db):
     """INFORMATION_SCHEMA.COLUMNS has no synonyms, so `dbo.syn` is "not found"
     and the hint blames permissions. Either resolve it (`sys.synonyms`,
@@ -836,11 +796,6 @@ def test_database_ansi_options_off_do_not_move_the_verdict():
 ESCAPING_FILTER = "[a]]'b] = 1) or (1 = 1 or [a]]'b] = 7"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS5: a row filter with `]]` then a quote inside a bracketed "
-    "identifier passes both checks and escapes its parentheses",
-)
 def test_rt_hs5_a_filter_escaping_its_parentheses_is_refused():
     """`where (<filter>) and <bucket bounds>` became `where ([a]]'b] = 1) or
     (1 = 1 or [a]]'b] = 7) and <bounds>`: rows matching the first term are
@@ -851,10 +806,11 @@ def test_rt_hs5_a_filter_escaping_its_parentheses_is_refused():
         SQLServerDialect(side="A").check_where(ESCAPING_FILTER)
 
 
-def test_an_escaping_filter_is_never_read_as_identical(db):
-    """What RT-HS5 costs today: the escaped `or` makes bucket counts
-    inconsistent, which the per-level sum check reports - the planted row is
-    found and the verdict is unverified, never identical."""
+def test_an_escaping_filter_is_refused_and_a_bracketed_one_still_filters(db):
+    """RT-HS5 end to end: the escaping filter is refused before any query
+    (before the fix its escaped `or` made bucket counts inconsistent and the
+    verdict unverified); a filter on the same `]]`-named column that keeps
+    its parentheses selects exactly its rows."""
     ex(DB, "drop table if exists esc_a", "drop table if exists esc_b")
     ddl = "id int primary key, v int, [a]]'b] int"
     ex(DB, f"create table esc_a ({ddl})", f"create table esc_b ({ddl})")
@@ -863,17 +819,19 @@ def test_an_escaping_filter_is_never_read_as_identical(db):
         f"from {series(2000)}"
     )
     ex(DB, f"insert esc_a {fill}", f"insert esc_b {fill}", "update esc_b set v = -1 where id = 1500")
-    r = run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=ESCAPING_FILTER, where_b=ESCAPING_FILTER)
-    assert not r.identical
-    assert (1500, "different", ("v",)) in found(r)
-    assert r.unexplained
+    with pytest.raises(ValueError, match=r"side A.*row filter.*parenthesis"):
+        run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=ESCAPING_FILTER, where_b=ESCAPING_FILTER)
+    # (Balanced for the shared scan too, which still misreads `]]'`.)
+    p = "[a]]'b] = 1 or id = 1500 or [a]]'b] = 7"
+    r = run(db, db, "dbo.esc_a", "dbo.esc_b", where_a=p, where_b=p)
+    assert found(r) == [(1500, "different", ("v",))]
+    assert not r.unexplained
 
 
 @pytest.mark.parametrize(
     "predicate",
     [
         "[set] > 0",
-        "{fn ucase('a')} = 'A'",
         "id in (select value from string_split(N'1,2', N','))",
         "id > 0 and @@rowcount >= 0",
         "id > 0 and 1 = (select 1 for xml path(''))",
@@ -915,31 +873,61 @@ def test_harmless_t_sql_filters_still_find_the_planted_row(db, predicate):
         "[a] > 0 and 'unterminated",
         "[unterminated > 0",
         "id > 0 \\' or 1 = 1",
+        # RT-HS5: `]]` is an escaped `]` to T-SQL, so the quote is code here.
+        ESCAPING_FILTER,
+        "[x]]'y] = 1) or (1 = 1",
+        # Table and query hints: held for the whole diff's transaction.
+        "id in (select id from dbo.wh_a with (xlock, holdlock))",
+        "id in (select id from dbo.wh_a WITH(NOLOCK))",
+        "id in (select id from dbo.wh_a with (tablockx))",
+        "id > 0 option (maxdop 1)",
+        # ODBC escapes: the driver rewrites them after the guard has read them.
+        "{fn ucase('a')} = 'A'",
+        "id > 0 and {call dbo.p} = 1",
+        "id > 0 or {d '2024-01-01'} = 1",
     ],
 )
 def test_filters_that_could_write_or_escape_are_refused_before_any_query(predicate):
     """Statement separators, comments, an unbalanced parenthesis, double
-    quotes and the write/exec words are refused by the checks, naming the
-    side - before any connection is used."""
+    quotes, the write/exec words, table and query hints and ODBC escape
+    braces are refused by the checks, naming the side - before any
+    connection is used."""
     from parity.dialects.mssql_dialect import SQLServerDialect
 
     with pytest.raises(ValueError, match=r"\[side A: mssql\] row filter"):
         SQLServerDialect(side="A").check_where(predicate)
 
 
-def test_a_filter_with_a_lock_hint_is_accepted_and_holds_its_locks():
-    """Not a write, but worth knowing: `with (xlock, holdlock)` inside a
-    filter passes the guard, and in the dialect's one long transaction the
-    locks are held until the diff ends - a second session's locking read of
-    the row times out. (A run using it on both sides of one table waits
-    forever: side B blocks on side A's locks and the driver has no query
-    timeout - seen during the campaign.)"""
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "note = N'with (xlock)' or id > 0",
+        "[with] > 0 or id > 0",
+        "note = N'{fn x}' or id > 0",
+        "note = N'a]]b' or [a]]b] is null or id > 0",
+    ],
+)
+def test_hint_words_and_braces_inside_literals_or_brackets_are_accepted(predicate):
+    """The hint and brace refusals read the skeleton: inside a literal or a
+    bracketed identifier `with (`, `{` and `]]` are harmless. Offline."""
+    from parity.dialects.mssql_dialect import SQLServerDialect
+
+    SQLServerDialect(side="A").check_where(predicate)
+
+
+def test_a_lock_hint_filter_is_refused_and_would_hold_its_locks():
+    """Why `with (...)` hints are refused (RT-HS5): run raw in the dialect's
+    one long transaction, `with (xlock, holdlock)` holds its locks until the
+    diff ends - a second session's locking read of the row times out, and a
+    run using it on both sides of one table waited forever (side B blocks on
+    side A's locks). `check_where` refuses it before any query."""
     url = make_db("rth_mssql_lock")
     ex("rth_mssql_lock", "create table t (id int primary key, v int)", "insert t values (1, 1), (2, 2)")
     a = get_dialect(url, side="A")
     try:
         pred = "id in (select id from dbo.t with (xlock, holdlock))"
-        a.check_where(pred)
+        with pytest.raises(ValueError, match=r"row filter.*hint"):
+            a.check_where(pred)
         a.query(f"select count_big(*) from [dbo].[t] where ({pred})")
         with pytest.raises(Exception, match=r"(?i)lock request time ?out"):
             ex(
@@ -951,11 +939,6 @@ def test_a_filter_with_a_lock_hint_is_accepted_and_holds_its_locks():
         a.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS10: a row filter that selects no row on either side gives "
-    "'identical' with no warning that nothing was compared",
-)
 def test_rt_hs10_a_filter_selecting_nothing_is_not_silently_identical(db):
     """A filter with a typo (`region = 'EU '`, a stray space, on a
     binary-collated column) selects nothing on both sides; the verdict is
@@ -1115,11 +1098,6 @@ def _cli(*argv: str) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS8: an Azure-style user@server URL whose password holds a '/' "
-    "prints the password in the 'Port could not be cast' error",
-)
 def test_rt_hs8_a_malformed_url_never_prints_the_password():
     """`mssql://admin@srv:P4ss/w0rd@host` - an unencoded `@` in the user
     (Azure's `user@server` form) and a `/` in the password. urlparse reads
@@ -1207,11 +1185,6 @@ def test_tls_instance_and_parameter_errors_are_clear_and_secret_free(query):
 # ============================================================ odd schemas
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HS11: a table or schema whose name holds a '.' cannot be "
-    "named at all - the table argument is split on every dot",
-)
 def test_rt_hs11_a_dotted_table_name_can_be_compared(db):
     """`[dbo].[orders.2024]` is legal (and common for imported files). The
     table argument has no quoting syntax, so `dbo.orders.2024` is three
@@ -1326,3 +1299,156 @@ def test_a_mixed_composite_key_against_postgres(db):
     )
     texts = " ".join(str(d.key) for d in r.diffs)
     assert "Ab" in texts and "ab" in texts and "z" in texts
+
+
+# ================================================ round H fixes: follow-ups
+
+
+def test_rt_hs1_unmask_lifts_the_refusal_and_exclude_works_around_it(db):
+    """Masked columns: refused naming side, table and column for the reader;
+    with the masked columns excluded the unmasked difference is found; once
+    UNMASK is granted, every planted difference is found; a view reading a
+    masked column is refused as a whole for a login without UNMASK."""
+    ta, tb = pair(
+        DB,
+        "id int primary key, email varchar(50) masked with (function = 'email()'), v int",
+        ["(1, 'alice@example.com', 1)", "(2, 'x@y.z', 2)"],
+        ["(1, 'bob@example.com', 1)", "(2, 'x@y.z', 3)"],
+        "ddm2",
+    )
+    ex(DB, "drop view if exists dbo.ddm2_v", "create view dbo.ddm2_v as select id, email, v from dbo.ddm2_a")
+    with pytest.raises(ValueError, match=r"side A.*'email'.*ddm2_a.*UNMASK"):
+        run(reader(), reader(), ta, tb)
+    assert found(run(reader(), reader(), ta, tb, exclude=["email"])) == [
+        (2, "different", ("v",))
+    ]
+    # Without VIEW DEFINITION the view's sources are invisible: refused.
+    with pytest.raises(ValueError, match=r"side A.*ddm2_v.*VIEW DEFINITION"):
+        run(reader(), reader(), "dbo.ddm2_v", tb, exclude=["email"])
+    ex(DB, f"grant view definition on dbo.ddm2_v to [{READER}]")
+    with pytest.raises(ValueError, match=r"side A.*ddm2_v.*masked.*UNMASK"):
+        run(reader(), reader(), "dbo.ddm2_v", tb, exclude=["email"])
+    ex(DB, f"grant unmask to [{READER}]")
+    try:
+        assert found(run(reader(), reader(), ta, tb)) == [
+            (1, "different", ("email",)),
+            (2, "different", ("v",)),
+        ]
+        assert found(run(reader(), reader(), "dbo.ddm2_v", tb)) == [
+            (1, "different", ("email",)),
+            (2, "different", ("v",)),
+        ]
+    finally:
+        ex(DB, f"revoke unmask to [{READER}]")
+
+
+def test_rt_hs1_granular_unmask_on_one_column(db):
+    """SQL Server 2022's granular UNMASK: granted on one column, that column
+    is compared and the other masked one is still refused."""
+    ta, tb = pair(
+        DB,
+        "id int primary key, a int masked with (function = 'default()'), "
+        "b int masked with (function = 'default()')",
+        ["(1, 1, 1)"],
+        ["(1, 2, 2)"],
+        "ddm3",
+    )
+    ex(DB, f"grant unmask on dbo.ddm3_a(a) to [{READER}]", f"grant unmask on dbo.ddm3_b(a) to [{READER}]")
+    with pytest.raises(ValueError, match=r"'b'.*UNMASK"):
+        run(reader(), reader(), ta, tb)
+    assert found(run(reader(), reader(), ta, tb, exclude=["b"])) == [(1, "different", ("a",))]
+
+
+def test_rt_hs2_a_visible_policy_is_named_and_none_means_no_caveat(db):
+    """With VIEW DEFINITION (sa here) an enabled filter predicate is named in
+    the caveat, also through a view; a table without a policy draws none."""
+    ta, tb = pair(
+        DB, "id int primary key, v int, owner sysname", ["(1, 1, 'x')"], ["(1, 2, 'x')"], "rls2"
+    )
+    ex(DB, "drop view if exists dbo.rls2_v", "create view dbo.rls2_v as select id, v, owner from dbo.rls2_a")
+    r = run(db, db, ta, tb)
+    assert found(r) == [(1, "different", ("v",))]
+    assert not any("row-level security" in w for w in r.warnings)
+    ex(DB, "drop security policy if exists dbo.rth_pol2", "drop function if exists dbo.rth_fn2")
+    ex(DB, "create function dbo.rth_fn2(@o sysname) returns table with schemabinding as "
+           "return select 1 as ok where @o = @o")  # fmt: skip
+    ex(DB, "create security policy dbo.rth_pol2 add filter predicate "
+           "dbo.rth_fn2(owner) on dbo.rls2_a with (state = on)")  # fmt: skip
+    try:
+        for source in (ta, "dbo.rls2_v"):
+            r = run(db, db, source, tb)
+            assert found(r) == [(1, "different", ("v",))]
+            assert any("row-level security" in w and "rth_pol2" in w for w in r.warnings)
+    finally:
+        ex(DB, "drop security policy if exists dbo.rth_pol2")
+
+
+def test_rt_hs7_a_wide_decimal_renders_and_narrow_ones_keep_their_sql():
+    """Offline: only a decimal the cast could overflow takes the padded
+    text; decimal(38,6), decimal(10,2) and money render the SQL they always
+    did. (Live: `test_rt_hs7_...` finds the one-unit difference.)"""
+    from parity.dialects.mssql_dialect import SQLServerDialect, _column
+
+    d = SQLServerDialect(side="A")
+    old = r"coalesce(convert(nvarchar(max), cast([c] as decimal(38,6))), N'\N')"
+    for p, s in ((38, 6), (10, 2), (32, 0), (38, 9)):
+        assert d.normalize(_column("c", "decimal", None, p, s)) == old
+    assert d.normalize(_column("c", "money", None, 19, 4)) == old
+    wide = d.normalize(_column("c", "numeric", None, 38, 0))
+    assert wide == r"coalesce(convert(nvarchar(max), [c]) + N'.000000', N'\N')"
+    assert d.normalize(_column("c", "decimal", None, 38, 3)) == (
+        r"coalesce(convert(nvarchar(max), [c]) + N'000', N'\N')"
+    )
+
+
+def test_rt_hs4_only_double_byte_code_pages_take_the_round_trip():
+    """Offline: a varchar in code page 1252 or 65001 renders as it always
+    did; only 932/936/949/950 are wrapped."""
+    from parity.dialects.mssql_dialect import SQLServerDialect, _column
+
+    d = SQLServerDialect(side="A")
+    plain = d.normalize(_column("v", "varchar", None))
+    assert d.normalize(_column("v", "varchar", None, None, None, 1252)) == plain
+    assert d.normalize(_column("v", "varchar", None, None, None, 65001)) == plain
+    for page in (932, 936, 949, 950):
+        wrapped = d.normalize(_column("v", "varchar", None, None, None, page))
+        assert "parity: invalid code page bytes " in wrapped and wrapped != plain
+
+
+@pytest.mark.parametrize(
+    ("name", "parts", "quoted"),
+    [
+        ("dbo.[orders.2024]", ("dbo", "orders.2024"), "[dbo].[orders.2024]"),
+        ("[dbo].[a]]b]", ("dbo", "a]b"), "[dbo].[a]]b]"),
+        ("[x.y]", ("dbo", "x.y"), "[x.y]"),
+        ("dbo.orders", ("dbo", "orders"), "[dbo].[orders]"),
+    ],
+)
+def test_rt_hs11_bracketed_names_split_and_quote_exactly(name, parts, quoted):
+    """Offline: brackets group a dotted part, `]]` is `]`; plain names split
+    as before. An unterminated bracket or a third part is refused."""
+    from parity.dialects.mssql_dialect import SQLServerDialect
+
+    d = SQLServerDialect(side="A")
+    assert d.split_table(name, "dbo") == parts
+    assert d.qualify(name) == quoted
+    for bad in ("dbo.[x", "a.[b].c", "[a]b"):
+        with pytest.raises(ValueError, match="side A"):
+            d.split_table(bad, "dbo")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "mssql://admin@srv:P4ssSecretX/w0rd@127.0.0.1/db",
+        "mssql://admin:P4ssSecretX@host:notaport/db",
+    ],
+)
+def test_rt_hs8_url_errors_never_echo_the_userinfo(url):
+    """Offline: the parse error names the problem, never the password."""
+    from parity.dialects.mssql_dialect import parse_mssql_url
+
+    with pytest.raises(ValueError) as exc:
+        parse_mssql_url(url)
+    assert "P4ssSecretX" not in str(exc.value)
+    assert "percent-encode" in str(exc.value) or "needs" in str(exc.value)

@@ -207,6 +207,19 @@ left out.
 As each says. A SQL Server table too wide to compile into one checksum query
 asks you to compare fewer columns per run with `--columns` / `--exclude`.
 
+```
+parity: [side A: mssql] column 'email' of dbo.customers is under dynamic data masking and this login does not hold UNMASK: ...
+parity: [side A: mssql] view dbo.v_customers reads dynamically masked column(s) ['customers.email'], and this login does not hold UNMASK: ...
+parity: [side A: mssql] dbo.orders_syn is a synonym for [legacy].[dbo].[orders], in another database or on another server; ...
+```
+
+The login reads masked values as their masks: `GRANT UNMASK TO <login>` (on
+SQL Server 2022 also per schema, table or column), or `--exclude` the
+column. A synonym into another database: connect to that database and name
+the base table. A table name holding a dot is bracketed, `dbo.[orders.2024]`.
+A warning `this login cannot see whether a row-level security policy filters
+…` goes away with `GRANT VIEW DEFINITION TO <login>` (database-wide: a policy is visible only with VIEW DEFINITION on the policy itself).
+
 ## Everything reads as different
 
 When nearly every row is reported (often with the `at least 10,000
