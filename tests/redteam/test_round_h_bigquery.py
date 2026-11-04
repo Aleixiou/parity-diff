@@ -228,12 +228,6 @@ def test_geography_points_that_are_stored_differently_differ(bigquery_url, neste
     assert _found(result) == [(2, "different", ["g"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB4: the hidden pseudo-column _PARTITIONTIME of an ingestion-time "
-    "partitioned table is listed by INFORMATION_SCHEMA.COLUMNS and compared as "
-    "data - a schema difference against any copy, every row against a reload",
-)
 def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tmp_path):
     run, name, ds, _ = bq
     t = name("ingest")
@@ -251,11 +245,6 @@ def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tm
     assert _found(result) == [(2, "different", ["v"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB5: a table CLONE honours FOR SYSTEM_TIME AS OF but is read live "
-    "(table_type 'CLONE' is not 'BASE TABLE'), with a caveat calling it a view",
-)
 def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
     run, name, ds, _ = bq
     base, clone = name("cl_base"), name("cl_clone")
@@ -281,12 +270,6 @@ def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
 BRACKET_ESCAPE = "']' in unnest([']'])) or (true or 'x' in unnest(['['])"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB6: the --where check skips `[` to the first `]` even inside a "
-    "string literal, so a predicate with `[']']` escapes its parentheses (and "
-    "the bucket bounds) on BigQuery",
-)
 def test_a_bracketed_string_cannot_escape_the_filter_parentheses():
     assert row_filter_problem(BRACKET_ESCAPE) is not None
 
@@ -302,11 +285,6 @@ def test_the_bracket_predicate_really_escapes_on_bigquery(bq):
     assert got == [(10,)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB7: a domain-scoped project (example.com:proj) cannot be named in "
-    "a three-part table name; its dot splits it into four parts and it is refused",
-)
 def test_a_domain_scoped_project_can_be_named_in_the_table():
     d = BigQueryDialect(side="A")
     d.project = "billing-project"
@@ -570,12 +548,6 @@ def test_materialized_view_is_read_live_and_compared(bigquery_url, bq, tmp_path)
     assert any("read live" in w for w in result.warnings)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB8: a table in another region (US public data from an EU "
-    "connection) is reported as missing or inaccessible; nothing points at the "
-    "location or at ?location=",
-)
 def test_a_table_in_another_location_fails_naming_the_location(bigquery_url):
     """The test dataset is in the EU; a US public table cannot be read by a job
     in the EU (with `?location=US` the same call succeeds). The error must
@@ -847,12 +819,6 @@ def test_schema_changes_and_replacement_mid_walk_stay_invisible(bigquery_url, bq
         fresh.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB10: a table written as the BigQuery console copies it, "
-    "`project.dataset.table` in backticks, is refused as 'Invalid project ID' "
-    "or 'table not found' with no word about the backticks",
-)
 @pytest.mark.parametrize("form", ["`{t}`", "`{p}.{d}.{t}`", "`{p}`.`{d}`.`{t}`"])
 def test_a_backtick_quoted_table_name_is_read_or_explained(bigquery_url, bq, form):
     t = _where_table(bq)
@@ -970,12 +936,6 @@ def test_current_timestamp_in_a_filter_moves_under_the_pinned_snapshot(bigquery_
         a.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB11: the --where caveat says now()/current_date are a risk only "
-    "'on an engine without one snapshot', but BigQuery's base-table snapshot "
-    "does not pin current_timestamp(): each query has its own clock",
-)
 def test_the_filter_caveat_warns_about_bigquery_clock_functions():
     from parity.dialects.duckdb_dialect import DuckDBDialect
     from parity.engine import _filter_caveats

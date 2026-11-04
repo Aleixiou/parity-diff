@@ -45,13 +45,19 @@ The BigQuery-specific decisions, each confirmed by that run:
   the whole walk sees one version of a live table (CLAUDE.md section 4.9).
   Views are *not* pinned: BigQuery silently ignores `FOR SYSTEM_TIME AS OF` on
   a view - verified, it returned the live row count - so a view is read live at
-  every level, the same READ COMMITTED limitation Snowflake has.
+  every level, the same READ COMMITTED limitation Snowflake has. A table
+  clone honours the clause and is pinned like a base table (verified, RT-HB5);
+  a table snapshot is immutable, so it is read as it is, with no caveat.
 - **Read-only by construction.** Credentials are requested with the
   `bigquery.readonly` OAuth scope and queries go through `jobs.query`. Verified:
-  SELECT, INFORMATION_SCHEMA and time travel work; INSERT, DELETE, CREATE, DROP
-  and multi-statement scripts are refused by the server ("Need BigQuery or
-  Cloud Platform write scope"). Credentials that cannot be down-scoped (a VM's
-  metadata server) keep their own scopes; the dialect still issues SELECT only.
+  SELECT, INFORMATION_SCHEMA and time travel work; INSERT, DELETE, UPDATE,
+  MERGE, CREATE, DROP, EXPORT DATA, temp tables, transactions and EXECUTE
+  IMMEDIATE are refused by the server ("Need BigQuery or Cloud Platform write
+  scope"), inside a multi-statement script as much as alone. A script that
+  only reads (DECLARE, a temp function, SELECT) does run - the scope refuses
+  writes, not scripts - but the dialect never sends one, and `;` is refused
+  in a row filter. Credentials that cannot be down-scoped (a VM's metadata
+  server) keep their own scopes; the dialect still issues SELECT only.
 """
 
 from __future__ import annotations
@@ -74,6 +80,15 @@ from parity.types import Column, LogicalType
 #: Read-only OAuth scope. Under it the server refuses any DML, DDL or script,
 #: so no bug in query building can write to a user's project.
 READONLY_SCOPE = "https://www.googleapis.com/auth/bigquery.readonly"
+
+#: Table types that honour `FOR SYSTEM_TIME AS OF`: a base table and a table
+#: clone (verified live: a row inserted into a clone mid-walk stays invisible).
+_PINNABLE = {"BASE TABLE", "CLONE"}
+
+#: Table types that cannot change, so reading them live is one snapshot
+#: anyway: a table snapshot is read-only by definition (BigQuery refuses DML
+#: on it), and needs neither time travel nor a caveat.
+_IMMUTABLE = {"SNAPSHOT"}
 
 #: Query parameters `bigquery://` understands. Anything else is refused rather
 #: than ignored: a misspelt `locaton=` silently dropped is a query routed to the
@@ -145,9 +160,10 @@ class BigQueryDialect(Dialect):
         #: Base tables (project, dataset, table) that read at `snapshot`. Only
         #: base tables: on a view BigQuery ignores time travel without an error.
         self._pinned: set[tuple[str, str, str]] = set()
-        #: Tables `columns()` found to be views (or anything but a base
-        #: table): read live at every level, which `caveats` reports.
-        self._live: set[tuple[str, str, str]] = set()
+        #: Tables `columns()` found to be views (or anything else time travel
+        #: does not pin), with their table_type: read live at every level,
+        #: which `caveats` reports.
+        self._live: dict[tuple[str, str, str], str] = {}
 
     # ---------------------------------------------------------------- setup
 
@@ -206,9 +222,19 @@ class BigQueryDialect(Dialect):
 
         Three parts are accepted here, unlike the other engines, because
         reading another project's dataset (a shared or public one) while
-        billing your own is ordinary BigQuery usage.
+        billing your own is ordinary BigQuery usage. The name may come as the
+        console copies it, in backticks - whole (`` `p.d.t` ``) or per part
+        (`` `p`.`d`.`t` ``) - and the project may be domain-scoped
+        (``example.com:proj``), whose own dot is not a separator (RT-HB7,
+        RT-HB10).
         """
-        parts = table.split(".")
+        parts = _split_table_name(table)
+        if parts is None:
+            raise self._err(
+                f"table name {table!r} has backticks parity cannot read: quote "
+                "the whole name (`project.dataset.table`) or each part "
+                "(`project`.`dataset`.`table`), or leave the backticks out"
+            )
         if len(parts) == 3:
             return parts[0], parts[1], parts[2]
         if len(parts) == 2:
@@ -249,6 +275,11 @@ class BigQueryDialect(Dialect):
         project, dataset, name = self._resolve(table)
         schema = f"{project}.{dataset}"
         info = self.qualify_parts(project, dataset)
+        # `is_hidden`: an ingestion-time partitioned table lists its
+        # pseudo-columns (_PARTITIONTIME, _PARTITIONDATE) with is_hidden YES.
+        # They are load metadata, not data - a copy of the table elsewhere
+        # has no such column, and a reload of the same rows has other values
+        # (RT-HB4) - and `select *` leaves them out too.
         sql = (
             "select c.column_name, c.data_type, t.table_type, "
             "format_timestamp('%Y-%m-%d %H:%M:%E6S+00', current_timestamp()) "
@@ -256,26 +287,54 @@ class BigQueryDialect(Dialect):
             f"join {info}.INFORMATION_SCHEMA.TABLES as t "
             "on c.table_name = t.table_name "
             f"where c.table_name = {self.string_literal(name)} "
+            "and c.is_hidden = 'NO' "
             "order by c.ordinal_position"
         )
         try:
             rows = self.query(sql)
         except Exception as exc:
             # A missing dataset and a dataset this account cannot see return
-            # the same 403 from BigQuery, so the message has to cover both.
+            # the same 403 from BigQuery, so the message has to cover both -
+            # and so does a dataset in another location than the job (RT-HB8).
             raise self._err(
                 f"cannot read dataset {schema} while looking for {table}: it "
-                f"does not exist, or this account lacks access to it ({exc})"
+                f"does not exist, or this account lacks access to it"
+                f"{self._location_hint(project, dataset)} ({exc})"
             ) from exc
         if not rows:
             raise self._err(self._not_found(table, schema, name))
         if self.snapshot is None:
             self.snapshot = str(rows[0][3])
-        if rows[0][2] == "BASE TABLE":
+        kind = str(rows[0][2])
+        if kind in _PINNABLE:
             self._pinned.add((project, dataset, name))
-        else:
-            self._live.add((project, dataset, name))
+        elif kind not in _IMMUTABLE:
+            self._live[(project, dataset, name)] = kind
         return [_column(str(r[0]), str(r[1])) for r in rows]
+
+    def _location_hint(self, project: str, dataset: str) -> str:  # pragma: no cover - live
+        """Name the dataset's location when it is not where jobs run.
+
+        A job runs in one location and cannot read a dataset in another, and
+        the server's error is the same "not found or no access" as for a
+        missing dataset. Dataset metadata is readable across locations, so ask
+        for it and say which `?location=` would work. Best effort: when that
+        lookup fails too, the hint says where jobs run and how to change it.
+        """
+        here = self._location or "the dataset's default location"
+        try:
+            found = self._client.get_dataset(f"{project}.{dataset}").location
+        except Exception:
+            return (
+                f"; or it is in another location than this connection's jobs "
+                f"({here}): add ?location=<its region> to the connection string"
+            )
+        if found and (self._location or "").lower() != str(found).lower():
+            return (
+                f"; it is in location {found} and this connection runs jobs in "
+                f"{here}: add ?location={found} to the connection string"
+            )
+        return ""
 
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """Say so when the walk is not one snapshot (RT-D7).
@@ -287,14 +346,16 @@ class BigQueryDialect(Dialect):
         """
         if not self._live:
             return []
-        names = sorted(".".join(ref) for ref in self._live)
+        names = sorted(
+            f"{'.'.join(ref)} ({kind.lower()})" for ref, kind in self._live.items()
+        )
         note = (
-            f"{' and '.join(names)} is not a base table, and BigQuery ignores "
-            "time travel on a view, so it is read live at every level rather "
-            "than as one snapshot: rows written during the diff can be "
-            "reported as differences that never existed at one point in time, "
-            "or missed. Diff the base table, or a snapshot of the view, for a "
-            "single-snapshot result"
+            f"{' and '.join(names)} is not a base table or a clone, and "
+            "BigQuery ignores time travel on it, so it is read live at every "
+            "level rather than as one snapshot: rows written during the diff "
+            "can be reported as differences that never existed at one point "
+            "in time, or missed. Diff the base table, or a snapshot of it, for "
+            "a single-snapshot result"
         )
         return [note]
 
@@ -562,6 +623,50 @@ class BigQueryDialect(Dialect):
         run-to-run noise, so the wider one is free.
         """
         return f"coalesce(sum(cast(({expr}) as bignumeric)), 0)"
+
+
+def _split_table_name(table: str) -> list[str] | None:
+    """A table reference's parts, backticks and domain-scoped projects read.
+
+    Split on dots outside backticks; a backticked part is taken literally,
+    its backticks stripped. One backticked part holding the whole name
+    (`` `p.d.t` ``, as the console copies it) is read as if unquoted. A bare
+    part holding `:` names a domain-scoped project (``example.com:proj``):
+    it and the bare parts before it are one project, rejoined by their dots.
+    None when a backtick appears anywhere but around a whole part - one is
+    never stripped from inside a name.
+    """
+    parts: list[str] = []
+    quoted: list[bool] = []
+    i = 0
+    while True:
+        if table.startswith("`", i):
+            end = table.find("`", i + 1)
+            if end < 0:
+                return None
+            parts.append(table[i + 1 : end])
+            quoted.append(True)
+            i = end + 1
+            if i < len(table) and table[i] != ".":
+                return None
+        else:
+            end = table.find(".", i)
+            end = len(table) if end < 0 else end
+            part = table[i:end]
+            if "`" in part:
+                return None
+            parts.append(part)
+            quoted.append(False)
+            i = end
+        if i >= len(table):
+            break
+        i += 1  # the dot
+    if len(parts) == 1 and quoted[0]:
+        return None if "`" in parts[0] else _split_table_name(parts[0])
+    for j, part in enumerate(parts):
+        if ":" in part and not any(quoted[: j + 1]):
+            return [".".join(parts[: j + 1]), *parts[j + 1 :]]
+    return parts
 
 
 def _column(name: str, raw: str) -> Column:

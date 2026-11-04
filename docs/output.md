@@ -140,7 +140,9 @@ the `filtered:` line names each side's predicate (`whole table` for a side
 without one), the risk figures count filtered rows, and JSON carries
 `where_a`, `where_b` and `risk.filtered`. A caveat warns that a predicate
 which changes during the run (`random()`, `clock_timestamp()`, or `now()`
-without one snapshot) can select different rows in different queries; the
+and `current_timestamp()` unless the engine evaluates them once per run -
+BigQuery's snapshot does not pin its clock) can select different rows in
+different queries; the
 run then reports those ranges as unexplained, never identical. A separate
 warning appears when only one side is filtered.
 

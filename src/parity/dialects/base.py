@@ -709,9 +709,17 @@ def sql_literal(value: str) -> str:
 #: Quote characters a predicate may use: string literals everywhere, quoted
 #: identifiers (`"` standard, `` ` `` MySQL and BigQuery). A quote of one kind
 #: ends only at the same kind; doubling it (`'it''s'`) closes and reopens, on
-#: every engine alike. `[` opens a SQL Server identifier (or a subscript) and
-#: is skipped to the first `]`: the engine's own region is never shorter.
-_FILTER_QUOTES = {"'": "'", '"': '"', "`": "`", "[": "]"}
+#: every engine alike.
+_FILTER_QUOTES = {"'": "'", '"': '"', "`": "`"}
+
+#: `[` is read two ways: on SQL Server it opens an identifier that runs to the
+#: first `]` (`]]` inside it closes and reopens, which ends in the same place)
+#: and quotes nothing else, so `[it's]` is one name; everywhere else it is an
+#: array literal or a subscript, and a quote inside it opens a string. The
+#: scan runs once per reading and refuses what either reading finds (RT-HB6:
+#: reading only the first let `[']']` end its "identifier" inside a BigQuery
+#: string literal, and the predicate escape its parentheses).
+_FILTER_BRACKET_READINGS = (True, False)
 
 #: Text that changes where a quoted region ends on some engines and not on
 #: others, so the scan below could disagree with an engine about which
@@ -722,21 +730,28 @@ _FILTER_QUOTES = {"'": "'", '"': '"', "`": "`", "[": "]"}
 _FILTER_AMBIGUOUS = re.compile(r"""\\['"`]|'''|\"\"\"|\$\w*\$""")
 
 
-def _filter_scan(predicate: str) -> str | None:
+def _filter_scan(predicate: str, bracket_identifiers: bool) -> str | None:
     """Find what would let `predicate` escape its parentheses, or None.
 
-    Every quoted region is skipped as the engines skip it - whatever could
-    make them disagree is refused first (`_FILTER_AMBIGUOUS`) - so the
-    parentheses counted here are the ones every engine parses as code.
+    One left-to-right pass: every quoted region is skipped as the engines
+    skip it - whatever could make them disagree is refused first
+    (`_FILTER_AMBIGUOUS`) - and parentheses are counted only outside them.
+    `bracket_identifiers` picks SQL Server's reading of `[` (an identifier
+    to the first `]`) or every other engine's (code, so quotes inside it
+    are strings). Run under both, the parentheses counted are the ones
+    every engine parses as code.
     """
+    quotes = dict(_FILTER_QUOTES)
+    if bracket_identifiers:
+        quotes["["] = "]"
     depth = 0
     close = ""
     for ch in predicate:
         if close:
             if ch == close:
                 close = ""
-        elif ch in _FILTER_QUOTES:
-            close = _FILTER_QUOTES[ch]
+        elif ch in quotes:
+            close = quotes[ch]
         elif ch == "#":
             # MySQL reads `#` to the end of the line as a comment.
             return "contains '#' outside a quoted string (MySQL reads it as a comment)"
@@ -781,7 +796,13 @@ def row_filter_problem(predicate: str) -> str | None:
             "backslash before a quote, a triple-quoted or a dollar-quoted "
             "string); spell the value another way, with chr() for instance"
         )
-    return _filter_scan(predicate)
+    for bracket_identifiers in _FILTER_BRACKET_READINGS:
+        problem = _filter_scan(predicate, bracket_identifiers)
+        if problem:
+            if not bracket_identifiers:
+                problem += " when `[` is read as code, not as a SQL Server identifier"
+            return problem
+    return None
 
 
 class Dialect(ABC):
