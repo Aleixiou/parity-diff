@@ -275,6 +275,37 @@ def test_a_view_that_gained_a_column_compares_it(tmp_path):
     assert found(result) == [(1, "different", ("w",))]
 
 
+def test_a_view_needing_an_extension_fails_without_installing_it(tmp_path):
+    """A view in the file calls a spatial function. Read with HOME pointed at an
+    empty directory (no extensions installed), the side must fail loudly and
+    nothing may be downloaded into that directory."""
+    path = str(tmp_path / "ext.duckdb")
+    con = duckdb.connect(path)
+    try:
+        con.execute("load spatial")
+    except duckdb.Error:
+        con.close()
+        pytest.skip("the spatial extension is not installed here (installing it needs the network)")
+    try:
+        con.execute("create table t (id int, x double)")
+        con.execute("insert into t values (1, 1.0)")
+        con.execute("create view v as select id, st_astext(st_point(x, x)) as g from t")
+    finally:
+        con.close()
+    home = tmp_path / "home"
+    home.mkdir()
+    code = (
+        "import sys\nfrom parity.dialects.base import get_dialect\nfrom parity.engine import diff\n"
+        "a = get_dialect('duckdb:///' + sys.argv[1], side='A')\nb = get_dialect('duckdb:///' + sys.argv[1], side='B')\n"
+        "try:\n    diff(a, b, 'main.v', 'main.v', key='id')\nexcept ValueError as e:\n    print('REFUSED', str(e)[:200])\n"
+        "else:\n    print('RAN')\n"
+    )
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    out = subprocess.run([sys.executable, "-c", code, path], env=env, capture_output=True, text=True, timeout=300)
+    assert "REFUSED [side A" in out.stdout, out.stdout + out.stderr
+    assert not [p for p in home.rglob("*") if p.is_file()], "an extension was installed"
+
+
 def test_a_wal_left_by_a_dead_writer_is_replayed_read_only(tmp_path):
     """A writer killed before its checkpoint leaves a WAL. The read-only side
     must see the committed changes (the update and the delete in the WAL) and
@@ -516,50 +547,67 @@ def _xf(reason: str):
     return pytest.mark.xfail(strict=True, reason=reason)
 
 
+def _xf_pre2(reason: str):
+    """A strict xfail before DuckDB 2.0, whose varchar cast quotes array
+    strings and keeps a TIMETZ offset's seconds (measured: these pass there)."""
+    return pytest.mark.xfail(DUCK_VERSION < (2, 0), strict=True, reason=reason + " (DuckDB < 2.0)")
+
+
+#: RT-HD14: on DuckDB 2.0 a column's collation reaches the key-uniqueness
+#: count, so distinct keys equal under it are refused as duplicates.
+_HD14 = pytest.mark.xfail(
+    DUCK_VERSION >= (2, 0),
+    strict=True,
+    reason="RT-HD14: on DuckDB 2.0 count(distinct <key text>) follows the key column's "
+    "collation (NOCASE, NOACCENT, NFC, ICU) or a default_collation, so a unique key "
+    "holding 'a' and 'A' is refused as not unique (CLAUDE.md 4.11: counted by bytes)",
+)
+
+
 NESTED_FALSE_MATCHES = [
     pytest.param(
         "VARCHAR[2]", "['a, b', 'c']", "['a', 'b, c']",
-        marks=_xf("RT-HD5: a fixed-size ARRAY of VARCHAR prints its strings unquoted: ['a, b','c'] = ['a','b, c'], a false match"),
+        marks=_xf_pre2("RT-HD5: a fixed-size ARRAY of VARCHAR prints its strings unquoted: ['a, b','c'] = ['a','b, c'], a false match"),
         id="array-varchar-comma",
     ),
     pytest.param(
         "VARCHAR[2]", "[NULL, 'x']", "['NULL', 'x']",
-        marks=_xf("RT-HD5: a fixed-size ARRAY of VARCHAR prints NULL and 'NULL' alike, a false match"),
+        marks=_xf_pre2("RT-HD5: a fixed-size ARRAY of VARCHAR prints NULL and 'NULL' alike, a false match"),
         id="array-varchar-null",
     ),
     pytest.param(
         "VARCHAR[2][]", "[['a, b', 'c']]", "[['a', 'b, c']]",
-        marks=_xf("RT-HD5: a list of fixed-size VARCHAR arrays, the same unquoted text"),
+        marks=_xf_pre2("RT-HD5: a list of fixed-size VARCHAR arrays, the same unquoted text"),
         id="list-of-array-varchar",
     ),
     pytest.param(
         "VARCHAR[2][2]", "[['a, b', 'c'], ['d', 'e']]", "[['a', 'b, c'], ['d', 'e']]",
-        marks=_xf("RT-HD5: a 2-D fixed-size VARCHAR array, the same unquoted text"),
+        marks=_xf_pre2("RT-HD5: a 2-D fixed-size VARCHAR array, the same unquoted text"),
         id="array-of-array-varchar",
     ),
     pytest.param(
         "STRUCT(a VARCHAR[2])", "{'a': ['x, y', 'z']}", "{'a': ['x', 'y, z']}",
-        marks=_xf("RT-HD5: a fixed-size VARCHAR array inside a STRUCT, the same unquoted text"),
+        marks=_xf_pre2("RT-HD5: a fixed-size VARCHAR array inside a STRUCT, the same unquoted text"),
         id="struct-of-array-varchar",
     ),
     pytest.param(
         "STRUCT(a TIMETZ)", "{'a': '12:00:00+05:00:30'::timetz}", "{'a': '12:00:00+05:30'::timetz}",
-        marks=_xf("RT-HD6: TIMETZ inside a STRUCT renders through the varchar cast, which drops the offset's seconds (COV-7, fixed only for a scalar TIMETZ)"),
+        marks=_xf_pre2("RT-HD6: TIMETZ inside a STRUCT renders through the varchar cast, which drops the offset's seconds (COV-7, fixed only for a scalar TIMETZ)"),
         id="struct-timetz",
     ),
     pytest.param(
         "TIMETZ[2]", "['12:00:00+05:00:30'::timetz, '01:00:00+00'::timetz]", "['12:00:00+05:30'::timetz, '01:00:00+00'::timetz]",
-        marks=_xf("RT-HD6: TIMETZ in a fixed-size ARRAY: the offset's seconds are dropped (COV-7)"),
+        marks=_xf_pre2("RT-HD6: TIMETZ in a fixed-size ARRAY: the offset's seconds are dropped (COV-7)"),
         id="array-timetz",
     ),
     pytest.param(
         "MAP(INTEGER, TIMETZ)", "map {1: '12:00:00+05:00:30'::timetz}", "map {1: '12:00:00+05:30'::timetz}",
-        marks=_xf("RT-HD6: TIMETZ as a MAP value: the offset's seconds are dropped (COV-7)"),
+        marks=_xf_pre2("RT-HD6: TIMETZ as a MAP value: the offset's seconds are dropped (COV-7)"),
         id="map-timetz",
     ),
     pytest.param(
         "UNION(t TIMETZ, s VARCHAR)", "union_value(t := '12:00:00+05:00:30'::timetz)", "union_value(t := '12:00:00+05:30'::timetz)",
-        marks=_xf("RT-HD6: TIMETZ as a UNION member (JSON of the varchar cast): the offset's seconds are dropped (COV-7)"),
+        marks=_xf_pre2("RT-HD6: TIMETZ as a UNION member (JSON of the varchar cast): the offset's seconds are dropped (COV-7)"),
         id="union-timetz",
     ),
     pytest.param(
@@ -614,7 +662,7 @@ VARIANT_PAIRS = [
     pytest.param("'\\x00'::blob::variant", "'\\x5Cx00'::blob::variant", id="blob"),
     pytest.param(
         "'12:00:00+05:00:30'::timetz::variant", "'12:00:00+05:30'::timetz::variant",
-        marks=_xf("RT-HD6: a TIMETZ held in a VARIANT renders through JSON of the varchar cast, which drops the offset's seconds (COV-7)"),
+        marks=_xf_pre2("RT-HD6: a TIMETZ held in a VARIANT renders through JSON of the varchar cast, which drops the offset's seconds (COV-7)"),
         id="timetz-offset-seconds",
     ),
 ]
@@ -633,6 +681,7 @@ def test_variant_values_that_differ_are_found(tmp_path, a, b):
 
 @pytest.mark.sample_check_may_disagree
 @pytest.mark.xfail(
+    DUCK_VERSION < (2, 0),
     strict=True,
     reason="RT-HD8: an ENUM fixed-size ARRAY (`ENUM('a, b', ...)[2]`) is mapped to STRING "
     "(map_type cuts at '(' before it sees the [2]) and rendered as unquoted array text: "
@@ -646,7 +695,7 @@ def test_an_enum_array_difference_is_found_by_the_walk(tmp_path):
 
 
 @pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(strict=True, reason="RT-HD8: as above, [NULL, 'x'] = ['NULL', 'x'] for an ENUM array")
+@pytest.mark.xfail(DUCK_VERSION < (2, 0), strict=True, reason="RT-HD8: as above, [NULL, 'x'] = ['NULL', 'x'] for an ENUM array")
 def test_an_enum_array_null_is_found_by_the_walk(tmp_path):
     """A NULL element and the label 'NULL' print alike in array text."""
     result = diff_pair(tmp_path, "ENUM('x', 'NULL')[2]", "[NULL, 'x']", "['NULL', 'x']")
@@ -716,8 +765,10 @@ KEYS = [
 
 
 @pytest.mark.parametrize(("typ", "k1", "k2", "k3", "k4"), KEYS, ids=lambda x: str(x)[:24])
-def test_every_key_type_keeps_distinct_keys_apart(tmp_path, typ, k1, k2, k3, k4):
+def test_every_key_type_keeps_distinct_keys_apart(request, tmp_path, typ, k1, k2, k3, k4):
     """A change, a deletion and an insertion, each under its own key."""
+    if any(c in typ for c in ("NOCASE", "NOACCENT", "NFC")):
+        request.applymarker(_HD14)
     ddl = f"create table t (id {typ}, v int)"
     pa = duck_file(tmp_path, "ka", ddl, f"insert into t values ({k1}, 1), ({k2}, 2), ({k3}, 3)")
     pb = duck_file(tmp_path, "kb", ddl, f"insert into t values ({k1}, 1), ({k2}, 20), ({k4}, 4)")
@@ -728,10 +779,11 @@ def test_every_key_type_keeps_distinct_keys_apart(tmp_path, typ, k1, k2, k3, k4)
 
 
 @pytest.mark.parametrize("coll", ["nocase", "noaccent", "nfc", "de", "en_us", "de.noaccent", "nocase.noaccent.nfc"])
-def test_keys_equal_under_a_collation_stay_distinct(tmp_path, coll):
+def test_keys_equal_under_a_collation_stay_distinct(request, tmp_path, coll):
     """'a'/'A', 'é' composed/decomposed, 'é'/'e', 'ss'/'ß', 'a'/'a ' are
     different keys whatever the column's collation: one-sided on each side,
     and four such keys on both sides with one changed row."""
+    request.applymarker(_HD14)
     ddl = f"create table t (k varchar collate {coll}, v int)"
     for ka, kb in [("'a'", "'A'"), ("'é'", "'e' || chr(769)"), ("'é'", "'e'"), ("'ss'", "'ß'"), ("'a'", "'a '")]:
         pa = duck_file(tmp_path, "a", ddl, f"insert into t values ({ka}, 1), ('z', 2)")
@@ -747,13 +799,18 @@ def test_keys_equal_under_a_collation_stay_distinct(tmp_path, coll):
 
 def test_a_varchar_array_key_whose_text_collides_is_refused(tmp_path):
     """RT-HD5 as a key: ['a, b','c'] and ['a','b, c'] are two keys whose text
-    is one, so uniqueness fails - a refusal, not a merge."""
+    is one before DuckDB 2.0, so uniqueness fails - a refusal, not a merge.
+    From 2.0 the strings are quoted and the changed row is found."""
     ddl = "create table t (id VARCHAR[2], v int)"
     rows = "insert into t values (['a, b', 'c'], 1), (['a', 'b, c'], 2)"
     pa = duck_file(tmp_path, "a", ddl, rows)
     pb = duck_file(tmp_path, "b", ddl, rows, "update t set v = 3 where id = ['a', 'b, c']")
-    with pytest.raises(ValueError, match="not unique"):
-        run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    if DUCK_VERSION < (2, 0):
+        with pytest.raises(ValueError, match="not unique"):
+            run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+        return
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
+    assert [(d.kind, tuple(d.columns)) for d in result.diffs] == [("different", ("v",))]
 
 
 # ===================================================================== --where
@@ -1020,9 +1077,11 @@ GLOBALS = [
 
 
 @pytest.mark.parametrize("setting", GLOBALS)
-def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(tmp_path, setting):
+def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(request, tmp_path, setting):
     """Keys 'A' and 'a' stay two keys under a nocase default collation; the
     planted changes (row 5, key 'A') are found under every setting."""
+    if "default_collation" in setting:
+        request.applymarker(_HD14)
     mk = (
         "create table t (id int, k varchar, tz timestamptz, s varchar)",
         "insert into t select i, 'k' || i, timestamptz '2020-06-15 12:00:00+00' + to_days(i), 's' || i from range(1, 101) r(i)",
