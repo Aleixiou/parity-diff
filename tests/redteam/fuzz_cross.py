@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
-import json
 import os
 import random
 import sys
@@ -91,7 +90,9 @@ class Snowflake(fh.Engine):
         finally:
             cur.close()
 
-    def load(self, table: str, names: list[str], cols: list[Col], rows: list[tuple]) -> None:
+    def load(
+        self, table: str, names: list[str], cols: list[Col], rows: list[tuple]
+    ) -> None:
         """Multi-row INSERT ... SELECT over bound text, cast per column."""
         if not rows:
             return
@@ -129,7 +130,9 @@ class Snowflake(fh.Engine):
             chunk = rows[i : i + per]
             tup = "(" + ", ".join(["%s"] * len(cols)) + ")"
             sql = head + ", ".join([tup] * len(chunk))
-            self.exec(sql, [val(v, c) for r in chunk for v, c in zip(r, cols, strict=True)])
+            self.exec(
+                sql, [val(v, c) for r in chunk for v, c in zip(r, cols, strict=True)]
+            )
 
     def fetch_expr(self, name: str, c: Col) -> str:
         """Selected so the oracle sees the stored value exactly."""
@@ -196,16 +199,30 @@ class CaseH(fh.Case):
     def describe(self) -> str:
         """The base description plus the round-H knobs."""
         return (
-            super().describe()
-            + f" vs={self.verify_sample} where_a={self.where_a!r} "
+            super().describe() + f" vs={self.verify_sample} where_a={self.where_a!r} "
             f"where_b={self.where_b!r} map={self.column_map}"
         )
 
 
 KEY_SHAPES = [
-    "int", "int", "bigint", "text", "text", "dec", "date", "ts", "uuid",
-    "int+text", "text+date", "bigint+int", "dec+text", "uuid+int",
-    "int+text+date", "ts+int", "binary", "time+int",
+    "int",
+    "int",
+    "bigint",
+    "text",
+    "text",
+    "dec",
+    "date",
+    "ts",
+    "uuid",
+    "int+text",
+    "text+date",
+    "bigint+int",
+    "dec+text",
+    "uuid+int",
+    "int+text+date",
+    "ts+int",
+    "binary",
+    "time+int",
 ]
 
 
@@ -237,10 +254,10 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
     shapes = [s for s in KEY_SHAPES if not ("binary" in s and "bigquery" in engines)]
     key_shape = rng.choice(shapes)
     key = [Col(f"k{i}", kind) for i, kind in enumerate(key_shape.split("+"))]
-    # A DECIMAL key with no integer digits (p == s) is RT-HX1 (DuckDB renders
-    # `.25`), kept out of generation so a failure here is always new.
+    # A DECIMAL key with no integer digits (p == s) is generated too: RT-HX1
+    # (DuckDB rendered `.25`) is fixed.
     key = [
-        replace(c, p=(p := rng.randint(2, 30)), s=rng.randint(0, min(p - 1, 8)))
+        replace(c, p=(p := rng.randint(2, 30)), s=rng.randint(0, min(p, 8)))
         if c.kind == "dec"
         else c
         for c in key
@@ -273,11 +290,10 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
         if kind == "dec":
             p = rng.randint(1, 38)
             s = rng.randint(0, min(p, 12))
+            # Scale 0 included: Snowflake reads NUMBER(p,0) as INTEGER and
+            # the other engines DECIMAL(p,0) as DECIMAL, compared by value
+            # since RT-HX2 was fixed.
             p = min(p, s + 38 - fs)
-            if s == 0 and "snowflake" in engines:
-                # RT-HX2: Snowflake NUMBER(p,0) is INTEGER, DECIMAL(p,0)
-                # elsewhere - every row differs. Kept out of generation.
-                s, p = 1, max(p, 2)
             if rng.random() < 0.15:
                 b_kind = "double"
                 p = min(p, s + 34)
@@ -286,8 +302,14 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
         if kind == "int" and rng.random() < 0.2:
             b_kind = "bigint"
         # A migration's type change that keeps every value: must compare equal.
-        widen = {"small": "int", "tiny": "int", "char": "text", "ascii": "text",
-                 "money": "dec", "ts3": "ts"}
+        widen = {
+            "small": "int",
+            "tiny": "int",
+            "char": "text",
+            "ascii": "text",
+            "money": "dec",
+            "ts3": "ts",
+        }
         if kind in widen and rng.random() < 0.3:
             b_kind = widen[kind]
             if kind == "money":
@@ -335,7 +357,9 @@ def random_case_h(seed: int, a: str, b: str, max_rows: int = 120) -> CaseH:
     return case
 
 
-def hostile_text_keys(rng: random.Random, key: list[Col], keys: list[tuple]) -> list[tuple]:
+def hostile_text_keys(
+    rng: random.Random, key: list[Col], keys: list[tuple]
+) -> list[tuple]:
     """Text key parts that differ only by case, trailing or leading space,
     tab, accent, normalisation form, a backslash or a separator - the keys a
     case- or pad-insensitive collation would merge."""
@@ -376,7 +400,14 @@ def hostile_text_keys(rng: random.Random, key: list[Col], keys: list[tuple]) -> 
     return out
 
 
-EXTRA_OPS = ["time_micro", "bytes_tweak", "uuid_tweak", "json_tweak", "colswap", "keytweak"]
+EXTRA_OPS = [
+    "time_micro",
+    "bytes_tweak",
+    "uuid_tweak",
+    "json_tweak",
+    "colswap",
+    "keytweak",
+]
 
 
 def extra_mutations(rng: random.Random, case: CaseH, engines: set[str]) -> None:
@@ -410,7 +441,9 @@ def extra_mutations(rng: random.Random, case: CaseH, engines: set[str]) -> None:
             if c.kind == "text":
                 import unicodedata
 
-                nv = rng.choice([v.swapcase(), v + " ", unicodedata.normalize("NFD", v) + "́"])
+                nv = rng.choice(
+                    [v.swapcase(), v + " ", unicodedata.normalize("NFD", v) + "́"]
+                )
             elif c.kind == "ts":
                 nv = v + dt.timedelta(microseconds=1)
             elif c.kind == "dec":
@@ -425,19 +458,31 @@ def extra_mutations(rng: random.Random, case: CaseH, engines: set[str]) -> None:
                 nv = uuid.UUID(int=v.int ^ 1)
             else:
                 continue
-            present = {tuple(fh.key_text(x[m], case.key[m].kind) for m in range(nkey))
-                       for x in [*case.rows_a, *case.rows_b]}
+            present = {
+                tuple(fh.key_text(x[m], case.key[m].kind) for m in range(nkey))
+                for x in [*case.rows_a, *case.rows_b]
+            }
             r[j] = nv
             if tuple(fh.key_text(r[m], case.key[m].kind) for m in range(nkey)) in present:
                 continue
         else:
-            cand = [nkey + j for j, c in enumerate(case.cols)
-                    if c.kind == {"time_micro": "time", "bytes_tweak": "binary",
-                                  "uuid_tweak": "uuid", "json_tweak": "json"}[op]]
+            cand = [
+                nkey + j
+                for j, c in enumerate(case.cols)
+                if c.kind
+                == {
+                    "time_micro": "time",
+                    "bytes_tweak": "binary",
+                    "uuid_tweak": "uuid",
+                    "json_tweak": "json",
+                }[op]
+            ]
             if not cand:
                 continue
             ci = rng.choice(cand)
-            nv = fh._mutate_cell(rng, op, case.cols[ci - nkey], r[ci], case.float_scale, engines)
+            nv = fh._mutate_cell(
+                rng, op, case.cols[ci - nkey], r[ci], case.float_scale, engines
+            )
             if nv is fh._SKIP:
                 continue
             r[ci] = nv
@@ -483,7 +528,9 @@ def plan_map(rng: random.Random, case: CaseH) -> None:
     case.names_b = names
 
 
-def _pred(rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]) -> tuple[str, Any]:
+def _pred(
+    rng: random.Random, case: CaseH, side: str, eng: str, names: list[str]
+) -> tuple[str, Any]:
     """One random predicate as (SQL for `eng`, a description)."""
     allc = case.all_cols
     ident = _ident(eng)
@@ -545,7 +592,9 @@ def _where_for(rng: random.Random, case: CaseH, side: str, names: list[str]) -> 
 def plan_where(rng: random.Random, case: CaseH) -> None:
     """A row filter on one or both sides, through the same RNG."""
     names_a = [c.name for c in case.all_cols]
-    names_b = case.names_b or [c.name.upper() if case.b_upper else c.name for c in case.all_cols]
+    names_b = case.names_b or [
+        c.name.upper() if case.b_upper else c.name for c in case.all_cols
+    ]
     which = rng.choice(["both_same", "both_same", "a", "b", "both"])
     state = rng.getstate()
     if which in ("both_same", "a", "both"):
@@ -685,7 +734,9 @@ def run_case_h(case: CaseH, ea: fh.Engine, eb: fh.Engine) -> OutcomeH:
                 pass
 
 
-def shrink_h(case: CaseH, ea, eb, still_bad: Callable[[OutcomeH], bool], budget: int = 150) -> CaseH:
+def shrink_h(
+    case: CaseH, ea, eb, still_bad: Callable[[OutcomeH], bool], budget: int = 150
+) -> CaseH:
     """Greedy: drop keys (halves, then singles), then columns, within `budget` runs."""
     nkey = len(case.key)
     runs = 0
@@ -725,7 +776,9 @@ def shrink_h(case: CaseH, ea, eb, still_bad: Callable[[OutcomeH], bool], budget:
             if len(best.cols) <= 1 or runs >= budget:
                 break
             name = best.cols[ci].name
-            if (best.columns_arg and name in best.columns_arg) or name in best.exclude_arg:
+            if (
+                best.columns_arg and name in best.columns_arg
+            ) or name in best.exclude_arg:
                 continue
             if name in best.column_map or best.where_a or best.where_b:
                 continue
@@ -736,7 +789,9 @@ def shrink_h(case: CaseH, ea, eb, still_bad: Callable[[OutcomeH], bool], budget:
                 rows_a=[r[:pos] + r[pos + 1 :] for r in best.rows_a],
                 rows_b=[r[:pos] + r[pos + 1 :] for r in best.rows_b],
                 mutations=list(best.mutations),
-                names_b=(best.names_b[:pos] + best.names_b[pos + 1 :]) if best.names_b else None,
+                names_b=(best.names_b[:pos] + best.names_b[pos + 1 :])
+                if best.names_b
+                else None,
             )
             if bad(trial):
                 best, changed = trial, True
@@ -771,9 +826,13 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", type=int, default=100)
-    ap.add_argument("--minutes", type=float, default=0, help="per pair, overrides --cases")
+    ap.add_argument(
+        "--minutes", type=float, default=0, help="per pair, overrides --cases"
+    )
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--pairs", default="", help="comma list like mssql-postgres,duckdb-duckdb")
+    ap.add_argument(
+        "--pairs", default="", help="comma list like mssql-postgres,duckdb-duckdb"
+    )
     ap.add_argument("--max-rows", type=int, default=120)
     ap.add_argument("--no-shrink", action="store_true")
     ap.add_argument("--log", default="")

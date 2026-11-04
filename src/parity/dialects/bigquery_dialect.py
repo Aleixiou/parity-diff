@@ -446,7 +446,15 @@ class BigQueryDialect(Dialect):
             # the other engines print `0.000000`. ROUND is half away from zero,
             # as DuckDB's decimal cast and PostgreSQL's round() are; verified on
             # 312 decimals, halfway cases included.
-            expr = f"format({fmt}, round({c}, {s}))"
+            num = c
+            if map_type_bigquery(column.raw_type) is LogicalType.INTEGER:
+                # An INT64 compared against a decimal takes this rule (the
+                # engine's `_integer_as_decimal`, RT-HX2). ROUND of an INT64
+                # is FLOAT64, which rounds past 2^53 - two distinct integers
+                # could print alike - so it goes through NUMERIC, whose 29
+                # integer digits hold every INT64 exactly.
+                num = f"cast({c} as numeric)"
+            expr = f"format({fmt}, round({num}, {s}))"
         elif t is LogicalType.FLOAT:
             # Finite values follow `canonical_float_text` (base.py): below 2^53
             # the shortest round-trip decimal, rounded half away from zero.

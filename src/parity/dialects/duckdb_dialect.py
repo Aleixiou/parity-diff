@@ -187,6 +187,19 @@ def parse_duckdb_type(raw: str) -> DuckType:
 _LOSSY_NESTED_SCALARS = frozenset({"TIMETZ", "TIME WITH TIME ZONE", "VARIANT"})
 
 
+def _restore_leading_zero(text: str) -> str:
+    """`text`, the varchar cast of a DECIMAL with no integer digit (`.25`,
+    `-.5`), with the zero every other engine prints restored (RT-HX1).
+
+    Tested on the text, not the value: a negative value that rounds to zero
+    prints without its sign, so `c < 0` would have prefixed `-0` to `.000`.
+    """
+    return (
+        f"case when starts_with({text}, '-') then '-0' || substr({text}, 2) "
+        f"else '0' || {text} end"
+    )
+
+
 def _needs_nested_rule(t: DuckType, *, top: bool) -> bool:
     """Whether `t` must be rendered part by part (`DuckDBDialect._nested`).
 
@@ -552,6 +565,12 @@ class DuckDBDialect(Dialect):
             )
         elif t is LogicalType.DECIMAL:
             expr = f"cast(cast({c} as decimal(38,{self.float_scale})) as varchar)"
+            if self.float_scale >= 38:
+                # decimal(38,38) has no integer digit, and DuckDB then prints
+                # no leading zero (`.5`, RT-HX1); every other engine prints
+                # `0.5`. Below scale 38 the cast keeps one, so only this
+                # scale's SQL changes.
+                expr = _restore_leading_zero(expr)
         elif t is LogicalType.BOOLEAN:
             # `else` must not swallow NULL. With `case when c then 'true' else
             # 'false' end` a NULL boolean renders as 'false' - identical to a
@@ -893,8 +912,19 @@ class DuckDBDialect(Dialect):
 
     def decimal_key_text(self, c: str, column: Column) -> str:
         """DECIMAL's varchar cast is exact and plain, at the declared scale;
-        drop the trailing fractional zeros that scale adds."""
+        drop the trailing fractional zeros that scale adds.
+
+        A DECIMAL(p,p) has no integer digit, and its varchar cast then has no
+        leading zero either: `.25`, `-.517439`, where the rule (and DuckDB's
+        own DECIMAL(10,6)) says `0.25`. Every fractional key of such a column
+        matched nothing and read as only_in_a plus only_in_b (RT-HX1), so the
+        zero is restored for that shape only; every other DECIMAL key renders
+        exactly the SQL it did.
+        """
         t = f"cast({c} as varchar)"
+        shape = re.fullmatch(r"\s*DECIMAL\((\d+),\s*(\d+)\)\s*", column.raw_type.upper())
+        if shape and shape.group(1) == shape.group(2):
+            t = _restore_leading_zero(t)
         return (
             f"case when {c} = 0 then '0' "
             f"when contains({t}, '.') then rtrim(rtrim({t}, '0'), '.') "

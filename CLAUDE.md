@@ -1043,6 +1043,16 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   as text + `` + their send hex, or are refused (no send function, or
   nested); dates past 294276-12-31 render via `::text`; a hashed key's NULL
   check uses `num_nulls`; `connect_timeout` defaults to 30 s.
+- **INTEGER against DECIMAL compares by value** (RT-HX2, `_integer_as_decimal`
+  in engine.py). Whether a scale-0 decimal is an integer is the engine's call:
+  Snowflake reports INT, BIGINT, NUMBER(19,0) and NUMBER(14,0) all as
+  `NUMBER` with scale 0 (measured live), so it, like Oracle, maps them
+  INTEGER, while PostgreSQL/DuckDB keep numeric(14,0) DECIMAL. No one-sided
+  mapping is right, so the engine renders the INTEGER side of such a pair
+  through the DECIMAL rule (BigQuery via `cast(.. as numeric)`: ROUND of
+  INT64 is FLOAT64). Same-type pairs are untouched. A DuckDB DECIMAL(p,p)
+  prints no leading zero (`.25`); its key text, and its value at float scale
+  38, restore it (RT-HX1).
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,

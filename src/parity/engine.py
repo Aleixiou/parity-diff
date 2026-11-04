@@ -420,7 +420,13 @@ def _resolve_key(
     # the same mismatch is already named in `_select_columns`.
     for ca, cb in zip(a_key, b_key, strict=True):
         ta, tb = ca.logical_type, cb.logical_type
-        if not _renders_alike(ta, tb) and not ({ta, tb} & _TEXTUAL):
+        # An integer key against a decimal one renders alike: a decimal key
+        # is its minimal exact text, `42` where the integer is `42`.
+        if (
+            not _renders_alike(ta, tb)
+            and not ({ta, tb} & _TEXTUAL)
+            and {ta, tb} != _INTEGER_DECIMAL
+        ):
             warnings.append(
                 f"key column {ca.name!r} is {_type_label(ca)} on side A but "
                 f"{_type_label(cb)} on side B; the two types render the same "
@@ -456,6 +462,43 @@ def _resolve_key(
         )
 
     return KeySpec(a_key, hashed), KeySpec(b_key, hashed)
+
+
+#: An integer on one side and a decimal on the other. Both hold exact numbers,
+#: so the pair is compared by value: the integer side renders through the
+#: DECIMAL rule (`_integer_as_decimal`).
+_INTEGER_DECIMAL = frozenset({LogicalType.INTEGER, LogicalType.DECIMAL})
+
+
+def _integer_as_decimal(
+    a_cols: list[Column], b_cols: list[Column]
+) -> tuple[list[Column], list[Column]]:
+    """Render an INTEGER column compared against a DECIMAL one as a DECIMAL.
+
+    Engines disagree on whether a scale-0 decimal is an integer: Snowflake
+    and Oracle have only NUMBER, and read NUMBER(14,0) as INTEGER, while
+    PostgreSQL's numeric(14,0) and DuckDB's DECIMAL(14,0) stay DECIMAL. A
+    faithful migration then compared `41886` against `41886.000000` and
+    reported every row as different (RT-HX2) - and so did a bigint migrated
+    to numeric(18,0) on any engine pair. No mapping fixes that from one side,
+    since Snowflake's INT is NUMBER(38,0) and a bigint can land as either.
+
+    So the pair is reconciled here, from both sides' types: the integer
+    column takes the DECIMAL rule, which every dialect applies exactly to an
+    integer operand (an integer has no places to round), and the pair
+    compares by value at the float scale, as DECIMAL against DECIMAL does.
+    Only such pairs change; a same-type pair renders exactly as before. Keys
+    need nothing: `normalize_key` already renders a decimal key as its
+    minimal exact text, `42` like an integer key.
+    """
+    a_out, b_out = list(a_cols), list(b_cols)
+    for i, (ca, cb) in enumerate(zip(a_cols, b_cols, strict=True)):
+        if {ca.logical_type, cb.logical_type} == _INTEGER_DECIMAL:
+            if ca.logical_type is LogicalType.INTEGER:
+                a_out[i] = dataclasses.replace(ca, logical_type=LogicalType.DECIMAL)
+            else:
+                b_out[i] = dataclasses.replace(cb, logical_type=LogicalType.DECIMAL)
+    return a_out, b_out
 
 
 def _select_columns(
@@ -557,6 +600,17 @@ def _select_columns(
         name = cols_a[f].name
         ta, tb = cols_a[f].logical_type, cols_b[f].logical_type
         if ta is tb or {ta, tb} <= _NUMERIC_EQUIVALENT:
+            continue
+        if {ta, tb} == _INTEGER_DECIMAL:
+            # Compared by value (`_integer_as_decimal`), so no row differs
+            # for the type alone - but a decimal with places compared against
+            # an integer is a schema change worth naming, and the comparison
+            # is at the float scale, not exact.
+            warnings.append(
+                f"column {name!r} is {_type_label(cols_a[f])} on side A but "
+                f"{_type_label(cols_b[f])} on side B; compared by value, both "
+                f"rendered as decimals at the float scale"
+            )
             continue
         what = (
             f"column {name!r} is {_type_label(cols_a[f])} on side A but "
@@ -778,6 +832,7 @@ def diff(
             if a.holds_sub_micro(ca) and b.holds_sub_micro(cb):
                 a_cols[i] = dataclasses.replace(ca, sub_micro=True)
                 b_cols[i] = dataclasses.replace(cb, sub_micro=True)
+        a_cols, b_cols = _integer_as_decimal(a_cols, b_cols)
         # JSON is compared as each engine's normal form, and the engines
         # normalise differently (key order, duplicate keys, number spelling).
         # Equal text is always the same document, so this can only cost false

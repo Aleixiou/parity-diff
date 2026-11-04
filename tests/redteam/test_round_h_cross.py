@@ -25,19 +25,19 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import float_fresh  # noqa: E402
-import fuzz_cross as fx  # noqa: E402
-import fuzz_harness as fh  # noqa: E402
-from conftest import (  # noqa: E402
+import float_fresh
+import fuzz_cross as fx
+import fuzz_harness as fh
+from conftest import (
     _bigquery_available,
     _mssql_available,
     _mysql_available,
     _pg_available,
     _snowflake_available,
 )
-from test_fuzz import _duck, _found, _run  # noqa: E402
+from test_fuzz import _duck, _found, _run
 
-from parity.dialects.base import canonical_float_text  # noqa: E402
+from parity.dialects.base import canonical_float_text
 
 CASES = int(os.environ.get("PARITY_RTH_CASES", "6"))
 SEED = int(os.environ.get("PARITY_RTH_SEED", "1"))
@@ -60,7 +60,7 @@ def _available(name: str) -> tuple[bool, str]:
     }[name]()
 
 
-PAIRS = fx.all_pairs(list(fx.LOCAL)) + [("bigquery", "duckdb"), ("snowflake", "duckdb")]
+PAIRS = [*fx.all_pairs(list(fx.LOCAL)), ("bigquery", "duckdb"), ("snowflake", "duckdb")]
 
 
 @pytest.mark.parametrize(("a", "b"), PAIRS, ids=lambda x: x)
@@ -138,8 +138,15 @@ def test_a_filter_that_changes_between_queries_is_never_identical(
         b = _duck(tmp_path, f"b{_}", "id int, v int", rows)
         try:
             r = fx.diff(
-                a, b, "t", "t", key="id", where_a=where_a, where_b=where_b,
-                threshold=50, bisection_factor=4,
+                a,
+                b,
+                "t",
+                "t",
+                key="id",
+                where_a=where_a,
+                where_b=where_b,
+                threshold=50,
+                bisection_factor=4,
             )
         finally:
             a.close()
@@ -180,11 +187,6 @@ def test_fresh_random_doubles_render_the_spec_on_duckdb(tmp_path):
 # *correct* behaviour: a strict xfail while open, an XPASS the day it is fixed.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HX1: DuckDB renders a DECIMAL(p,p) key without its leading zero "
-    "('.25', '-.5'), so it pairs with no other engine's '0.25' (false alarm)",
-)
 def test_rt_hx1_duckdb_decimal_key_without_integer_digits_matches(tmp_path):
     """Fuzz seed 12000035 (duckdb->duckdb, key decimal(6,6)) reported key
     `-.517439` where the rules say `-0.517439` (`decimal_key_text`: `-0.25`).
@@ -197,10 +199,6 @@ def test_rt_hx1_duckdb_decimal_key_without_integer_digits_matches(tmp_path):
 
 
 @pytest.mark.postgres
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HX1: DuckDB DECIMAL(p,p) key '.25' never matches PostgreSQL's '0.25'",
-)
 def test_rt_hx1_duckdb_decimal_pp_key_against_postgres(pg_url, tmp_path):
     """RT-HX1 across engines: numeric(6,6) on PostgreSQL, decimal(6,6) on
     DuckDB, the same keys, one planted value difference."""
@@ -222,11 +220,6 @@ def test_rt_hx1_duckdb_decimal_pp_key_against_postgres(pg_url, tmp_path):
 
 
 @pytest.mark.snowflake
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HX2: Snowflake NUMBER(p,0) is read as INTEGER, DECIMAL(p,0) "
-    "elsewhere as DECIMAL - every row of a faithful migration differs",
-)
 def test_rt_hx2_snowflake_number_p_0_matches_a_decimal_p_0(snowflake_url, tmp_path):
     """Fuzz seeds 32000004 and 32000014 (snowflake<->duckdb): NUMBER(14,0)
     and NUMBER(1,0) holding exactly what DuckDB's DECIMAL(14,0) holds were
@@ -240,7 +233,9 @@ def test_rt_hx2_snowflake_number_p_0_matches_a_decimal_p_0(snowflake_url, tmp_pa
     w = open_snowflake(snowflake_url, side="A")
     cur = w._conn.cursor()
     try:
-        cur.execute(f"create or replace table {name} (id integer, amount number(14,0), note varchar)")
+        cur.execute(
+            f"create or replace table {name} (id integer, amount number(14,0), note varchar)"
+        )
         cur.execute(f"insert into {name} values (1, 41886, 'x'), (2, 0, 'y')")
         path = str(tmp_path / "b.duckdb")
         con = duckdb_write(path)
@@ -252,7 +247,169 @@ def test_rt_hx2_snowflake_number_p_0_matches_a_decimal_p_0(snowflake_url, tmp_pa
         # Side A's stored spelling (NOTE) names the column.
         found = [(k, kind, [c.lower() for c in cols]) for k, kind, cols in _found(result)]
         assert found == [(2, "different", ["note"])]
+        assert any("compared by value" in w for w in result.warnings), result.warnings
     finally:
         cur.execute(f"drop table if exists {name}")
         cur.close()
         w.close()
+
+
+def test_rt_hx1_decimal_38_38_values_keep_their_leading_zero():
+    """RT-HX1 for values: at float_scale 38 DuckDB's rendering cast is
+    decimal(38,38), which also prints `.5`; PostgreSQL prints `0.5`. The
+    zero is restored (only at that scale). Planted: one value."""
+    import duckdb
+
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+    from parity.types import Column, LogicalType
+
+    con = duckdb.connect()
+    con.execute("create table t (i int, x decimal(38,38))")
+    con.execute("insert into t values (1, 0.5), (2, -0.25), (3, 0), (4, null)")
+    d = DuckDBDialect(float_scale=38)
+    expr = d.normalize(Column("x", LogicalType.DECIMAL, "DECIMAL(38,38)"))
+    got = dict(con.execute(f"select i, {expr} from t").fetchall())
+    z = "0" * 38
+    assert got == {1: "0.5" + z[1:], 2: "-0.25" + z[2:], 3: "0." + z, 4: "\\N"}
+    # Planted: the neighbouring value renders differently.
+    assert got[1] != got[2]
+
+
+def test_rt_hx1_only_a_decimal_p_p_key_changes_its_sql():
+    """The repair is scoped: DECIMAL(10,6) and DECIMAL(18,0) keys render the
+    SQL they always did, so no other key checksum moves."""
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+    from parity.types import Column, LogicalType
+
+    d = DuckDBDialect()
+    old = (
+        "case when \"k\" = 0 then '0' when contains(cast(\"k\" as varchar), '.') "
+        "then rtrim(rtrim(cast(\"k\" as varchar), '0'), '.') else cast(\"k\" as varchar) end"
+    )
+    for raw in ("DECIMAL(10,6)", "DECIMAL(18,0)", "DECIMAL(38,10)"):
+        assert d.decimal_key_text('"k"', Column("k", LogicalType.DECIMAL, raw)) == old
+    assert "starts_with" in d.decimal_key_text(
+        '"k"', Column("k", LogicalType.DECIMAL, "DECIMAL(6,6)")
+    )
+
+
+@pytest.mark.parametrize(
+    ("ddl_b", "rows_b", "found"),
+    [
+        # A faithful migration to a scale-0 decimal: only the planted note.
+        (
+            "decimal(14,0)",
+            ["(1, 41886, 'x')", "(2, 0, 'z')", "(3, -7, 'w')"],
+            [(2, "different", ["note"])],
+        ),
+        # Places: 41886.5 is not 41886, at any scale.
+        (
+            "decimal(14,2)",
+            ["(1, 41886.5, 'x')", "(2, 0, 'y')", "(3, -7, 'w')"],
+            [(1, "different", ["amount"])],
+        ),
+        # Within the float scale: 7e-7 rounds to 0.000001, never to zero.
+        (
+            "decimal(14,7)",
+            ["(1, 41886, 'x')", "(2, 0.0000007, 'y')", "(3, -7, 'w')"],
+            [(2, "different", ["amount"])],
+        ),
+        # NULL against 0 is a difference too.
+        (
+            "decimal(14,0)",
+            ["(1, 41886, 'x')", "(2, null, 'y')", "(3, -7, 'w')"],
+            [(2, "different", ["amount"])],
+        ),
+    ],
+)
+def test_rt_hx2_an_integer_column_compares_by_value_with_a_decimal(
+    tmp_path, ddl_b, rows_b, found
+):
+    """RT-HX2 on one engine: bigint against a decimal compared `41886` with
+    `41886.000000` and reported every row. Now both render as decimals."""
+    a = _duck(
+        tmp_path,
+        "a",
+        "id int, amount bigint, note varchar",
+        "(1, 41886, 'x')",
+        "(2, 0, 'y')",
+        "(3, -7, 'w')",
+        side="A",
+    )
+    b = _duck(tmp_path, "b", f"id int, amount {ddl_b}, note varchar", *rows_b)
+    result = _run(a, b)
+    assert _found(result) == found
+    assert not result.identical
+    (note,) = [w for w in result.warnings if w.startswith("column 'amount'")]
+    assert "compared by value" in note and "BIGINT" in note
+
+
+def test_rt_hx2_only_a_mixed_integer_decimal_pair_is_reconciled():
+    """A same-type pair keeps its Columns, so its SQL - and every ordinary
+    checksum - is what it was; INTEGER against FLOAT is left alone too."""
+    from parity.engine import _integer_as_decimal
+    from parity.types import Column, LogicalType
+
+    i = Column("v", LogicalType.INTEGER, "BIGINT")
+    d = Column("v", LogicalType.DECIMAL, "DECIMAL(14,0)")
+    f = Column("v", LogicalType.FLOAT, "DOUBLE")
+    assert _integer_as_decimal([i, d, f], [i, d, i]) == ([i, d, f], [i, d, i])
+    a, b = _integer_as_decimal([i, d], [d, i])
+    assert [c.logical_type for c in a + b] == [LogicalType.DECIMAL] * 4
+    assert a[0].raw_type == "BIGINT" and b[1].raw_type == "BIGINT"
+
+
+def test_rt_hx2_an_integer_key_against_a_decimal_key_is_not_warned(tmp_path):
+    """A decimal key renders its minimal exact text, so integer 42 and
+    decimal(18,0) 42 are one key - no 'every row will report' warning, and
+    the planted deletion is the only difference."""
+    a = _duck(tmp_path, "a", "id bigint, v int", "(1, 1)", "(2, 2)", "(3, 3)", side="A")
+    b = _duck(tmp_path, "b", "id decimal(18,0), v int", "(1, 1)", "(3, 3)")
+    result = _run(a, b)
+    # Hashed (the types differ), so the key is reported as its text.
+    assert _found(result) == [("2", "only_in_a", ["v"])]
+    assert not any(w.startswith("key column") for w in result.warnings), result.warnings
+
+
+def test_rt_hx2_bigquery_renders_an_int64_through_numeric():
+    """An INT64 under the DECIMAL rule would ROUND to FLOAT64 and lose
+    integers past 2^53; it goes through NUMERIC. A NUMERIC column's SQL is
+    unchanged."""
+    from parity.dialects.bigquery_dialect import BigQueryDialect
+    from parity.types import Column, LogicalType
+
+    d = BigQueryDialect()
+    numeric = d.normalize(Column("v", LogicalType.DECIMAL, "NUMERIC(14, 0)"))
+    assert "round(`v`, 6)" in numeric and "as numeric" not in numeric
+    int64 = d.normalize(Column("v", LogicalType.DECIMAL, "INT64"))
+    assert "round(cast(`v` as numeric), 6)" in int64
+
+
+@pytest.mark.postgres
+def test_rt_hx2_postgres_bigint_against_duckdb_decimal(pg_url, tmp_path):
+    """RT-HX2 across engines: PostgreSQL bigint against DuckDB decimal(18,0),
+    PostgreSQL numeric(14,0) against DuckDB BIGINT (past 2^53 too), the same
+    values, one planted value difference."""
+    import psycopg
+
+    from parity.dialects.base import get_dialect
+
+    con = psycopg.connect(pg_url, autocommit=True)
+    name = f"rth_x_hx2_{os.getpid()}"
+    try:
+        con.execute(f"create table public.{name} (id int, a bigint, b numeric(18,0))")
+        con.execute(
+            f"insert into public.{name} values (1, 41886, 9007199254740993), (2, -7, 0)"
+        )
+        d = _duck(
+            tmp_path,
+            "b",
+            "id int, a decimal(18,0), b bigint",
+            "(1, 41886, 9007199254740993)",
+            "(2, -7, 1)",
+        )
+        result = _run(get_dialect(pg_url, side="A"), d, ta=f"public.{name}")
+        assert _found(result) == [(2, "different", ["b"])]
+    finally:
+        con.execute(f"drop table if exists public.{name}")
+        con.close()
