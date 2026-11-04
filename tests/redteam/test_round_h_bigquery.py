@@ -169,52 +169,34 @@ def nested(bq):
     return a, b
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB1: ARRAY renders through FORMAT('%t') with strings unquoted, so "
-    "['a, b'] equals ['a', 'b'] and [''] equals [] - a false match",
-)
 def test_array_elements_keep_their_boundaries(bigquery_url, nested):
     result = _bq_bq(bigquery_url, *nested, columns=["arr"])
     assert _found(result) == [(2, "different", ["arr"]), (3, "different", ["arr"])]
 
 
 def test_array_unquoted_strings_collide_in_the_rendering_itself(bq):
-    """The mechanism behind RT-HB1, pinned on literals: if BigQuery ever
-    quotes strings in '%t', this fails and RT-HB1 must be re-examined."""
+    """The mechanism behind RT-HB1, pinned on literals: '%t' itself still
+    collides (so it must never come back), and the dialect's rendering -
+    `canonical_list_text` since the fix - keeps the four apart."""
     run, *_ = bq
-    got = run(
-        "select "
-        + ", ".join(
-            "(" + _render(t, v) + ")"
-            for t, v in [
-                ("ARRAY<STRING>", "['a, b']"),
-                ("ARRAY<STRING>", "['a', 'b']"),
-                ("ARRAY<BYTES>", "[b'a, b']"),
-                ("ARRAY<BYTES>", "[b'a', b'b']"),
-            ]
-        )
-    )[0]
-    assert got[0] == got[1] == "[a, b]"
-    assert got[2] == got[3] == "[a, b]"
+    cases = [
+        ("ARRAY<STRING>", "['a, b']"),
+        ("ARRAY<STRING>", "['a', 'b']"),
+        ("ARRAY<BYTES>", "[b'a, b']"),
+        ("ARRAY<BYTES>", "[b'a', b'b']"),
+    ]
+    raw = run("select " + ", ".join(f"format('%t', {v})" for _, v in cases))[0]
+    assert raw[0] == raw[1] == "[a, b]"
+    assert raw[2] == raw[3] == "[a, b]"
+    got = run("select " + ", ".join("(" + _render(t, v) + ")" for t, v in cases))[0]
+    assert len(set(got)) == 4, got
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB2: STRUCT renders through FORMAT('%t'): ('a, b', 'c') equals "
-    "('a', 'b, c'), and a NULL field equals the string 'NULL' - a false match",
-)
 def test_struct_fields_keep_their_boundaries_and_nulls(bigquery_url, nested):
     result = _bq_bq(bigquery_url, *nested, columns=["st"])
     assert _found(result) == [(2, "different", ["st"]), (3, "different", ["st"])]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB3: GEOGRAPHY renders as WKT with 15 significant digits, so "
-    "points stored with different coordinates (ST_X 0.9999999999999998 vs 1.0) "
-    "compare identical - a false match",
-)
 def test_geography_points_that_are_stored_differently_differ(bigquery_url, nested, bq):
     run, _, ds, _ = bq
     a, b = nested

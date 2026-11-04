@@ -395,6 +395,35 @@ def canonical_list_text(elements: Sequence[str], dims: str | None = None) -> str
     return head + "".join(e + LIST_TERMINATOR for e in elements) + "]"
 
 
+#: Between a struct field's name and its value: a backslash and `=`. Like the
+#: terminator, no field name (escaped) or value text can hold it.
+STRUCT_FIELD_MARK = "\\="
+
+
+def canonical_struct_text(fields: Sequence[tuple[str, str]]) -> str:
+    r"""A struct's canonical text, from its fields' names and value texts.
+
+    `{` + per field, in declared order: the name escaped as text, then
+    `STRUCT_FIELD_MARK`, then the value by its own type's rule (NULL as the
+    sentinel), then `LIST_TERMINATOR`; then `}`. So `('a, b', 'c')` is
+    `{x\=a, b\,y\=c\,}` and never `('a', 'b, c')`'s `{x\=a\,y\=b, c\,}`, a
+    NULL field is `\N` and the string 'NULL' is `NULL`, and a renamed field
+    differs. For a given struct type the text decodes one way only: it
+    starts with `{`, so it is never the sentinel, and no name or value can
+    forge a mark or a terminator. Rendered by BigQuery (RT-HB2); a STRUCT
+    stays UNKNOWN to the engine - the sample check does not read it - and
+    is compared only against a struct rendered by the same rule.
+    """
+    return (
+        "{"
+        + "".join(
+            escape_canonical_text(name) + STRUCT_FIELD_MARK + text + LIST_TERMINATOR
+            for name, text in fields
+        )
+        + "}"
+    )
+
+
 def canonical_inet_text(packed: bytes, prefix: int) -> str:
     """A PostgreSQL inet/cidr value's canonical text: `address/prefix`.
 

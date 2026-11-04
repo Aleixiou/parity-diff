@@ -76,7 +76,9 @@ def test_ordinary_bracket_and_quote_spellings_pass(predicate):
 
 
 @pytest.mark.parametrize(
-    "dialect", [d for d in DIALECTS if d is not SQLServerDialect], ids=lambda d: d.__name__
+    "dialect",
+    [d for d in DIALECTS if d is not SQLServerDialect],
+    ids=lambda d: d.__name__,
 )
 def test_ordinary_spellings_pass_each_dialect(dialect):
     """SQL Server is left out: its own guard refuses a double quote."""

@@ -62,6 +62,7 @@ The BigQuery-specific decisions, each confirmed by that run:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import parse_qs, unquote
@@ -71,7 +72,9 @@ from parity.dialects.base import (
     FLOAT_MAX_MAGNITUDE_SQL,
     FLOAT_OUT_OF_RANGE_MESSAGE,
     HASH_HEX_CHARS,
+    LIST_ELEMENT_TYPES,
     Dialect,
+    escape_canonical_text,
     float_tiny_sql,
     float_zero_text,
 )
@@ -312,7 +315,9 @@ class BigQueryDialect(Dialect):
             self._live[(project, dataset, name)] = kind
         return [_column(str(r[0]), str(r[1])) for r in rows]
 
-    def _location_hint(self, project: str, dataset: str) -> str:  # pragma: no cover - live
+    def _location_hint(
+        self, project: str, dataset: str
+    ) -> str:  # pragma: no cover - live
         """Name the dataset's location when it is not where jobs run.
 
         A job runs in one location and cannot read a dataset in another, and
@@ -324,7 +329,7 @@ class BigQueryDialect(Dialect):
         here = self._location or "the dataset's default location"
         try:
             found = self._client.get_dataset(f"{project}.{dataset}").location
-        except Exception:
+        except Exception:  # noqa: BLE001 - a hint only; the real error follows
             return (
                 f"; or it is in another location than this connection's jobs "
                 f"({here}): add ?location=<its region> to the connection string"
@@ -542,16 +547,87 @@ class BigQueryDialect(Dialect):
             # false match, unless NULL is kept NULL for the coalesce first.
             text = f"if({c} is null, null, to_json_string({c}))"
             expr = self.escape_text(self.json_compact_layout(text))
+        elif t is LogicalType.LIST:
+            expr = self._array_text(column)
         else:
-            # Anything else (ARRAY, STRUCT, INTERVAL, ...) through
-            # FORMAT('%t'), which renders every type - CAST to STRING raises on
-            # ARRAY/STRUCT and would kill the diff. But '%t' renders NULL as the
-            # *string* 'NULL', which would slip past the coalesce and compare
-            # equal to a real 'NULL' on the other side; hence the explicit guard.
-            # Arbitrary text (strings inside arrays and structs, JSON), so
-            # escaped like STRING.
-            expr = self.escape_text(f"if({c} is null, null, format('%t', {c}))")
+            expr = self._unknown_text(column)
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    #: The `WITH OFFSET` alias an array's elements are ordered by.
+    LIST_OFFSET_NAME = "__parity_offset"
+
+    def list_element(self, column: Column) -> Column:
+        """The element of an `ARRAY<T>` column: `T`, by BigQuery's own map."""
+        raw = column.raw_type.strip()
+        if not (raw.upper().startswith("ARRAY<") and raw.endswith(">")):
+            raise self._err(f"column {column.name!r} ({column.raw_type}) is not an array")
+        return _column(self.LIST_ELEMENT_NAME, raw[6:-1].strip())
+
+    def _array_text(self, column: Column) -> str:
+        """An ARRAY as `canonical_list_text`: each element by its own rule.
+
+        The elements in storage order (`WITH OFFSET`), each followed by the
+        terminator, joined; an empty array joins to NULL, hence `ifnull`,
+        and renders `[]`. '%t' printed `[a, b]` with strings unquoted, so
+        ['a, b'] equalled ['a', 'b'] and [''] equalled [] (RT-HB1). A table
+        cannot hold a NULL array (it stores one as empty) or a NULL element;
+        a view's may, and they render the sentinel. Elements without a list
+        rule (STRUCT, GEOGRAPHY, JSON, INTERVAL) render by this dialect's
+        own injective text and keep the column UNKNOWN.
+        """
+        c = self.quote(column.name)
+        if column.logical_type is LogicalType.LIST:
+            element = self.list_element_text(column)
+        else:
+            element = self.normalize(self.list_element(column))
+        var = self.quote(self.LIST_ELEMENT_NAME)
+        off = self.quote(self.LIST_OFFSET_NAME)
+        each = self.concat_sql(element, self.list_terminator_sql())
+        return (
+            f"if({c} is null, null, concat('[', ifnull((select string_agg({each}, '' "
+            f"order by {off}) from unnest({c}) as {var} with offset as {off}), ''), ']'))"
+        )
+
+    def _unknown_text(self, column: Column) -> str:
+        """Text for a type with no shared rule - injective on BigQuery.
+
+        STRUCT renders by `canonical_struct_text`: each field by its own
+        rule, named (RT-HB2: '%t' printed `(a, b, c)` for both ('a, b', 'c')
+        and ('a', 'b, c'), and a NULL field as the string 'NULL'). The fields
+        are read through `unnest([c])`, which turns them into columns the
+        field rules can name. A struct with anonymous fields (only a view's
+        can have them) cannot be read that way and renders as TO_JSON_STRING,
+        which quotes strings and prints floats to round-trip precision.
+        ARRAY of such an element follows `canonical_list_text` too. GEOGRAPHY
+        renders as its WKB, exactly (RT-HB3: WKT kept 15 significant digits,
+        so points stored differently compared equal). Anything else
+        (INTERVAL, RANGE) through FORMAT('%t'), which prints each component
+        exactly. '%t' renders NULL as the *string* 'NULL', which would slip
+        past the coalesce, hence the guard. Text values inside are escaped
+        like STRING.
+        """
+        c = self.quote(column.name)
+        raw = column.raw_type.strip()
+        up = raw.upper()
+        if up.startswith("ARRAY<") and raw.endswith(">"):
+            return self._array_text(column)
+        if up.startswith("STRUCT<") and raw.endswith(">"):
+            fields = _struct_fields(raw[7:-1])
+            if fields is None:
+                return self.escape_text(f"if({c} is null, null, to_json_string({c}))")
+            mark = self.concat_sql(self.backslash_sql(), "'='")
+            parts = ", ".join(
+                f"{self.string_literal(escape_canonical_text(name))}, {mark}, "
+                f"{self.normalize(_column(name, kind))}, {self.list_terminator_sql()}"
+                for name, kind in fields
+            )
+            return (
+                f"if({c} is null, null, (select concat('{{', {parts}, '}}') "
+                f"from unnest([{c}])))"
+            )
+        if up == "GEOGRAPHY":
+            return f"to_hex(st_asbinary({c}))"
+        return self.escape_text(f"if({c} is null, null, format('%t', {c}))")
 
     def concat_sql(self, left: str, right: str) -> str:
         """`concat()`, the spelling the sentinel has always used here."""
@@ -682,6 +758,68 @@ def _split_table_name(table: str) -> list[str] | None:
     return parts
 
 
+def _split_top_level(body: str) -> list[str]:
+    """`body` split at commas outside `<>`, `()`, backticks and quotes."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == "\\":
+                i += 1  # an escaped character inside a quoted name
+            elif ch == quote:
+                quote = ""
+        elif ch in "`'\"":
+            quote = ch
+        elif ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+        i += 1
+    parts.append(body[start:])
+    return parts
+
+
+_FIELD = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\s+(\S.*)$", re.S)
+
+
+def _struct_fields(body: str) -> list[tuple[str, str]] | None:
+    """The (name, type) fields of `STRUCT<body>`, or None for anonymous ones.
+
+    INFORMATION_SCHEMA prints `STRUCT<x STRING, y NUMERIC(10, 2)>`, a name
+    that needs quoting in backticks. A field with no name (`STRUCT<INT64>`,
+    possible in a view) cannot be selected by name, so the struct is read
+    another way.
+    """
+    fields: list[tuple[str, str]] = []
+    for part in _split_top_level(body):
+        part = part.strip()
+        if part.startswith("`"):
+            end = 1
+            name = ""
+            while end < len(part) and part[end] != "`":
+                if part[end] == "\\" and end + 1 < len(part):
+                    end += 1
+                name += part[end]
+                end += 1
+            kind = part[end + 1 :].strip()
+            if end >= len(part) or not kind:
+                return None
+            fields.append((name, kind))
+            continue
+        match = _FIELD.match(part)
+        if not match:
+            return None
+        fields.append((match.group(1), match.group(2).strip()))
+    return fields or None
+
+
 def _column(name: str, raw: str) -> Column:
     """Build a Column, marking TIMESTAMP as an instant and DATETIME as naive."""
     t = raw.upper()
@@ -698,9 +836,15 @@ def map_type_bigquery(raw: str) -> LogicalType:
 
     INFORMATION_SCHEMA reports parameterised types as `NUMERIC(12, 2)` and
     `STRING(20)`, and aliases such as SMALLINT as INT64; strip the parameters.
-    Composite types (`ARRAY<INT64>`, `STRUCT<...>`) fall through to UNKNOWN.
+    An ARRAY whose element has a list rule is a LIST (`ARRAY<STRING(10)>`
+    included); any other ARRAY, STRUCT, GEOGRAPHY, INTERVAL and RANGE are
+    UNKNOWN, rendered injectively by the dialect (`_unknown_text`).
     """
-    t = raw.upper().split("(")[0].strip()
+    stripped = raw.strip()
+    if stripped.upper().startswith("ARRAY<") and stripped.endswith(">"):
+        element = map_type_bigquery(stripped[6:-1])
+        return LogicalType.LIST if element in LIST_ELEMENT_TYPES else LogicalType.UNKNOWN
+    t = raw.upper().split("(")[0].split("<")[0].strip()
     if t in {"INT64", "INTEGER", "INT", "SMALLINT", "BIGINT", "TINYINT", "BYTEINT"}:
         return LogicalType.INTEGER
     if t in {"NUMERIC", "DECIMAL", "BIGNUMERIC", "BIGDECIMAL"}:
