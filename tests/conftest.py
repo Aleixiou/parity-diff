@@ -54,6 +54,7 @@ class SecretUrl(str):
     """
 
     def __repr__(self) -> str:
+        """Show the URL with its secrets redacted, so a failure report cannot leak them."""
         return f"<url {redact_url(self)}>"
 
 

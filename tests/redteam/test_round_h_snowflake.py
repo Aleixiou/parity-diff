@@ -58,6 +58,7 @@ SCHEMA = "RTH_SF_HT"
     ],
 )
 def test_rt_hf10_a_double_slash_comment_is_refused(predicate):
+    """RT-HF10: a `//` comment in a row filter is refused."""
     with pytest.raises(ValueError, match="//"):
         SnowflakeDialect(side="A").check_where(predicate)
 
@@ -73,6 +74,7 @@ def test_rt_hf3_offline_a_nanosecond_tz_key_is_moved_to_utc():
 
 
 def _int_key() -> Any:
+    """A one-column NUMBER(38,0) key spec on column K."""
     from parity.types import KeySpec
 
     return KeySpec([Column("K", map_type_snowflake("NUMBER", 0), "NUMBER")], False)
@@ -121,6 +123,7 @@ def test_rt_hf9_offline_a_wide_span_buckets_by_its_boundaries(lo, hi, n):
     assert "*" not in sql and "/" not in sql
 
     def bucket(k: int) -> int:
+        """The bucket the boundary arms put key `k` in."""
         return next((q for v, q in arms if k >= v), 0)
 
     rng = random.Random(lo ^ hi ^ n)
@@ -144,6 +147,7 @@ def test_rt_hf8_offline_the_decimal_text_never_casts_to_number_38():
 
 
 def test_rt_hf7_offline_spatial_and_vector_render_without_a_varchar_cast():
+    """RT-HF7: spatial and VECTOR columns render through their own functions."""
     for raw, needle in [
         ("GEOGRAPHY", 'st_aswkb("V")'),
         ("GEOMETRY", 'st_asewkb("V")'),
@@ -163,13 +167,15 @@ def _connect_log(monkeypatch) -> list[str]:
 
     class Cur:
         def execute(self, sql: str) -> None:
+            """Record the statement."""
             log.append(sql)
 
         def close(self) -> None:
-            pass
+            """Nothing to release."""
 
     class Conn:
         def cursor(self) -> Cur:
+            """A fresh recording cursor."""
             return Cur()
 
     connector = types.ModuleType("snowflake.connector")
@@ -183,11 +189,13 @@ def _connect_log(monkeypatch) -> list[str]:
 
 
 def test_rt_hf2_offline_quoted_identifiers_ignore_case_is_pinned(monkeypatch):
+    """RT-HF2: QUOTED_IDENTIFIERS_IGNORE_CASE is pinned off at connect."""
     log = _connect_log(monkeypatch)
     assert any("quoted_identifiers_ignore_case=false" in s for s in log), log
 
 
 def test_rt_hf6_offline_strict_json_output_is_pinned(monkeypatch):
+    """RT-HF6: STRICT_JSON_OUTPUT is pinned off at connect."""
     log = _connect_log(monkeypatch)
     assert any("strict_json_output=false" in s for s in log), log
 
@@ -224,10 +232,12 @@ class _Url(str):
     the account in the failure report (it did, once, in this campaign)."""
 
     def __repr__(self) -> str:
+        """Never show the URL: it holds the password and the account."""
         return "<snowflake url>"
 
 
 def _with_schema(url: str, schema: str) -> str:
+    """The same URL with its schema replaced by `schema`, still redacted."""
     p = urlsplit(url)
     database = next(x for x in p.path.split("/") if x)
     return _Url(
@@ -301,6 +311,7 @@ def _user_default(params: dict[str, Any]) -> Iterator[None]:
     original = sd.connect_kwargs
 
     def hostile(url, key):
+        """The real connect kwargs with `params` merged into the session parameters."""
         kwargs = original(url, key)
         kwargs["session_parameters"] = {**kwargs["session_parameters"], **params}
         return kwargs
@@ -313,6 +324,7 @@ def _user_default(params: dict[str, Any]) -> Iterator[None]:
 
 
 def _open(url: str, side: str, params: dict[str, Any] | None = None, scale: int = 6):
+    """Open a dialect, logging in with `params` as user defaults if given."""
     if not params:
         return open_snowflake(url, side=side, float_scale=scale)
     with _user_default(params):
@@ -320,6 +332,7 @@ def _open(url: str, side: str, params: dict[str, Any] | None = None, scale: int 
 
 
 def _diff(url, a_table, b_table, key, a=None, b=None, **kwargs):
+    """Diff two tables on `url` and close both dialects."""
     a = a or _open(url, "A")
     b = b or _open(url, "B")
     try:
@@ -330,6 +343,7 @@ def _diff(url, a_table, b_table, key, a=None, b=None, **kwargs):
 
 
 def _found(result) -> dict[Any, tuple[str, list[str]]]:
+    """The differences as {key: (kind, sorted columns)}."""
     return {d.key: (d.kind, sorted(d.columns)) for d in result.diffs}
 
 
@@ -451,6 +465,7 @@ def test_quoted_identifiers_ignore_case_on_the_schema_does_not_redirect(sfh):
 
 @pytest.fixture(scope="module")
 def tz_keys(sfh) -> str:
+    """Three TIMESTAMP_TZ(9)-keyed tables: same instant, same wall clock, both."""
     _exec(
         sfh,
         "create or replace table RTH_SF_TZA (k timestamp_tz(9), v int)",
@@ -500,6 +515,7 @@ def test_rt_hf3_one_nanosecond_instant_at_two_offsets_is_one_key(tz_keys):
 
 @pytest.fixture(scope="module")
 def policies(sfh) -> str:
+    """Table pairs under a masking policy and a row access policy."""
     _pair(
         sfh,
         "RTH_SF_PM",
@@ -817,6 +833,7 @@ _MIXED_PLANTS = {
 
 @pytest.fixture(scope="module")
 def mixed(sfh) -> str:
+    """A mixed-type table pair with one planted change per row in `_MIXED_PLANTS`."""
     rows = " union all ".join(_MIXED_ROW.format(i=i) for i in range(1, 15))
     _pair(sfh, "RTH_SF_MX", _MIXED_COLS, rows, rows)
     _exec(
@@ -831,6 +848,7 @@ def mixed(sfh) -> str:
 
 @pytest.mark.parametrize("params", HOSTILE, ids=lambda p: "+".join(p))
 def test_a_hostile_user_default_does_not_change_the_verdict(mixed, params):
+    """Hostile user-default session parameters change no difference found."""
     a = _open(mixed, "A", params)
     result = _diff(mixed, "RTH_SF_MXA", "RTH_SF_MXB", "id", a=a)
     assert _found(result) == {
@@ -890,6 +908,7 @@ def test_far_dates_and_years_render_in_full(sfh):
 
 @pytest.fixture()
 def live_pair(sfh) -> str:
+    """A 2,000-row table and a clone with row 777 changed."""
     _exec(
         sfh,
         "create or replace table RTH_SF_LA (id int, v varchar)",
@@ -908,6 +927,7 @@ def _mid_walk(url: str, statement: str):
     fired = {"done": False}
 
     def hooked(sql: str):
+        """Run the query; after side A's first checksum, run `statement` once."""
         rows = original(sql)
         if not fired["done"] and "md5_number_upper64" in sql:
             fired["done"] = True
@@ -981,6 +1001,7 @@ def test_a_crafted_double_slash_filter_is_caught_downstream(sfh):
 
 @pytest.fixture(scope="module")
 def objects(sfh) -> str:
+    """A table and its changed clone, as table, view, secure view and transient."""
     _exec(
         sfh,
         "create or replace table RTH_SF_OA (id int, v varchar, w int)",
@@ -999,6 +1020,7 @@ def objects(sfh) -> str:
     "b_table", ["RTH_SF_OB", "RTH_SF_OVW", "RTH_SF_OSV", "RTH_SF_OTR"]
 )
 def test_views_secure_views_clones_and_transient_tables(objects, b_table):
+    """Views, secure views, clones and transient tables find the one change."""
     result = _diff(objects, "RTH_SF_OA", b_table, "id")
     assert _found(result) == {123: ("different", ["V"])}
 
@@ -1025,6 +1047,7 @@ def test_materialized_and_dynamic_tables(objects):
 
 
 def test_a_600_column_table_finds_a_change_in_the_last_column(sfh):
+    """A 600-column table finds a change in its last column."""
     cols = ", ".join(f"c{i} int" for i in range(600))
     sel = ", ".join(f"seq4() + {i}" for i in range(600))
     _exec(
@@ -1142,6 +1165,7 @@ def test_every_key_type_finds_the_planted_row(sfh, typ, keys, planted):
 
 
 def test_a_float_key_is_refused_naming_side_and_column(sfh):
+    """A FLOAT key is refused naming the side and the column."""
     _pair(sfh, "RTH_SF_KF", "k float, v int", "select 1.5, 1", "select 1.5, 2")
     with pytest.raises(ValueError, match=r"side A.*'K' cannot be used as a key"):
         _diff(sfh, "RTH_SF_KFA", "RTH_SF_KFB", "k")
@@ -1167,6 +1191,7 @@ def test_a_composite_key_with_a_separator_in_its_text(sfh):
 
 @pytest.fixture(scope="module")
 def where_pair(sfh) -> str:
+    """A 300-row pair with quotes and backslashes, rows 3, 4 and 200 changed."""
     _exec(
         sfh,
         "create or replace table RTH_SF_W2A (id int, v varchar)",
@@ -1195,6 +1220,7 @@ def where_pair(sfh) -> str:
     ],
 )
 def test_snowflake_row_filters_select_exactly_their_rows(where_pair, where, want):
+    """Each Snowflake-spelled row filter selects exactly its rows on both sides."""
     result = _diff(
         where_pair, "RTH_SF_W2A", "RTH_SF_W2B", "id", where_a=where, where_b=where
     )
@@ -1212,6 +1238,7 @@ def test_snowflake_row_filters_select_exactly_their_rows(where_pair, where, want
     ],
 )
 def test_snowflake_quoting_tricks_are_refused_before_any_query(where):
+    """Dollar quotes, backslash escapes, comments and `;` are refused offline."""
     with pytest.raises(ValueError, match="row filter"):
         SnowflakeDialect(side="A").check_where(where)
 
@@ -1226,6 +1253,7 @@ def test_a_random_row_filter_is_never_identical(where_pair):
 
 
 def test_map_pairs_a_renamed_mixed_case_column(sfh):
+    """`column_map` pairs a column renamed to a quoted mixed-case name."""
     _exec(
         sfh,
         "create or replace table RTH_SF_MPA (id int, amount int, note varchar)",
@@ -1313,12 +1341,14 @@ def test_specials_against_duckdb(sfh, tmp_path):
 
 
 def _cli(*argv: str) -> tuple[int, str]:
+    """Run the CLI in-process; return its exit code and all output."""
     out, err = io.StringIO(), io.StringIO()
     code = main(list(argv), out=out, err=err)
     return code, out.getvalue() + err.getvalue()
 
 
 def test_cli_json_finds_the_planted_difference_and_prints_no_secret(objects):
+    """The CLI's JSON names the planted difference and never the password."""
     password = urlsplit(objects).password or ""
     code, text = _cli(
         "diff", "--a", objects, "--a-table", "RTH_SF_OA",
@@ -1351,6 +1381,7 @@ def test_cli_a_failed_login_exits_2_without_the_password(sf_url):
 
 
 def test_cli_an_unknown_url_parameter_is_refused_without_its_value(sf_url):
+    """An unknown URL parameter is refused by name, its value never printed."""
     secret = f"Rth-{uuid.uuid4().hex}"
     bad = sf_url + ("&" if "?" in sf_url else "?") + f"passcode={secret}"
     code, text = _cli(

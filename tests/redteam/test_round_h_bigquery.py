@@ -50,9 +50,11 @@ def bq(bigquery_url):
     made: list[str] = []
 
     def run(sql: str) -> list[tuple]:
+        """Run one statement and return its rows as tuples."""
         return [tuple(r.values()) for r in client.query_and_wait(sql)]
 
     def name(base: str) -> str:
+        """Hand out a run-unique table name and remember it for cleanup."""
         n = f"rth_bq_{base}_{RUN}"
         made.append(n)
         return n
@@ -81,6 +83,7 @@ def pgw():
 
     class W:
         def table(self, base: str, ddl: str) -> str:
+            """Create table `rth_bq_<base>_<run>` with `ddl`; dropped afterwards."""
             t = f"rth_bq_{base}_{RUN}"
             conn.execute(f"drop table if exists {t}")
             conn.execute(f"create table {t} ({ddl})")
@@ -88,6 +91,7 @@ def pgw():
             return t
 
         def execute(self, sql: str, params=None):
+            """Run one statement on the fixture connection."""
             return conn.execute(sql, params)
 
     yield W()
@@ -121,10 +125,12 @@ def _diff(a, b, a_table, b_table, **kw):
 
 
 def _bq_bq(url, a_table, b_table, **kw):
+    """Diff two BigQuery tables, both sides on `url`."""
     return _diff(open_bigquery(url, "A"), open_bigquery(url, "B"), a_table, b_table, **kw)
 
 
 def _bq_duck(url, path, a_table, b_table, **kw):
+    """Diff a BigQuery table (side A) against a DuckDB file's table (side B)."""
     return _diff(open_bigquery(url, "A"), open_duckdb(path, "B"), a_table, b_table, **kw)
 
 
@@ -170,6 +176,7 @@ def nested(bq):
 
 
 def test_array_elements_keep_their_boundaries(bigquery_url, nested):
+    """RT-HB1: arrays whose elements split or vanish differ, not collide."""
     result = _bq_bq(bigquery_url, *nested, columns=["arr"])
     assert _found(result) == [(2, "different", ["arr"]), (3, "different", ["arr"])]
 
@@ -193,11 +200,13 @@ def test_array_unquoted_strings_collide_in_the_rendering_itself(bq):
 
 
 def test_struct_fields_keep_their_boundaries_and_nulls(bigquery_url, nested):
+    """RT-HB1: struct field boundaries and a NULL field against 'NULL' differ."""
     result = _bq_bq(bigquery_url, *nested, columns=["st"])
     assert _found(result) == [(2, "different", ["st"]), (3, "different", ["st"])]
 
 
 def test_geography_points_that_are_stored_differently_differ(bigquery_url, nested, bq):
+    """Two GEOGRAPHY points one ulp apart are reported, not rounded together."""
     run, _, ds, _ = bq
     a, b = nested
     # The negative control: the stored points really differ.
@@ -211,6 +220,7 @@ def test_geography_points_that_are_stored_differently_differ(bigquery_url, neste
 
 
 def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tmp_path):
+    """An ingestion-time partitioned table compares on its data columns only."""
     run, name, ds, _ = bq
     t = name("ingest")
     run(
@@ -228,6 +238,7 @@ def test_ingestion_time_partition_pseudo_column_is_not_data(bigquery_url, bq, tm
 
 
 def test_a_table_clone_is_read_at_one_snapshot(bigquery_url, bq):
+    """A table clone is read at the first query's snapshot, with no caveat."""
     run, name, ds, _ = bq
     base, clone = name("cl_base"), name("cl_clone")
     run(
@@ -253,6 +264,7 @@ BRACKET_ESCAPE = "']' in unnest([']'])) or (true or 'x' in unnest(['['])"
 
 
 def test_a_bracketed_string_cannot_escape_the_filter_parentheses():
+    """RT-HB6 offline: the row-filter check refuses the bracket escape."""
     assert row_filter_problem(BRACKET_ESCAPE) is not None
 
 
@@ -268,6 +280,7 @@ def test_the_bracket_predicate_really_escapes_on_bigquery(bq):
 
 
 def test_a_domain_scoped_project_can_be_named_in_the_table():
+    """A domain-scoped project id keeps its colon and resolves as the project."""
     d = BigQueryDialect(side="A")
     d.project = "billing-project"
     assert d._resolve("example.com:proj.ds.t") == ("example.com:proj", "ds", "t")
@@ -656,6 +669,7 @@ _WHERE_TABLE: list[str] = []
 
 
 def _where_table(bq) -> str:
+    """Build the shared three-row filter table once per run; return its name."""
     if not _WHERE_TABLE:
         run, name, ds, _ = bq
         t = name("where")
@@ -729,6 +743,7 @@ def test_cli_end_to_end_json_exit_code_and_no_credentials(bigquery_url, bq, tmp_
 
 
 def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path):
+    """A 500-column FLOAT64 table compares and finds a change in the last column."""
     run, name, ds, _ = bq
     n = 500
     t = name("widef")
@@ -798,6 +813,7 @@ def test_schema_changes_and_replacement_mid_walk_stay_invisible(bigquery_url, bq
 
 @pytest.mark.parametrize("form", ["`{t}`", "`{p}.{d}.{t}`", "`{p}`.`{d}`.`{t}`"])
 def test_a_backtick_quoted_table_name_is_read_or_explained(bigquery_url, bq, form):
+    """Each backtick spelling of a table name reads its columns or names backticks."""
     t = _where_table(bq)
     project, dataset, _ = parse_bigquery_url(bigquery_url)
     a = open_bigquery(bigquery_url, "A")
@@ -914,6 +930,7 @@ def test_current_timestamp_in_a_filter_moves_under_the_pinned_snapshot(bigquery_
 
 
 def test_the_filter_caveat_warns_about_bigquery_clock_functions():
+    """The row-filter caveat names a BigQuery clock function in the predicate."""
     from parity.dialects.duckdb_dialect import DuckDBDialect
     from parity.engine import _filter_caveats
 

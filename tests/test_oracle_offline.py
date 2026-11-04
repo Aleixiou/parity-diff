@@ -142,28 +142,33 @@ class FakeCursor:
     """Records the SQL; raises `error` if set."""
 
     def __init__(self, conn: FakeConn) -> None:
+        """Remember the fake connection whose log this cursor writes."""
         self.conn = conn
 
     def execute(self, sql: str) -> None:
+        """Log the SQL, then raise the connection's error if it has one."""
         self.conn.seen.append(sql)
         if self.conn.error:
             raise self.conn.error
 
     def fetchall(self) -> list[tuple]:
+        """One row, whatever the query."""
         return [(1,)]
 
     def close(self) -> None:
-        pass
+        """Nothing to release."""
 
 
 class FakeConn:
     """A stand-in python-oracledb connection."""
 
     def __init__(self, error: Exception | None = None) -> None:
+        """An empty SQL log, and the error every execute should raise."""
         self.seen: list[str] = []
         self.error = error
 
     def cursor(self) -> FakeCursor:
+        """A cursor logging into this connection."""
         return FakeCursor(self)
 
 

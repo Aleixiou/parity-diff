@@ -458,7 +458,7 @@ class DuckDBDialect(Dialect):
         if not rows:
             raise self._err(self._not_found(table, schema, name))
         kind = self.query(
-            f"select table_type from system.information_schema.tables {where}"
+            f"select table_type from system.information_schema.tables {where}"  # noqa: S608 - names via string_literal
         )
         if kind and kind[0][0] == "VIEW":
             listed = rows
