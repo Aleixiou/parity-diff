@@ -77,13 +77,6 @@ SHADOWS = {
 
 
 @pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD1: a macro in the DuckDB file named like a built-in (md5, substr, "
-    "replace, concat_ws) replaces it in parity's SQL - every row hashes alike and a "
-    "changed row is a false match; nothing pins the built-ins (cf. PostgreSQL's "
-    "search_path pin)",
-)
 @pytest.mark.parametrize("name", sorted(SHADOWS))
 def test_a_macro_shadowing_a_builtin_cannot_hide_a_change(tmp_path, name):
     """Both files carry the same macro library (a team's shared helpers, or a
@@ -93,42 +86,55 @@ def test_a_macro_shadowing_a_builtin_cannot_hide_a_change(tmp_path, name):
     ddl = "create table t (id int, v varchar)"
     pa = duck_file(tmp_path, "a", ddl, rows, SHADOWS[name])
     pb = duck_file(tmp_path, "b", ddl, rows, "update t set v = 'changed' where id = 4242", SHADOWS[name])
-    try:
-        result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
-    except ValueError:
-        return  # a refusal is an acceptable answer
-    assert not result.identical
-    assert found(result) == [(4242, "different", ("v",))]
+    with pytest.raises(ValueError, match=rf"\[side A: duckdb\] the database defines macro {name}, named like DuckDB built-ins"):
+        open_duckdb(pa, "A")
+    with pytest.raises(ValueError, match=rf"\[side B: duckdb\] the database defines macro {name}"):
+        open_duckdb(pb, "B")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD1: `create type json as varchar` in the file shadows the JSON type the "
-    "UNION rendering casts through, so a UNION loses its tag: 1::int = '1', a false match",
-)
 def test_a_user_type_named_json_cannot_hide_a_union_tag(tmp_path):
     """DuckDB refuses to shadow core types (below) but not `json`."""
     ddl = "create table t (id int, v union(n int, s varchar))"
     shadow = "create type json as varchar"
     pa = duck_file(tmp_path, "a", ddl, "insert into t values (1, union_value(n := 1)), (2, union_value(n := 2))", shadow)
     pb = duck_file(tmp_path, "b", ddl, "insert into t values (1, union_value(s := '1')), (2, union_value(n := 2))", shadow)
-    try:
-        result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
-    except ValueError:
-        return
-    assert found(result) == ONE
+    with pytest.raises(ValueError, match=r"\[side A: duckdb\] the database defines type json"):
+        open_duckdb(pa, "A")
+    with pytest.raises(ValueError, match=r"\[side B: duckdb\] the database defines type json"):
+        open_duckdb(pb, "B")
 
 
-def test_a_macro_on_one_side_only_does_not_hide_a_change(tmp_path):
-    """The shadowing macro on one side only: its hashes differ from the honest
-    side's, so the walk cannot call the tables identical (it reports noise)."""
+def test_a_macro_on_one_side_only_is_refused_and_the_other_side_compares(tmp_path):
+    """The shadowing macro on one side only: that side is refused (RT-HD1);
+    the honest file still compares, and finds its planted change."""
     rows = "insert into t select i, 'v' || i from range(1, 2001) r(i)"
     ddl = "create table t (id int, v varchar)"
     pa = duck_file(tmp_path, "a", ddl, rows)
     pb = duck_file(tmp_path, "b", ddl, rows, "update t set v = 'x' where id = 7", SHADOWS["md5"])
-    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
-    assert not result.identical
-    assert (7, "different", ("v",)) in found(result)
+    with pytest.raises(ValueError, match=r"\[side B: duckdb\] the database defines macro md5"):
+        open_duckdb(pb, "B")
+    pc = duck_file(tmp_path, "c", ddl, rows, "update t set v = 'x' where id = 7")
+    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pc, "B"), "main.t", "main.t")
+    assert found(result) == [(7, "different", ("v",))]
+
+
+@pytest.mark.parametrize(
+    "macro",
+    [
+        "create macro MD5(x) as 'z'",  # case-folded lookup
+        "create macro strftime(a, b) as 'z'",  # a built-in the dialect uses that is not listed above
+        "create macro coalesce_x(a) as a",  # not a built-in: allowed
+    ],
+)
+def test_any_macro_named_like_a_builtin_is_refused(tmp_path, macro):
+    """Defence in depth: the check is every built-in's name, not a list of
+    the functions parity happens to call today."""
+    p = duck_file(tmp_path, "m", "create table t (id int)", "insert into t values (1)", macro)
+    if "coalesce_x" in macro:
+        open_duckdb(p, "A").close()
+        return
+    with pytest.raises(ValueError, match=r"\[side A: duckdb\] the database defines macro"):
+        open_duckdb(p, "A")
 
 
 def test_user_types_cannot_shadow_builtin_types(tmp_path):
@@ -154,12 +160,6 @@ def _sqlite_file(tmp_path: Path) -> str:
     return path
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD4: duckdb:/// on a SQLite file auto-installs (downloads from "
-    "extensions.duckdb.org) and loads sqlite_scanner inside duckdb.connect, before "
-    "the dialect turns autoinstall/autoload off - a network call (CLAUDE.md 6)",
-)
 def test_a_sqlite_file_is_refused_without_loading_an_extension(tmp_path):
     """Verified 2026-11-04 with HOME pointed at an empty directory: the connect
     wrote `.duckdb/extensions/v1.5.5/windows_amd64/sqlite_scanner.duckdb_extension`
@@ -190,13 +190,25 @@ def test_a_sqlite_file_is_refused_without_loading_an_extension(tmp_path):
     pytest.fail(f"a SQLite file opened as a DuckDB side; extensions loaded: {loaded}")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD12: a schema named like the file's stem (schema `warehouse` in "
-    "warehouse.duckdb) cannot be compared: `\"warehouse\".\"t\"` is an ambiguous "
-    "catalog-or-schema reference in DuckDB and every query fails (tables are not "
-    "catalog-qualified)",
-)
+def test_a_sqlite_file_is_refused_before_duckdb_opens_it(tmp_path, monkeypatch):
+    """RT-HD4 without the network: the header is read first, so duckdb.connect
+    (which would install and load sqlite_scanner) is never called."""
+    path = _sqlite_file(tmp_path)
+    calls: list = []
+    real = duckdb.connect
+
+    def spy(database=":memory:", *a, **kw):
+
+        """Record what duckdb.connect is asked to open."""
+        calls.append(database)
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(duckdb, "connect", spy)
+    with pytest.raises(ValueError, match=r"^\[side A: duckdb\] .*warehouse\.db is not a valid DuckDB database file \(it is a SQLite database\)"):
+        get_dialect(f"duckdb:///{path}", side="A")
+    assert calls == []
+
+
 def test_a_schema_named_like_the_file_can_be_compared(tmp_path):
     """Written under another name, then renamed - as a file copied between
     machines is. main.t is identical, warehouse.t has row 9 changed."""
@@ -234,11 +246,6 @@ def test_a_file_named_like_a_builtin_catalog_still_reads_its_own_tables(tmp_path
         assert found(run_diff(open_duckdb(ref, "A"), open_duckdb(p, "B"), "main.t", "main.t")) == [], stem
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD12: a file named information_schema.duckdb cannot be compared at all "
-    "- the unqualified information_schema.columns lookup is ambiguous",
-)
 def test_a_file_named_information_schema_can_be_compared(tmp_path):
     """The column lookup must name the system catalog's information_schema."""
     ddl = "create table t (id int, v varchar)"
@@ -251,16 +258,21 @@ def test_a_file_named_information_schema_can_be_compared(tmp_path):
     assert found(result) == [(3, "different", ("v",))]
 
 
-@pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD13: information_schema.columns reports a view's column types as they "
-    "were when the view was created; after `alter table t alter v type varchar` the "
-    "view still says INTEGER, so v is rendered unescaped and '\\N' = NULL: a false match",
-)
+def _view_diff(pa: str, pb: str):
+    """`main.vw` compared, or None where DuckDB itself refuses to bind it:
+    1.3 and 1.4 raise "Contents of view were altered" - loudly, naming the
+    side - for a view whose base table changed under it (RT-HD13 is 1.5+)."""
+    if DUCK_VERSION < (1, 5):
+        with pytest.raises(ValueError, match=r"\[side [AB]: duckdb\].*(altered|bind)"):
+            run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
+        return None
+    return run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
+
+
 def test_a_view_over_an_altered_column_compares_its_real_type(tmp_path):
     """`select * from vw` returns VARCHAR; the catalog says INTEGER."""
     def mk(value: str) -> tuple[str, ...]:
+        """The statements building one side."""
         return (
             "create table t (id int, v int)",
             "create view vw as select * from t",
@@ -273,12 +285,11 @@ def test_a_view_over_an_altered_column_compares_its_real_type(tmp_path):
     # The base table is right ...
     assert found(run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")) == ONE
     # ... the view over it must be too.
-    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
-    assert found(result) == ONE
+    result = _view_diff(pa, pb)
+    if result is not None:
+        assert found(result) == ONE
 
 
-@pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(strict=True, reason="RT-HD13: a view's stale catalog type picks the wrong rule after ALTER TYPE: the difference is rendered away")
 @pytest.mark.parametrize(
     ("old", "new", "a", "b"),
     [
@@ -291,6 +302,7 @@ def test_a_view_over_an_altered_column_compares_its_real_type(tmp_path):
 def test_a_view_over_a_retyped_column_finds_the_change(tmp_path, old, new, a, b):
     """The base table finds row 1; the `select *` view over it must too."""
     def mk(v: str) -> tuple[str, ...]:
+        """The statements building one side."""
         return (
             f"create table t (id int, v {old})",
             "create view vw as select * from t",
@@ -301,19 +313,15 @@ def test_a_view_over_a_retyped_column_finds_the_change(tmp_path, old, new, a, b)
     pa = duck_file(tmp_path, "a", *mk(a))
     pb = duck_file(tmp_path, "b", *mk(b))
     assert found(run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")) == ONE
-    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
-    assert found(result) == ONE
+    result = _view_diff(pa, pb)
+    if result is not None:
+        assert found(result) == ONE
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD13: a `select *` view created before `alter table add column` returns the "
-    "new column (DuckDB >= 1.5; 1.3-1.4 refuse to bind the view), but information_schema "
-    "lists only the old ones - the new column is silently never compared: a false match",
-)
 def test_a_view_that_gained_a_column_compares_it(tmp_path):
     """vw returns (id, v, w); w differs; the catalog lists (id, v)."""
     def mk(w: str) -> tuple[str, ...]:
+        """The statements building one side."""
         return (
             "create table t (id int, v int)",
             "create view vw as select * from t",
@@ -323,8 +331,10 @@ def test_a_view_that_gained_a_column_compares_it(tmp_path):
 
     pa = duck_file(tmp_path, "a", *mk("a"))
     pb = duck_file(tmp_path, "b", *mk("b"))
-    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.vw", "main.vw")
-    assert found(result) == [(1, "different", ("w",))]
+    result = _view_diff(pa, pb)
+    if result is not None:
+        assert found(result) == [(1, "different", ("w",))]
+        assert any("view main.vw: the catalog lists" in w for w in result.warnings)
 
 
 def test_a_view_needing_an_extension_fails_without_installing_it(tmp_path):
@@ -500,22 +510,8 @@ FOUND_PAIRS = [
     ("VARCHAR[]", "['a, b']", "['a', 'b']"),
     ("VARCHAR[]", "[NULL]", "['NULL']"),
     ("VARCHAR[]", "[]", "['']"),
-    pytest.param(
-        "VARCHAR[]", "NULL", "[]",
-        marks=[pytest.mark.sample_check_may_disagree, pytest.mark.xfail(
-            DUCK_VERSION < (1, 5), strict=True,
-            reason="RT-HD11: DuckDB 1.3-1.4 array_to_string([]) is NULL, so [] renders as NULL",
-        )],
-        id="list-empty-vs-null",
-    ),
-    pytest.param(
-        "INTEGER[]", "[]", "NULL",
-        marks=[pytest.mark.sample_check_may_disagree, pytest.mark.xfail(
-            DUCK_VERSION < (1, 5), strict=True,
-            reason="RT-HD11: DuckDB 1.3-1.4 array_to_string([]) is NULL, so [] renders as NULL",
-        )],
-        id="int-list-empty-vs-null",
-    ),
+    pytest.param("VARCHAR[]", "NULL", "[]", id="list-empty-vs-null"),  # RT-HD11 on 1.3-1.4
+    pytest.param("INTEGER[]", "[]", "NULL", id="int-list-empty-vs-null"),  # RT-HD11 on 1.3-1.4
     ("VARCHAR[]", "['\\,']", "[',']"),
     ("VARCHAR[]", "['a\\,', 'b']", "['a', '\\,b']"),
     ("INTEGER[][]", "[[1, 2], [3]]", "[[1], [2, 3]]"),
@@ -523,8 +519,8 @@ FOUND_PAIRS = [
     ("VARCHAR[][]", "[[NULL]]", "[['NULL']]"),
     ("VARCHAR[][2]", "[['a, b'], ['c']]", "[['a', 'b'], ['c']]"),
     ("INTEGER[2]", "[1, 2]", "[1, 3]"),
-    ("DOUBLE[2]", "[0.1, 2]", "[0.1000000000000001, 2]"),
-    ("FLOAT[3]", "[1.0, 2.0, 3.0]", "[1.0000001, 2.0, 3.0]"),
+    ("DOUBLE[2]", "[0.1, 2]", "[0.100001, 2]"),
+    ("FLOAT[3]", "[1.0, 2.0, 3.0]", "[1.5, 2.0, 3.0]"),
     ("BOOLEAN[2]", "[true, NULL]", "[true, false]"),
     ("UUID[2]", "[NULL, NULL]", "[NULL, '00000000-0000-0000-0000-000000000000']"),
     ("TIME[]", "['24:00:00']", "['00:00:00']"),
@@ -607,6 +603,9 @@ EQUAL_BY_RULE = [
     ("FLOAT", "'1.0000001'::float", "'1.0'::float"),
     ("DECIMAL(18,18)", "0.000000000000000001", "0.000000000000000002"),
     ("JSON", "'[1,2]'", "'[1, 2]'"),  # layout only
+    # A fixed-size ARRAY is a list, its elements at the float scale (RT-HD5).
+    ("DOUBLE[2]", "[0.1, 2]", "[0.1000000000000001, 2]"),
+    ("FLOAT[3]", "[1.0, 2.0, 3.0]", "[1.0000001, 2.0, 3.0]"),
 ]
 
 
@@ -637,71 +636,53 @@ def _xf_pre2(reason: str):
     return pytest.mark.xfail(DUCK_VERSION < (2, 0), strict=True, reason=reason + " (DuckDB < 2.0)")
 
 
-#: RT-HD14: on DuckDB 2.0 a column's collation reaches the key-uniqueness
-#: count, so distinct keys equal under it are refused as duplicates.
-_HD14 = pytest.mark.xfail(
-    DUCK_VERSION >= (2, 0),
-    strict=True,
-    reason="RT-HD14: on DuckDB 2.0 count(distinct <key text>) follows the key column's "
-    "collation (NOCASE, NOACCENT, NFC, ICU) or a default_collation, so a unique key "
-    "holding 'a' and 'A' is refused as not unique (CLAUDE.md 4.11: counted by bytes)",
-)
+#: RT-HD14 (fixed): on DuckDB 2.0 a column's collation reached the key-
+#: uniqueness count; the keys below hold collation-equal texts.
 
 
 NESTED_FALSE_MATCHES = [
     pytest.param(
         "VARCHAR[2]", "['a, b', 'c']", "['a', 'b, c']",
-        marks=_xf_pre2("RT-HD5: a fixed-size ARRAY of VARCHAR prints its strings unquoted: ['a, b','c'] = ['a','b, c'], a false match"),
         id="array-varchar-comma",
     ),
     pytest.param(
         "VARCHAR[2]", "[NULL, 'x']", "['NULL', 'x']",
-        marks=_xf_pre2("RT-HD5: a fixed-size ARRAY of VARCHAR prints NULL and 'NULL' alike, a false match"),
         id="array-varchar-null",
     ),
     pytest.param(
         "VARCHAR[2][]", "[['a, b', 'c']]", "[['a', 'b, c']]",
-        marks=_xf_pre2("RT-HD5: a list of fixed-size VARCHAR arrays, the same unquoted text"),
         id="list-of-array-varchar",
     ),
     pytest.param(
         "VARCHAR[2][2]", "[['a, b', 'c'], ['d', 'e']]", "[['a', 'b, c'], ['d', 'e']]",
-        marks=_xf_pre2("RT-HD5: a 2-D fixed-size VARCHAR array, the same unquoted text"),
         id="array-of-array-varchar",
     ),
     pytest.param(
         "STRUCT(a VARCHAR[2])", "{'a': ['x, y', 'z']}", "{'a': ['x', 'y, z']}",
-        marks=_xf_pre2("RT-HD5: a fixed-size VARCHAR array inside a STRUCT, the same unquoted text"),
         id="struct-of-array-varchar",
     ),
     pytest.param(
         "STRUCT(a TIMETZ)", "{'a': '12:00:00+05:00:30'::timetz}", "{'a': '12:00:00+05:30'::timetz}",
-        marks=_xf_pre2("RT-HD6: TIMETZ inside a STRUCT renders through the varchar cast, which drops the offset's seconds (COV-7, fixed only for a scalar TIMETZ)"),
         id="struct-timetz",
     ),
     pytest.param(
         "TIMETZ[2]", "['12:00:00+05:00:30'::timetz, '01:00:00+00'::timetz]", "['12:00:00+05:30'::timetz, '01:00:00+00'::timetz]",
-        marks=_xf_pre2("RT-HD6: TIMETZ in a fixed-size ARRAY: the offset's seconds are dropped (COV-7)"),
         id="array-timetz",
     ),
     pytest.param(
         "MAP(INTEGER, TIMETZ)", "map {1: '12:00:00+05:00:30'::timetz}", "map {1: '12:00:00+05:30'::timetz}",
-        marks=_xf_pre2("RT-HD6: TIMETZ as a MAP value: the offset's seconds are dropped (COV-7)"),
         id="map-timetz",
     ),
     pytest.param(
         "UNION(t TIMETZ, s VARCHAR)", "union_value(t := '12:00:00+05:00:30'::timetz)", "union_value(t := '12:00:00+05:30'::timetz)",
-        marks=_xf_pre2("RT-HD6: TIMETZ as a UNION member (JSON of the varchar cast): the offset's seconds are dropped (COV-7)"),
         id="union-timetz",
     ),
     pytest.param(
         "STRUCT(u UNION(n INTEGER, s VARCHAR))", "{'u': union_value(n := 1)}", "{'u': union_value(s := '1')}",
-        marks=_xf("RT-HD7: a UNION inside a STRUCT loses its tag in the varchar cast: 1::int = '1' (RT-A12 fixed only for a top-level UNION)"),
         id="struct-union-tag",
     ),
     pytest.param(
         "MAP(VARCHAR, UNION(n INTEGER, s VARCHAR))", "map {'k': union_value(n := 1)}", "map {'k': union_value(s := '1')}",
-        marks=_xf("RT-HD7: a UNION as a MAP value loses its tag: 1::int = '1'"),
         id="map-union-tag",
     ),
 ]
@@ -746,7 +727,6 @@ VARIANT_PAIRS = [
     pytest.param("'\\x00'::blob::variant", "'\\x5Cx00'::blob::variant", id="blob"),
     pytest.param(
         "'12:00:00+05:00:30'::timetz::variant", "'12:00:00+05:30'::timetz::variant",
-        marks=_xf_pre2("RT-HD6: a TIMETZ held in a VARIANT renders through JSON of the varchar cast, which drops the offset's seconds (COV-7)"),
         id="timetz-offset-seconds",
     ),
 ]
@@ -763,14 +743,6 @@ def test_variant_values_that_differ_are_found(tmp_path, a, b):
     assert found(result) == ONE
 
 
-@pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(
-    DUCK_VERSION < (2, 0),
-    strict=True,
-    reason="RT-HD8: an ENUM fixed-size ARRAY (`ENUM('a, b', ...)[2]`) is mapped to STRING "
-    "(map_type cuts at '(' before it sees the [2]) and rendered as unquoted array text: "
-    "['a, b','a'] = ['a','b, a'] in the walk; only a sampled row is caught",
-)
 def test_an_enum_array_difference_is_found_by_the_walk(tmp_path):
     """The sample check catches this row because the table has three rows; on
     a large table the row is outside the sample and the verdict is identical."""
@@ -778,8 +750,6 @@ def test_an_enum_array_difference_is_found_by_the_walk(tmp_path):
     assert found(result) == ONE
 
 
-@pytest.mark.sample_check_may_disagree
-@pytest.mark.xfail(DUCK_VERSION < (2, 0), strict=True, reason="RT-HD8: as above, [NULL, 'x'] = ['NULL', 'x'] for an ENUM array")
 def test_an_enum_array_null_is_found_by_the_walk(tmp_path):
     """A NULL element and the label 'NULL' print alike in array text."""
     result = diff_pair(tmp_path, "ENUM('x', 'NULL')[2]", "[NULL, 'x']", "['NULL', 'x']")
@@ -789,9 +759,8 @@ def test_an_enum_array_null_is_found_by_the_walk(tmp_path):
 @pytest.mark.parametrize(
     "typ",
     [
-        pytest.param("TIMESTAMP[2]", marks=_xf("RT-HD9: TIMESTAMP[2] maps to TIMESTAMP (prefix match) and strftime(array) fails: the diff crashes")),
-        pytest.param("TIMESTAMPTZ[2]", marks=_xf("RT-HD9: TIMESTAMPTZ[2] maps to TIMESTAMP: the diff crashes")),
-        pytest.param("TIMESTAMP_NS[2]", marks=_xf("RT-HD9: TIMESTAMP_NS[2] maps to TIMESTAMP: epoch_ns(array) fails, the diff crashes")),
+        "TIMESTAMP[2]",  # RT-HD9: these crashed, mapped to their scalar type
+        "TIMESTAMPTZ[2]",
         "DATE[2]",
     ],
 )
@@ -801,8 +770,16 @@ def test_a_fixed_size_temporal_array_is_compared(tmp_path, typ):
     assert found(result) == ONE
 
 
+@pytest.mark.parametrize("typ", ["TIMESTAMP_NS[2]", "TIMESTAMP_NS[]"])
+def test_a_nanosecond_array_is_refused_like_a_nanosecond_list(tmp_path, typ):
+    """RT-HD9: TIMESTAMP_NS[2] crashed (epoch_ns of an array). A list cannot
+    carry the scalar column's nanosecond caveat, so both are refused, naming
+    the column - never compared with the digits silently dropped."""
+    with pytest.raises(ValueError, match=r"list column 'v' holds TIMESTAMP_NS elements"):
+        diff_pair(tmp_path, typ, "['2020-01-01', '2020-01-02']", "['2020-01-01', '2020-01-03']")
+
+
 @pytest.mark.parametrize("typ", ["DECIMAL(10,2)[2]", "DECIMAL(38,10)[2]"])
-@pytest.mark.xfail(strict=True, reason="RT-HD9: DECIMAL(p,s)[n] maps to DECIMAL (cut at '(') and the cast of an array to decimal(38,6) fails: the diff crashes")
 def test_a_fixed_size_decimal_array_is_compared(tmp_path, typ):
     """A fixed-size array of decimals: a changed element is found."""
     result = diff_pair(tmp_path, typ, "[1.10, 2]", "[1.20, 2]")
@@ -916,10 +893,8 @@ KEYS = [
 
 
 @pytest.mark.parametrize(("typ", "k1", "k2", "k3", "k4"), KEYS, ids=lambda x: str(x)[:24])
-def test_every_key_type_keeps_distinct_keys_apart(request, tmp_path, typ, k1, k2, k3, k4):
+def test_every_key_type_keeps_distinct_keys_apart(tmp_path, typ, k1, k2, k3, k4):
     """A change, a deletion and an insertion, each under its own key."""
-    if any(c in typ for c in ("NOCASE", "NOACCENT", "NFC")):
-        request.applymarker(_HD14)
     ddl = f"create table t (id {typ}, v int)"
     pa = duck_file(tmp_path, "ka", ddl, f"insert into t values ({k1}, 1), ({k2}, 2), ({k3}, 3)")
     pb = duck_file(tmp_path, "kb", ddl, f"insert into t values ({k1}, 1), ({k2}, 20), ({k4}, 4)")
@@ -930,11 +905,10 @@ def test_every_key_type_keeps_distinct_keys_apart(request, tmp_path, typ, k1, k2
 
 
 @pytest.mark.parametrize("coll", ["nocase", "noaccent", "nfc", "de", "en_us", "de.noaccent", "nocase.noaccent.nfc"])
-def test_keys_equal_under_a_collation_stay_distinct(request, tmp_path, coll):
+def test_keys_equal_under_a_collation_stay_distinct(tmp_path, coll):
     """'a'/'A', 'é' composed/decomposed, 'é'/'e', 'ss'/'ß', 'a'/'a ' are
     different keys whatever the column's collation: one-sided on each side,
     and four such keys on both sides with one changed row."""
-    request.applymarker(_HD14)
     ddl = f"create table t (k varchar collate {coll}, v int)"
     for ka, kb in [("'a'", "'A'"), ("'é'", "'e' || chr(769)"), ("'é'", "'e'"), ("'ss'", "'ß'"), ("'a'", "'a '")]:
         pa = duck_file(tmp_path, "a", ddl, f"insert into t values ({ka}, 1), ('z', 2)")
@@ -948,31 +922,22 @@ def test_keys_equal_under_a_collation_stay_distinct(request, tmp_path, coll):
     assert found(r) == [("A", "different", ("v",))]
 
 
-def test_a_varchar_array_key_whose_text_collides_is_refused(tmp_path):
-    """RT-HD5 as a key: ['a, b','c'] and ['a','b, c'] are two keys whose text
-    is one before DuckDB 2.0, so uniqueness fails - a refusal, not a merge.
-    From 2.0 the strings are quoted and the changed row is found."""
+def test_a_varchar_array_key_is_refused_as_a_list_key(tmp_path):
+    """RT-HD5 as a key: a fixed-size ARRAY is a list (its elements by the
+    value rules, which round floats), and a list key is refused on every
+    version - before the fix ['a, b','c'] and ['a','b, c'] shared one key
+    text on DuckDB < 2.0."""
     ddl = "create table t (id VARCHAR[2], v int)"
     rows = "insert into t values (['a, b', 'c'], 1), (['a', 'b, c'], 2)"
     pa = duck_file(tmp_path, "a", ddl, rows)
     pb = duck_file(tmp_path, "b", ddl, rows, "update t set v = 3 where id = ['a', 'b, c']")
-    if DUCK_VERSION < (2, 0):
-        with pytest.raises(ValueError, match="not unique"):
-            run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
-        return
-    result = run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
-    assert [(d.kind, tuple(d.columns)) for d in result.diffs] == [("different", ("v",))]
+    with pytest.raises(ValueError, match="list column 'id' cannot be used as a key"):
+        run_diff(open_duckdb(pa, "A"), open_duckdb(pb, "B"), "main.t", "main.t")
 
 
 # ===================================================================== --where
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD2: a DuckDB list literal holding ']' inside a string ([\"'x]'\"]) ends the "
-    "filter scanner's '[' region early, so `v = ['x]'][1]) or (v = ['['][1]` passes "
-    "row_filter_problem and its first disjunct escapes the bucket bounds",
-)
 def test_a_list_literal_cannot_smuggle_a_parenthesis_past_the_filter_check():
     """DuckDB parses the predicate as `(v = 'x]') or (v = '[' and <bounds>)`.
     The walk's count checks then report the range unexplained and the escaped
@@ -981,8 +946,28 @@ def test_a_list_literal_cannot_smuggle_a_parenthesis_past_the_filter_check():
     assert row_filter_problem("v = ['x]'][1]) or (v = ['['][1]") is not None
 
 
-def test_the_escaped_filter_is_caught_by_the_walk_s_count_checks(tmp_path):
-    """RT-HD2's consequence today: never identical, the change still found."""
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "v = ['a]'][1]) or (1 = 1 and v = ['['][1]",
+        "list_contains(['x]'], v)) or (list_contains(['['], v)",
+    ],
+)
+def test_more_list_literals_cannot_smuggle_a_parenthesis(pred):
+    """DuckDB reads each `]` inside a quoted string as text: both predicates
+    close the parenthesis they are wrapped in (the second matched a row under
+    `(<pred>) and false`, measured on 1.5.5), so the check must refuse them."""
+    assert row_filter_problem(pred) is not None
+
+
+def test_the_escaped_filter_is_caught_by_the_walk_s_count_checks(tmp_path, monkeypatch):
+    """Defence in depth for RT-HD2: the scanner now refuses this predicate, so
+    the guard is switched off here to check the second layer - the walk's count
+    checks still make an escaped filter unexplained, never identical."""
+    from parity.dialects.base import Dialect
+
+    monkeypatch.setattr(Dialect, "check_where", lambda self, where: None)
+    assert row_filter_problem("v = ['x]'][1]) or (w >= ['['][1]") is not None
     pred = "v = ['x]'][1]) or (w >= ['['][1]"
     mk = (
         "create table t (id int, v varchar, w varchar)",
@@ -1209,11 +1194,6 @@ def test_an_in_memory_side_is_an_empty_database(two_files, url):
     assert code == 2 and "[side B: duckdb] table not found" in err
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD10: `duckdb:<path>` / `duckdb:/<path>` (no `//`) fail with 'could not "
-    "connect: list index out of range' - duckdb_path splits on '://' unchecked",
-)
 @pytest.mark.parametrize("prefix", ["duckdb:", "duckdb:/"])
 def test_a_url_without_the_double_slash_gets_a_clear_error(two_files, prefix):
     """Refused, naming the expected grammar - not an IndexError's text."""
@@ -1227,11 +1207,6 @@ def test_a_url_without_the_double_slash_gets_a_clear_error(two_files, prefix):
 SECRET = "rthd_SECRET_motherduck_token_0123456789"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HD3: a MotherDuck URL is refused only as 'database file not found: "
-    "md:db?motherduck_token=<token>' - the error prints the token",
-)
 @pytest.mark.parametrize(
     "url",
     [
@@ -1256,6 +1231,8 @@ def test_a_motherduck_url_never_reaches_the_network(two_files, monkeypatch):
     real = duckdb.connect
 
     def spy(database=":memory:", *a, **kw):
+
+        """Record what duckdb.connect is asked to open."""
         calls.append(database)
         return real(database, *a, **kw)
 
@@ -1304,11 +1281,9 @@ GLOBALS = [
 
 
 @pytest.mark.parametrize("setting", GLOBALS)
-def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(request, tmp_path, setting):
+def test_global_settings_of_a_shared_instance_do_not_change_the_verdict(tmp_path, setting):
     """Keys 'A' and 'a' stay two keys under a nocase default collation; the
     planted changes (row 5, key 'A') are found under every setting."""
-    if "default_collation" in setting:
-        request.applymarker(_HD14)
     mk = (
         "create table t (id int, k varchar, tz timestamptz, s varchar)",
         "insert into t select i, 'k' || i, timestamptz '2020-06-15 12:00:00+00' + to_days(i), 's' || i from range(1, 101) r(i)",
@@ -1377,31 +1352,20 @@ def _version_of(python: str) -> tuple[int, ...]:
             [python, "-c", "import duckdb; print(duckdb.__version__)"],
             capture_output=True, text=True, timeout=60, check=True,
         ).stdout.strip()
-    except Exception:  # noqa: BLE001 - an unusable interpreter is skipped
+    except Exception:
         return (0,)
     return tuple(int(p) for p in out.split(".")[:3] if p.isdigit())
 
 
 _PYTHONS = [(p, _version_of(p)) for p in DUCKDB_PYTHONS]
 
-#: DuckDB releases whose `array_to_string([], '')` is NULL, not '' - so the
-#: list rule renders every empty list as the NULL sentinel (measured).
-EMPTY_LIST_IS_NULL = ((1, 3, 0), (1, 5, 0))
-
-
 def _version_params():
-    """One param per interpreter; RT-HD11 marked on the affected releases."""
+    """One param per interpreter (RT-HD11 was a false match on 1.3-1.4)."""
     out = []
     for python, v in _PYTHONS:
         marks = []
         if v < (1, 3):
             marks.append(pytest.mark.skip(reason="refused at connect (DuckDB < 1.3)"))
-        elif EMPTY_LIST_IS_NULL[0] <= v < EMPTY_LIST_IS_NULL[1]:
-            marks.append(_xf(
-                "RT-HD11: on DuckDB 1.3-1.4 array_to_string of an empty list is NULL, "
-                "so every empty list renders as the NULL sentinel: [] = NULL, a false "
-                "match on a supported version (the sample check catches only sampled rows)"
-            ))
         out.append(pytest.param(python, v, marks=marks, id="duckdb-" + ".".join(map(str, v))))
     return out or [pytest.param(None, (0,), id="no-duckdb-venvs")]
 

@@ -183,8 +183,20 @@ duckdb:///:memory:
 `pip install "parity-diff[duckdb]"` (needs `duckdb>=1.3`). The file is
 opened read-only; it must exist (`database file not found: …`). Exactly one
 leading slash is removed from the path, as in SQLite and SQLAlchemy URLs.
+A file that is not a DuckDB database (a SQLite file, say) is refused before
+DuckDB opens it, so no extension is ever loaded to read it. MotherDuck
+(`md:`, `motherduck:`) is not supported.
 
-**Tables.** Unqualified names mean `main`.
+**Tables.** Unqualified names mean `main`. Tables are read as
+`"<catalog>"."<schema>"."<table>"`, so a schema named like the file is fine.
+A view is described as it returns rows now: if the catalog's entry is stale
+(its base table was altered after the view was created) the run warns and
+compares the live columns.
+
+**Refused files.** A database that defines a macro or a type named like a
+DuckDB built-in (`md5`, `replace`, `json`, ...) is refused: DuckDB calls the
+stored macro before the built-in, so parity's checksums would be computed by
+it. Compare a copy without those macros.
 
 **Permissions.** Read access to the file. Because it is opened read-only,
 another process may hold it open read-only too, but not for writing.

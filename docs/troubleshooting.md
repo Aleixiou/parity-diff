@@ -135,6 +135,21 @@ compared exactly).
 Snowflake policies are attached to the table: diff as a role they do not
 mask or filter for, or `--exclude` the masked column.
 
+## A DuckDB file is refused
+
+```
+parity: [side A: duckdb] the database defines macro md5, named like DuckDB built-ins. DuckDB calls a stored macro or type before the built-in, so parity's SQL would run it and its checksums could not be trusted. Compare a copy without them
+parity: [side B: duckdb] C:/data/warehouse.db is not a valid DuckDB database file (it is a SQLite database); parity opens DuckDB files only and loads no extension to read other formats
+```
+
+A macro (or type) stored in a DuckDB file replaces the built-in of the same
+name in every query, so the file is refused rather than trusted. Copy the
+tables into a file without those macros (`create table ... as select ...`
+from a session that does not load them). A SQLite or other non-DuckDB file is
+refused before DuckDB opens it, because opening it would load (and possibly
+download) an extension. MotherDuck (`md:`) is not supported. `duckdb:` URLs
+need `://`: `duckdb:///relative.duckdb`, `duckdb:///C:/abs.duckdb`.
+
 ## Version or feature refused
 
 | Message (start) | Fix |

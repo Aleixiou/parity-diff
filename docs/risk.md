@@ -17,7 +17,7 @@ The worst error is a **false match**: "identical" for tables that are not.
 A **false alarm** (a reported difference that is not real) and a **refusal**
 (the tool stops with an error) are inconvenient but never hide a difference.
 
-Source fingerprint: `src-sha256: 85aef74612d2fd67`
+Source fingerprint: `src-sha256: 60c8a1808979fc63`
 
 ## Summary
 
@@ -71,6 +71,8 @@ escape handling, search path and isolation (CLAUDE.md 4.8, 4.9, 4.11).
 | The login method changes what is read (password, or Snowflake key pair) | **0**: authentication selects the user, not the session; both paths go through one set of driver arguments carrying the same telemetry and session pins (pinned offline per path) | By design (tested) |
 | Table changes mid-run, single snapshot (PostgreSQL, MySQL InnoDB, SQL Server with snapshot isolation, Oracle, DuckDB, BigQuery base tables) | **0** — the whole walk reads one version | By design (verified live) |
 | A MySQL view over a non-transactional table read as one snapshot | **0** — the view's base tables are followed through `view_table_usage` (views of views included) and any non-InnoDB one gets the caveat below; a view whose base tables cannot be listed gets it too (round H, RT-HM17) | By design (tested) |
+| A DuckDB file redefines a built-in (a stored macro `md5`, `replace`, ..., or a type `json`), which DuckDB calls before the built-in on any connection | **0**: a file defining any macro or type named like a DuckDB built-in is refused at connect (round H, RT-HD1; it made every row hash alike) | By design (tested, DuckDB 1.3-2.0) |
+| Opening a DuckDB side loads or downloads an extension (a SQLite file, MotherDuck) | **0**: the file header is checked before DuckDB opens it, `md:` URLs are refused, autoinstall/autoload are off | By design (tested offline) |
 | Table changes mid-run, no single snapshot (Snowflake, BigQuery views, MySQL non-InnoDB, SQL Server without snapshot isolation) | **not bounded**; every run prints a caveat naming the side; a change inside a range between two levels of the walk makes that range unexplained (each level must add up, rows and checksum, to the level above); the sample check re-reads rows after the walk and fails on any sampled row that changed | Not quantifiable |
 | Rows or values hidden from the session on Oracle (VPD, Data Redaction) | caps: **0**, pinned and cross-checked against row counts; PostgreSQL RLS and Oracle VPD policies: **not bounded**, named in a caveat; Oracle Data Redaction: **not detectable** without privileges, documented | By design / Not quantifiable |
 
@@ -123,7 +125,7 @@ risk line, scale, filters and caveats, as the reports print them.
 
 | Risk | Odds | Kind |
 |---|---|---|
-| Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation) | By design (tested) |
+| Duplicate or NULL keys collapse rows and hide differences | **0** — refused before the walk, counted by bytes (never under a collation; DuckDB 2.0 applies collations to `count(distinct)`, so it counts `encode(text)`, RT-HD14) | By design (tested) |
 | Two distinct keys render alike and merge | **0** for INTEGER (DuckDB UHUGEINT hashed by its exact text), DECIMAL (exact text), TIMESTAMP (all stored digits, as the instant in UTC), STRING (escaped), and the exact rules of TIME, BINARY, BITS, INTERVAL, TIMETZ, INET, VARIANT; FLOAT and LIST keys are refused (a list's elements round as values do). This row said 0 for TIMESTAMP before round H too, and was wrong on Snowflake: a TIMESTAMP_TZ key with nanoseconds printed its stored wall clock, so two instants at different offsets merged (RT-HF3, fixed and tested live) | By design (tested) |
 
 ## 4. Rendering each value as canonical text (per engine)
@@ -137,6 +139,8 @@ and 4.3. This is where every past false match lived.
 | Rendering disagrees with the rules, values not in the sample | not measured; caught at run time by the sample check (section 8) | Proven bound at run time |
 | Types outside the rules: BigQuery STRUCT/GEOGRAPHY/INTERVAL/RANGE and arrays of them or of JSON, nested lists, other engines' structs, maps, ranges, arrays of JSON or of unmapped types, geometry, XML (the sweep loads 4 such native types to watch their text for collisions: none found) | **not covered**: compared by text, named in every report. The real risk is not only false alarms: an engine's text for such a type can collide - BigQuery's `FORMAT('%t')` printed `['a, b']` like `['a', 'b']` and a NULL struct field like `'NULL'` (round H, fixed). On BigQuery every one is now injective by construction (STRUCT by `canonical_struct_text`, GEOGRAPHY as WKB, INTERVAL/RANGE components printed exactly); on other engines the fallback is the engine's own text cast, injective only as far as that cast is | Not quantifiable |
 | A PostgreSQL extension type whose text prints two values alike (contrib `seg`) | **0** false matches between PostgreSQL sides: types outside pg_catalog and the known-exact list are compared by their binary send form too, or refused (round H) | By design (tested) |
+| DuckDB nested values whose own text is lossy: a UNION inside a STRUCT, MAP or list (tag dropped), a TIMETZ inside one (offset seconds dropped before 2.0), a fixed-size ARRAY (strings unquoted before 2.0), an empty list on 1.3-1.4 (rendered as NULL) | **0** false matches for these: rendered part by part, each scalar by its rule, and lists never NULL (round H, RT-HD5-HD9, HD11; pinned on 1.3, 1.4, 1.5 and 2.0). Remaining gap: a VARIANT holding a STRUCT or list with a TIMETZ, before DuckDB 2.0 - **not bounded**, documented | By design (tested) / Not quantifiable |
+| A DuckDB view whose base table was altered after it was created (the catalog keeps the old column list) | **0**: views are described live (DESCRIBE) and a warning names the stale entry (RT-HD13); DuckDB 1.3-1.4 refuse to read such a view | By design (tested) |
 | JSON across two engines whose normal forms differ (key order, duplicates, number spelling) | **0** false matches; such documents read as different (false alarms) and the run names both forms | By design (tested) |
 | INTERVAL `1 day` against `24 hours`, TIMETZ `12:00+05:45` against `06:15+00`, inet `/32` against `/8` | **0** false matches: different stored values, compared as different even where the engine's `=` calls them equal (false alarms by design) | By design (tested) |
 | A PostgreSQL array's shape (2x2 against its four elements flattened, `[0:1]={1,2}` against `{1,2}`) | **0** false matches: the dimensions are rendered with the elements, never flattened away | By design (tested) |
@@ -165,7 +169,8 @@ without a caveat, spatial SRID, invalid double-byte text), all fixed. Round H on
 secret leak in the test suite's failure reports. The Oracle sweep (2026-11-04)
 found one value Oracle cannot print (TIMESTAMP WITH LOCAL TIME ZONE at the
 last microsecond of 9999, whose year reads 10000): now refused, naming the
-column. Earlier campaign: about 30
+column. Round H on DuckDB: 14 problems
+(RT-HD1-HD14), 8 of them false matches, all fixed. Earlier campaign: about 30
 problems, 11 false matches on ordinary data, all fixed (CHANGELOG 0.4.0).
 
 ## 5. Hashing rows and summing per key range

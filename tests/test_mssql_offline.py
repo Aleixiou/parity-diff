@@ -625,9 +625,13 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     keyed = f"count(case when {d.quote('code')} is not null then 1 end)"
     # PostgreSQL counts a hashed key's bytes (RT-B10/D11): a nondeterministic
     # ICU collation would fold 'a'/'A' into one key.
+    # DuckDB counts the key text's UTF-8 bytes (RT-HD14): DuckDB 2.0 applies
+    # a column's collation to count(distinct).
     distinct = (
         f'count(distinct ({identity}) collate pg_catalog."C")'
         if isinstance(d, PostgresDialect)
+        else f"count(distinct encode({identity}))"
+        if isinstance(d, DuckDBDialect)
         else f"count(distinct {identity})"
     )
     assert f"count(*), {keyed}, {distinct} from" in seen[-1]

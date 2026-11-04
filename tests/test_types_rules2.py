@@ -338,7 +338,10 @@ def test_variant_payload_decodes_the_stored_bytes(payload: str, value):
         (map_type, "STRUCT(a INTEGER)[]", LogicalType.UNKNOWN),
         (map_type, "public.mood[]", LogicalType.UNKNOWN),
         (map_type, "ARRAY", LogicalType.UNKNOWN),
-        (map_type, "INTEGER[3]", LogicalType.UNKNOWN),  # fixed-size ARRAY
+        (map_type, "INTEGER[3]", LogicalType.LIST),  # fixed-size ARRAY (RT-HD5)
+        (map_type, "ENUM('a, b', 'c')[2]", LogicalType.LIST),  # RT-HD8
+        (map_type, "DECIMAL(10,2)[2]", LogicalType.LIST),  # RT-HD9
+        (map_type, "STRUCT(a INTEGER)[2]", LogicalType.UNKNOWN),
         (map_type_mysql, "bit", LogicalType.BITS),
         (map_type_mssql, "bit", LogicalType.BOOLEAN),  # never a bit string
         (map_type_mssql, "sql_variant", LogicalType.VARIANT),

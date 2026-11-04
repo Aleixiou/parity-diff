@@ -1415,9 +1415,10 @@ class Dialect(ABC):
         Its raw type is the list's without the trailing `[]` - `INTEGER[]` on
         DuckDB, `integer[]` as the PostgreSQL dialect spells an array.
         """
-        if not column.raw_type.endswith("[]"):
+        suffix = _ARRAY_SUFFIX.search(column.raw_type)
+        if not suffix:
             raise self._err(f"column {column.name!r} ({column.raw_type}) is not a list")
-        inner = column.raw_type[:-2]
+        inner = column.raw_type[: suffix.start()]
         return Column(self.LIST_ELEMENT_NAME, map_type(inner), inner)
 
     def list_element_text(self, column: Column) -> str:
@@ -1918,15 +1919,24 @@ def require_matching_scales(a: Dialect, b: Dialect) -> None:
         )
 
 
+#: A list's type suffix: `[]`, or DuckDB's fixed-size ARRAY `[n]`.
+_ARRAY_SUFFIX = re.compile(r"\[\d*\]$")
+
+
 def map_type(raw: str) -> LogicalType:
     """Map an engine's type name onto a logical category."""
-    if raw.endswith("[]"):
+    suffix = _ARRAY_SUFFIX.search(raw)
+    if suffix:
         # A list (DuckDB `INTEGER[]`) or array (PostgreSQL, whose dialect
-        # spells the element type the same way, `integer[]`). Checked before
-        # the `(` split, or `DECIMAL(10,2)[]` would read as a decimal. Ruled
-        # only when its element is (`LIST_ELEMENT_TYPES`); a nested list, a
-        # list of structs or of JSON stays UNKNOWN, compared as before.
-        element = map_type(raw[:-2])
+        # spells the element type the same way, `integer[]`), or a DuckDB
+        # fixed-size ARRAY (`VARCHAR[2]`), whose elements are a list's.
+        # Checked before the `(` split, or `DECIMAL(10,2)[]` would read as a
+        # decimal and `ENUM('a', 'b')[2]` as a string (RT-HD8, HD9: the
+        # array was then rendered by the scalar rule, or by a varchar cast
+        # that printed its strings unquoted before DuckDB 2.0, RT-HD5).
+        # Ruled only when its element is (`LIST_ELEMENT_TYPES`); a nested
+        # list, a list of structs or of JSON stays UNKNOWN.
+        element = map_type(raw[: suffix.start()])
         return LogicalType.LIST if element in LIST_ELEMENT_TYPES else LogicalType.UNKNOWN
     t = raw.lower().split("(")[0].strip()
     if t in {
