@@ -1,0 +1,402 @@
+# Troubleshooting
+
+Every error exits with code `2` and prints one line to stderr that starts with
+`parity:` and names the side, `[side A: postgres]` or `[side B]`. That prefix
+tells you which of the two databases to look at. The messages below are quoted
+from the code; `…` marks where your own names and values appear.
+
+- [Table not found](#table-not-found)
+- [Key column not found, not unique, or NULL](#key-column-not-found-not-unique-or-null)
+- [FLOAT or list key refused](#float-or-list-key-refused)
+- [A value or a scale is refused](#a-value-or-a-scale-is-refused)
+- [Version or feature refused](#version-or-feature-refused)
+- [Connection errors](#connection-errors)
+- [Columns refused](#columns-refused)
+- [Everything reads as different](#everything-reads-as-different)
+- [The run says it is not single-snapshot](#the-run-says-it-is-not-single-snapshot)
+- [Slow runs](#slow-runs)
+- [Config file errors (`parity run`)](#config-file-errors-parity-run)
+
+## Table not found
+
+```
+parity: [side A: duckdb] table not found: Orders (looked in schema 'main'). Names are matched exactly, including case - did you mean main.orders?
+```
+
+Table names are matched **exactly, including case**, because they are quoted
+into SQL. Unquoted SQL folds names to lower case on PostgreSQL and DuckDB and
+to UPPER case on Snowflake, so the table you created as `Orders` is probably
+stored as `orders` (or `ORDERS`). Use the name the error suggests.
+
+Also check the schema in the message: an unqualified table means `public` on
+PostgreSQL, `main` on DuckDB, the database's name on MySQL, the URL's schema
+(else `PUBLIC`) on Snowflake, the URL's dataset on BigQuery, and the login's
+default schema (normally `dbo`) on SQL Server. Pass `schema.table` to be sure.
+
+```
+parity: [side A: postgres] table public.orders exists but this role cannot read it. `information_schema` only lists tables you hold privileges on, so a missing GRANT looks exactly like a missing table. Ask for SELECT on public.orders.
+```
+
+The table is there; the login lacks `SELECT`. SQL Server cannot tell the two
+apart and adds to every not-found message: `If it does exist, this login may
+lack SELECT on it (db_datareader, or GRANT SELECT)`. Nor can MySQL, for a login
+with no privilege on the database: it answers `SELECT command denied` whether
+or not the table exists, and the message adds `Or it exists and this login
+holds no privilege on it`. BigQuery says `cannot
+read dataset … while looking for …: it does not exist, or this account lacks
+access to it` - and, when the dataset is in another location than the jobs,
+`it is in location US and this connection runs jobs in EU: add ?location=US
+to the connection string`. Grants per engine: [`engines.md`](engines.md).
+
+```
+parity: [side A: postgres] table name 'db.public.orders' has 3 dot-separated parts; expected 'table' or 'schema.table'
+```
+
+Drop the database part — the database comes from the connection string.
+(BigQuery alone accepts `project.dataset.table`, backticked whole or per part
+as the console copies it, and a domain-scoped `example.com:project`.)
+
+## Key column not found, not unique, or NULL
+
+```
+parity: [side B] key column(s) ['order_id'] not in orders. Columns are: ['amount', 'id', 'status']
+parity: [side A] key column ['k'] in dup is not unique: 100 rows but only 10 distinct keys. Rows cannot be compared one-to-one.
+parity: [side A] key column ['status'] in orders contains 14,285 NULL value(s). A row with no key cannot be matched to anything on the other side.
+```
+
+`--key` must name columns that identify one row on both sides. Key names are
+matched case-insensitively (`id` matches `ID`). If one column is not unique,
+give several: `--key customer_id,line_no`. A PostgreSQL composite key
+counts as NULL only when the value itself is NULL: `row(1, NULL)` is a key. Uniqueness is counted by bytes, so
+on a case-insensitive collation `'a'` and `'A'` are two keys, as they should
+be. A table without any unique key cannot be compared one-to-one; diff a view
+that adds one (for example a row number over a deterministic order) only if
+that order really is the same on both sides.
+
+## FLOAT or list key refused
+
+```
+parity: [side A: duckdb] in fk: FLOAT column 'k' cannot be used as a key. A key is matched by exact text, and doubles are only compared rounded to the float scale, which would merge distinct keys into one row; no rendering of a double is both exact and identical on every engine. Key by another column, or by a DECIMAL/integer cast of this one in a view
+```
+
+Use another key, or a view that casts the float key to an integer or
+DECIMAL. Lists and arrays are refused as keys for the same reason (`list
+column … cannot be used as a key`).
+
+## A value or a scale is refused
+
+The tool refuses rather than round or clamp a value it cannot render exactly.
+
+```
+parity: [side A: postgres] parity: FLOAT value out of the comparable range (|x| >= 2^116, about 8.3e34) - refusing to round it: …
+```
+
+A double of magnitude 2^116 or more. Exclude the column (`--exclude`), or
+compare a view that filters or rescales those values.
+
+```
+parity: [side A: mysql] … does not fit DECIMAL(65,6), the widest type MySQL can render it in at float_scale 6. MySQL would clamp it to that type's maximum without an error, so two different values could compare equal; …
+```
+
+A DECIMAL value with more integer digits than the engine can render at the
+float scale (MySQL 65 − scale, DuckDB 38 − scale). A smaller `--float-scale`
+gives more integer digits.
+
+```
+parity: [side A: duckdb] FLOAT column 'x' cannot be compared at float_scale 25; the maximum is 20
+parity: [side A: mssql] FLOAT column 'x' cannot be compared at float_scale 19 on SQL Server; the maximum is 18
+parity: [side A: mysql] DECIMAL column 'x' cannot be compared at float_scale 31; MySQL's maximum DECIMAL scale is 30
+```
+
+Lower `--float-scale`.
+
+```
+parity: [side A: mysql] …: its canonical text is longer than this server's max_allowed_packet, past which MySQL string functions return NULL. …
+```
+
+A text value too long for the MySQL server's `max_allowed_packet` once
+escaped. A DBA can raise `max_allowed_packet`, or exclude the column.
+
+```
+parity: [side B: snowflake] VARIANT column 'V' of ORDERS holds a double at items[3].price (key 42) whose JSON text Snowflake prints with 16 significant digits, which another double shares: …; leave it out with --exclude
+```
+
+Snowflake prints a double inside a VARIANT with 16 significant digits, and
+this one needs 17: a neighbouring double would print the same text, so the
+column cannot be compared exactly. Exclude it, or compare a view that casts
+the field to NUMBER or extracts it as a FLOAT column (FLOAT columns are
+compared exactly).
+
+```
+! side A: masking policy PII_MASK is set on column 'EMAIL' of ORDERS: if it masks values for this role, both sides compare the mask …
+! side A: row access policy REGION_ONLY filters ORDERS: rows it hides from this role are not compared at all …
+```
+
+Snowflake policies are attached to the table: diff as a role they do not
+mask or filter for, or `--exclude` the masked column.
+
+## A DuckDB file is refused
+
+```
+parity: [side A: duckdb] the database defines macro md5, named like DuckDB built-ins. DuckDB calls a stored macro or type before the built-in, so parity's SQL would run it and its checksums could not be trusted. Compare a copy without them
+parity: [side B: duckdb] C:/data/warehouse.db is not a valid DuckDB database file (it is a SQLite database); parity opens DuckDB files only and loads no extension to read other formats
+```
+
+A macro (or type) stored in a DuckDB file replaces the built-in of the same
+name in every query, so the file is refused rather than trusted. Copy the
+tables into a file without those macros (`create table ... as select ...`
+from a session that does not load them). A SQLite or other non-DuckDB file is
+refused before DuckDB opens it, because opening it would load (and possibly
+download) an extension. MotherDuck (`md:`) is not supported. `duckdb:` URLs
+need `://`: `duckdb:///relative.duckdb`, `duckdb:///C:/abs.duckdb`.
+
+## Version or feature refused
+
+| Message (start) | Fix |
+|---|---|
+| `PostgreSQL … is not supported: parity needs PostgreSQL 9.6 or newer (12 or newer to compare FLOAT columns)` | Upgrade, or diff a copy on a newer server. |
+| `FLOAT column 'x' needs PostgreSQL 12 or newer (server_version_num …): older servers do not print doubles as their shortest round-trip decimal, so they cannot be rendered canonically` | `--exclude` the float columns, or upgrade. |
+| `FLOAT column 'x' cannot be compared in a database at compatibility level …: below 130 SQL Server converts floats to decimal inexactly. Raise the level to 130 or more, or leave the column out with --exclude` | As it says. |
+| `DuckDB … is not supported: parity needs DuckDB 1.3 or newer (older versions render some values differently, which can hide a difference). Upgrade with: pip install -U duckdb` | As it says. |
+| `this server is MariaDB, not MySQL. parity's MySQL dialect has not been verified against MariaDB …` | MariaDB is not supported; diff a copy in MySQL or another engine. |
+| `this MySQL server has no MD5() function, which every row hash needs. MySQL 9.7 moved it into an optional component: a DBA can add it with INSTALL COMPONENT 'file://component_classic_hashing'` | As it says. |
+| `this server has no UTF-8 collations (SQL Server 2019 or newer is required) …` | SQL Server 2017 and older are not supported. |
+| `unsupported SQL Server engine edition …: … Microsoft Fabric and Azure Synapse differ in isolation and are not supported yet.` | Not supported yet. |
+| `Oracle … is not supported: this dialect is verified on 21c and 23ai, and needs 19c or newer` | Upgrade, or diff a copy on a newer server. |
+| `database character set … is not supported: rows are hashed as the UTF-8 bytes every other engine hashes, which Oracle's VARCHAR2 holds only in an AL32UTF8 database` | Diff a copy in an AL32UTF8 database (the default since 12.2). |
+| `the server returned text that is not valid UTF-8 (…); is the database encoding SQL_ASCII?` | A PostgreSQL `SQL_ASCII` database stores bytes unchecked; text that is not UTF-8 cannot be compared with any other engine. |
+
+## Connection errors
+
+```
+parity: [side B: duckdb] database file not found: nope.duckdb
+parity: [side A: postgres] could not connect: …
+parity: [side A] no dialect for scheme 'postgress'. Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql.
+```
+
+- **Check the connection string grammar** in [`engines.md`](engines.md). For
+  DuckDB the slash count matters: `duckdb:///rel/path.duckdb` is relative,
+  `duckdb:////abs/path.duckdb` absolute (POSIX), `duckdb:///C:/path.duckdb`
+  absolute (Windows).
+- **Special characters in the password.** PostgreSQL and SQL Server URLs need
+  reserved characters (`@ : / ? # %`) percent-encoded (`@` → `%40`). MySQL
+  accepts `/ # ? :` as they are but needs `@` as `%40` (`malformed MySQL URL;
+  expected mysql://user:password@host:port/database (percent-encode an `@` in
+  the password as %40)`). Snowflake URLs need `/ ? # @ %` percent-encoded in
+  the password. Connection errors do not print the password (tested for
+  PostgreSQL, MySQL, SQL Server and Snowflake).
+- **Unknown options are refused, not ignored**, on MySQL, SQL Server,
+  BigQuery and Snowflake: `unknown mssql connection parameter(s) ['encrypted']; supported:
+  [...]`, `MySQL URL option 'sslmode' is not supported, and an option is
+  refused rather than ignored. …`. The message lists what is accepted.
+  Snowflake reads only `warehouse`, `role` and `private_key_file`.
+- **TLS.** SQL Server encrypts and checks the certificate by default; a local
+  test server with a self-signed certificate needs
+  `?trust_server_certificate=yes` (never in production). On MySQL,
+  `ssl_mode=REQUIRED` or stricter makes the run check the session really is
+  encrypted: `the URL asks for ssl_mode REQUIRED or stricter, but the
+  connection to the server is not encrypted; refusing to continue`. For
+  PostgreSQL, pass libpq's own parameters in the URL, e.g.
+  `?sslmode=verify-full&sslrootcert=/path/ca.pem`. A corporate TLS-inspecting
+  proxy or antivirus can break certificate checks for the cloud engines; point
+  the driver at your organisation's CA bundle (for example
+  `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` for BigQuery and Snowflake).
+- **Snowflake connector 5.x.** The `[snowflake]` extra pins
+  `snowflake-connector-python>=4.0,<5`, because 5.x sends a telemetry batch at
+  every logout that no setting stops. If something else in your environment
+  upgraded it, reinstall: `pip install "snowflake-connector-python>=4.0,<5"`.
+  Snowflake logs in with a password or a key pair
+  (`?private_key_file=`, passphrase in `PARITY_SNOWFLAKE_KEY_PASSPHRASE`; see
+  [engines.md](engines.md#snowflake)); SSO and MFA prompts are not supported,
+  so an account policy that requires those for the user blocks it.
+- **BigQuery credentials.** BigQuery uses Application Default Credentials;
+  a URL holding a user or password is refused (`bigquery connection string
+  must not contain credentials …`). Run `gcloud auth application-default
+  login`, set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key, use
+  impersonation, or run on a VM with an attached service account. A 403
+  usually means the account lacks BigQuery Job User on the URL's project or
+  read access to the dataset ([`engines.md`](engines.md#bigquery)).
+- **SQL Server login.** Only SQL authentication is supported: `mssql
+  connection string needs a user: SQL authentication (user:password@host) is
+  the only kind verified so far`. A named instance goes in
+  `?instance=SQLEXPRESS`; `?login_timeout=30` waits longer for a slow server.
+- **PostgreSQL gives up connecting after 30 seconds** (an unreachable host or
+  port used to hang with no output). `?connect_timeout=120` in the URL waits
+  longer.
+
+## Columns refused
+
+```
+parity: [side A] orders has two columns that differ only in case: 'Id' and 'ID'. parity matches columns case-insensitively across engines and cannot tell these apart - rename or quote one, or diff a view that does.
+parity: --columns named the key column(s) ['id']; the key is how rows are matched up, not something compared between them
+parity: --columns named unknown columns: ['x']
+parity: --columns named columns present on only one side: ['extra']
+parity: --columns and --exclude both name: ['x']
+```
+
+```
+parity: [side A: mysql] this login may read only some columns of table orders (column-level privileges). MySQL then lists only those - ['id', 'a'] - and hides the rest from information_schema, so the hidden columns would silently go uncompared. Ask for SELECT on the whole table …
+```
+
+The login holds `GRANT SELECT (col, …)` on some columns only. Grant SELECT on
+the table: a comparison of the visible columns alone could not say what it
+left out.
+
+On Oracle, `column 'X' has type LONG (or XMLTYPE, VECTOR, …), which has no
+text form this dialect can compare …; leave it out with --exclude` and `CLOB
+column 'X' cannot be used as a key on Oracle` mean what they say.
+
+As each says. A SQL Server table too wide to compile into one checksum query
+asks you to compare fewer columns per run with `--columns` / `--exclude`.
+
+```
+parity: [side A: mssql] column 'email' of dbo.customers is under dynamic data masking and this login does not hold UNMASK: ...
+parity: [side A: mssql] view dbo.v_customers reads dynamically masked column(s) ['customers.email'], and this login does not hold UNMASK: ...
+parity: [side A: mssql] dbo.orders_syn is a synonym for [legacy].[dbo].[orders], in another database or on another server; ...
+```
+
+The login reads masked values as their masks: `GRANT UNMASK TO <login>` (on
+SQL Server 2022 also per schema, table or column), or `--exclude` the
+column. A synonym into another database: connect to that database and name
+the base table. A table name holding a dot is bracketed, `dbo.[orders.2024]`.
+A warning `this login cannot see whether a row-level security policy filters
+…` goes away with `GRANT VIEW DEFINITION TO <login>` (database-wide: a policy is visible only with VIEW DEFINITION on the policy itself).
+
+```
+parity: [side A: postgres] column 'v' holds public.seg, whose text output is not known to be exact (two different values can print alike) and which this server cannot compare any other way (...); leave it out with --exclude, or compare an exact cast of it through a view
+✗ not compared, side A cannot read ['salary'] of public.staff: this login lacks SELECT on those columns (column-level privileges)
+```
+
+- **An extension type is refused** when its text output may print two
+  different values alike (contrib `seg` prints `123456789` and `123456788`
+  both as `1.23457e+08`) and PostgreSQL has no exact binary form of it to
+  compare instead - no send function, or the type sits inside an array,
+  composite or range. `--exclude` the column, or diff a view that casts it to
+  something exact (`lower(v)::numeric`, say). Extension types whose text is
+  exact (citext, hstore, ltree, isn, cube, PostGIS, pgvector) are compared as
+  before.
+- **Columns the login cannot read** (PostgreSQL column-level `GRANT SELECT
+  (a, b)`) are not compared, and the run is not identical. Grant SELECT on
+  the whole table, or `--exclude` them to make the gap deliberate.
+
+```
+parity: [side A: postgres] row filter "set_config('x', 'y', false) is not null" calls set_config(), which changes the session or acts outside the read - a filter may only select rows
+```
+
+A PostgreSQL row filter may not call functions that change session settings,
+take locks, sleep, notify, touch sequences or large objects, reach another
+server or run SQL given as a string. A user function doing any of that
+inside a filter or a view is caught after the walk: the run is then not
+identical, naming the setting that moved.
+
+## Everything reads as different
+
+When nearly every row is reported (often with the `at least 10,000
+differences … stopped early` headline, and `rows downloaded` near 100%), the
+data is rarely that broken. Check, in this order:
+
+1. **The warnings above the rows.** The run names the usual causes itself:
+   a key or column whose type differs between the sides, a timezone-aware
+   column against a naive one, JSON normalised differently.
+2. **Wrong table or environment.** Exactly what a parity check exists to
+   catch — compare the row counts in the headline with what you expect.
+3. **Wrong key.** If both sides use different keys for the same row (a
+   surrogate key regenerated by the migration), every row is only in A and
+   only in B. Key by the natural key instead.
+4. **Key type changed** (`BIGINT` → `VARCHAR`, `timestamptz` → `timestamp`):
+   the same key renders as different text. Compare through a view that casts
+   one side.
+5. **Timestamps shifted by whole hours**: the target stored local wall-clock
+   time where the source stored instants. Sessions are pinned to UTC on both
+   sides, so this is a real difference in what was stored.
+6. **Decimals differ in the last places**: the target rounded to fewer
+   places. Lower `--float-scale` if that rounding is accepted, and say so when
+   you report the result.
+7. **Text differs only in trailing spaces or case**: these are real
+   differences; parity does not follow a collation.
+
+## The run says it is not single-snapshot
+
+```
+  ! side A (mssql): database 'legacy' has ALLOW_SNAPSHOT_ISOLATION OFF, so the walk runs at READ COMMITTED ...
+```
+
+On Snowflake, SQL Server without snapshot isolation, BigQuery views and MySQL
+non-InnoDB tables the walk cannot read one snapshot, so rows written during
+the run can show as differences. On SQL Server a DBA can enable it (`ALTER
+DATABASE … SET ALLOW_SNAPSHOT_ISOLATION ON`; it does not block writers).
+Otherwise diff a quiet replica, a clone (Snowflake zero-copy `CLONE`), or a
+base table instead of a view, or re-run and see whether the differences move.
+
+## Oracle: "the table's definition changed after this diff's snapshot began (ORA-01466)"
+
+The Oracle side reads one `READ ONLY` snapshot, which cannot read a table
+created, altered or truncated after it began - or within a few seconds before
+it (even the first insert into a freshly created table counts). Run the diff
+again once the table is no longer being rebuilt. A diff running longer than
+the database's undo retention on a busy table stops with ORA-01555 (snapshot
+too old) instead: raise `UNDO_RETENTION`, or diff a quieter copy.
+
+## Slow runs
+
+- **Cost is one full hash pass per side**: every compared column of every row
+  is rendered and hashed by MD5 inside the engine. Expect the time of a full
+  table scan with a hash per row; on a laptop, 10M rows PostgreSQL ↔ DuckDB
+  took about a minute.
+- **An index on the key does not help** — the work is CPU-bound hashing,
+  not lookup — and `--bisection-factor` does not speed up the first pass.
+- **Compare fewer columns** with `--columns` or `--exclude` if some are not
+  part of what you need to prove (and say so when you report the result).
+- **Many differences cost round trips and downloads.** Each differing range
+  is narrowed down and its rows downloaded; thousands of scattered
+  differences mean many queries. Fix the systematic cause first
+  ([above](#everything-reads-as-different)).
+- **The sample check** adds one pass over the key per side and the download
+  of about `--verify-sample` rows per side. `--verify-sample 0` skips it, at
+  the cost of the risk figure.
+- **Cloud warehouses**: a bigger Snowflake warehouse makes the hash pass
+  faster; BigQuery bills by bytes scanned, not time (see
+  [`engines.md`](engines.md)).
+- **Oracle rows that may be longer than 4,000 bytes** (estimated from the
+  raw column lengths: wide tables, CLOBs, long VARCHAR2s) are hashed as a
+  CLOB - natively by `DBMS_CRYPTO` when the login may call it, otherwise by an
+  MD5 written in PL/SQL at about 0.5 MB/s. `GRANT EXECUTE ON SYS.DBMS_CRYPTO`
+  to the reading login makes such tables much faster; it is not needed for
+  correctness.
+- **Interrupting** (Ctrl-C) cancels the running queries on PostgreSQL, MySQL,
+  Oracle and DuckDB; on Snowflake, BigQuery and SQL Server it waits for the query in
+  flight.
+
+## Config file errors (`parity run`)
+
+`parity run` validates the whole file before it connects anywhere, and lists
+every problem at once, each naming the file, the pair (by name and position)
+and the field:
+
+```
+parity: migration.toml: 3 problems in the config:
+  - pair 'orders' (#1): unknown field 'kye' - did you mean 'key'?
+  - pair 'orders' (#1): missing field 'key' (the column or columns that identify a row)
+  - pair 'customers' (#2): field 'b': no connection named 'warehous' in [connections] - did you mean 'warehouse'?
+```
+
+| Message (start) | Cause and fix |
+|---|---|
+| `unknown field 'x'` | A misspelt or unsupported key. It is refused rather than ignored, because a misspelt `exclude` or `where` would silently compare something else. Top level: `connections`, `defaults`, `pair`. `[defaults]`: `float_scale`, `verify_sample`, `max_diffs`, `bisection_factor`, `threshold`. `[[pair]]`: `name`, `a`, `b`, `table` or `a_table` + `b_table`, `key`, `columns`, `exclude`, `map`, `where`, `a_where`, `b_where`, and any default. |
+| `missing field 'a'` / `'key'` / `'b_table' (or 'table' for both)` | Every pair needs both connections, both tables and a key. |
+| `field 'b': no connection named 'x' in [connections]` | `a` and `b` name entries of `[connections]`, not connection strings. |
+| `duplicate name: pair #1 is also called 'orders'` | Names select pairs for `--only` and `--resume`, so they must be unique. A pair without `name` takes its `a_table`, so two pairs reading the same A table need names. |
+| `field 'float_scale' must be a whole number` / `must be at least N` | Numbers unquoted; `max_diffs = 0` is no limit, `bisection_factor` at least 2, `threshold` at least 1. |
+| `field 'where': row filter '…' contains ';'` (and the other `--where` refusals) | The same check as `--where`, see [Comparing a slice](../README.md#comparing-a-slice---where). |
+| `field 'where' is replaced on both sides by a_where and b_where` | Remove `where`, or one of the per-side filters. |
+| `connection 'legacy': environment variable LEGACY_URL is not set` | Export the variable before running. Only the connections of the selected pairs (`--only`) are expanded. |
+| `'${…}' is not an environment variable name` | `${NAME}` takes letters, digits and `_`, not starting with a digit. |
+| `the config file must end in .toml or .json` / `not valid TOML: …` / `not valid JSON: …` | The parser's message carries the line and column. |
+| `reading TOML needs Python 3.11 or newer, or the 'tomli' package` | On Python 3.10: `pip install "parity-diff[toml]"`, or write the same structure as JSON. |
+| `--only names no pair called 'x' - did you mean 'y'?` | `--only` takes pair names, comma-separated or repeated. |
+| `…: not a parity --resume state file` / `cannot read the --resume state file` | The file passed to `--resume` is not one `parity run` wrote (or is from another format version). Delete it or pass another path. |
+
+A pair that fails while running (a table not found, a key not unique, a
+connection refused) is not a config error: it is recorded as that pair's
+error, with the usual `[side A: …]` message from this page, and the run goes
+on to the next pair. The run's exit code is then `2`.

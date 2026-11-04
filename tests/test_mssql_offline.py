@@ -225,7 +225,11 @@ def test_connect_pins_snapshot_and_turns_autocommit_off(fake_driver):
     d.connect("mssql://u:p@h/wh?trust_server_certificate=yes")
     conn = fake_driver[0]
     assert conn.opened_autocommit is True and conn.autocommit is False
-    assert conn.calls[-1] == "set transaction isolation level snapshot"
+    # The isolation level, then NUMERIC_ROUNDABORT off (RT-D6, RT-G8).
+    assert conn.calls[-2:] == [
+        "set transaction isolation level snapshot",
+        "set numeric_roundabort off",
+    ]
     assert d.snapshot and d.default_schema == "sales" and d.database == "wh"
     assert d.caveats([]) == []
     d.close()
@@ -237,7 +241,10 @@ def test_connect_without_snapshot_stays_read_committed_and_says_so(fake_driver):
     fake_driver.append(FakeConn(_probe(snapshot=0, schema=None)))
     d = SQLServerDialect(side="B")
     d.connect("mssql://u:p@h/wh")
-    assert fake_driver[0].calls[-1] == "set transaction isolation level read committed"
+    assert fake_driver[0].calls[-2:] == [
+        "set transaction isolation level read committed",
+        "set numeric_roundabort off",
+    ]
     assert d.default_schema == "dbo"
     (note,) = d.caveats([])
     assert "ALLOW_SNAPSHOT_ISOLATION OFF" in note and "'wh'" in note
@@ -333,7 +340,7 @@ def test_columns_reads_upper_case_catalog_names_and_precision():
     """Upper case or a case-sensitive database rejects the catalog; datetime2
     precision folds into raw_type; datetimeoffset is marked an instant."""
     rows = [("id", "bigint", None), ("t", "datetime2", 7), ("o", "datetimeoffset", 3)]
-    d = _d(lambda sql: rows)
+    d = _d(lambda sql: rows if "INFORMATION_SCHEMA" in sql else [])
     cols = d.columns("sales.orders")
     sql = d._conn.calls[0]
     assert "from INFORMATION_SCHEMA.COLUMNS where TABLE_SCHEMA = N'sales'" in sql
@@ -355,7 +362,8 @@ def test_a_missing_table_names_near_misses_and_the_grant_hint():
     message = str(exc.value)
     assert "side A: mssql" in message and "dbo.Orders" in message
     assert "GRANT SELECT" in message
-    assert "select distinct TABLE_SCHEMA, TABLE_NAME" in d._conn.calls[1]
+    assert "sys.synonyms" in d._conn.calls[1]  # RT-HS9: a synonym is resolved first
+    assert "select distinct TABLE_SCHEMA, TABLE_NAME" in d._conn.calls[2]
 
     def failing(sql):
         """The near-miss query fails; the lookup itself finds nothing."""
@@ -392,9 +400,9 @@ def test_quoting_is_the_injection_boundary():
         ("sysname", LogicalType.STRING),
         ("uniqueidentifier", LogicalType.STRING),
         # rowversion, not a point in time - the shared map would say TIMESTAMP.
-        ("timestamp", LogicalType.UNKNOWN),
-        ("time", LogicalType.UNKNOWN),
-        ("varbinary", LogicalType.UNKNOWN),
+        ("timestamp", LogicalType.BINARY),
+        ("time", LogicalType.TIME),
+        ("varbinary", LogicalType.BINARY),
         ("xml", LogicalType.UNKNOWN),
     ],
 )
@@ -432,6 +440,13 @@ def _escaped(expr: str) -> str:
     )
 
 
+#: BINARY_PREFIX + lower-case hex (style 2), the rule every engine shares.
+_BINARY_HEX = (
+    "(((nchar(92) + nchar(92)) + 'x') + "
+    "lower(convert(nvarchar(max), convert(varbinary(max), [c]), 2)))"
+)
+
+
 @pytest.mark.parametrize(
     ("column", "expr"),
     [
@@ -467,16 +482,20 @@ def _escaped(expr: str) -> str:
         (_col("c", "uniqueidentifier"), "lower(convert(nvarchar(max), [c]))"),
         (_col("c", "nvarchar"), _escaped(_utf16_safe("cast([c] as nvarchar(max))"))),
         (_col("c", "varchar"), _escaped("cast([c] as nvarchar(max))")),
+        # BINARY_PREFIX + lower-case hex (style 2), the rule every engine shares.
+        (_col("c", "timestamp"), _BINARY_HEX),
+        (_col("c", "varbinary"), _BINARY_HEX),
+        # The SRID and the exact extended WKB (RT-HS3); hierarchyid's path.
         (
-            _col("c", "timestamp"),
-            "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
+            _col("c", "geography"),
+            (
+                "N'SRID=' + convert(nvarchar(max), [c].STSrid) + N';' "
+                "+ lower(convert(nvarchar(max), [c].AsBinaryZM(), 2))"
+            ),
         ),
-        (
-            _col("c", "varbinary"),
-            "convert(nvarchar(max), convert(varbinary(max), [c]), 1)",
-        ),
-        (_col("c", "geography"), _escaped("cast([c].ToString() as nvarchar(max))")),
-        (_col("c", "time", 7), _escaped("cast([c] as nvarchar(max))")),
+        (_col("c", "hierarchyid"), _escaped("cast([c].ToString() as nvarchar(max))")),
+        # TIME to the microsecond, the seventh digit truncated.
+        (_col("c", "time", 7), "left(convert(nvarchar(max), cast([c] as time(7))), 15)"),
     ],
 )
 def test_every_type_renders_as_nvarchar_max_inside_the_coalesce(column, expr):
@@ -562,10 +581,9 @@ def test_checksum_and_stats_queries_use_t_sql_spellings():
 
 
 def test_caveats_report_sub_microsecond_columns():
-    """datetime2(7)/datetimeoffset(7) lose their seventh digit, and say so;
-    lower precisions are exact and stay quiet."""
+    """datetime2(7)/datetimeoffset(7)/time(7) lose their seventh digit
+    against an engine without one, and say so; lower precisions stay quiet."""
     d = _d()
-    # time(7) is compared as raw text, all seven digits, so it is not listed.
     cols = [
         _col("a", "datetime2", 7),
         _col("b", "datetime2", 6),
@@ -573,7 +591,7 @@ def test_caveats_report_sub_microsecond_columns():
         _col("d", "time", 7),
     ]
     (note,) = d.caveats(cols)
-    assert "['a', 'c']" in note and "microseconds" in note
+    assert "['a', 'c', 'd']" in note and "microseconds" in note
 
 
 # --------------------------------------------- hooks: other engines unchanged
@@ -607,9 +625,13 @@ def test_the_new_hooks_leave_every_other_engine_sql_as_it_was(dialect):
     keyed = f"count(case when {d.quote('code')} is not null then 1 end)"
     # PostgreSQL counts a hashed key's bytes (RT-B10/D11): a nondeterministic
     # ICU collation would fold 'a'/'A' into one key.
+    # DuckDB counts the key text's UTF-8 bytes (RT-HD14): DuckDB 2.0 applies
+    # a column's collation to count(distinct).
     distinct = (
         f'count(distinct ({identity}) collate pg_catalog."C")'
         if isinstance(d, PostgresDialect)
+        else f"count(distinct encode({identity}))"
+        if isinstance(d, DuckDBDialect)
         else f"count(distinct {identity})"
     )
     assert f"count(*), {keyed}, {distinct} from" in seen[-1]
@@ -674,3 +696,35 @@ def test_a_query_too_large_for_sql_server_names_the_side_and_table():
             d.segment_checksums("s.wide", INT_KEY, [], 1, 100, 4)
         msg = str(caught.value)
         assert "[side A: mssql]" in msg and "s.wide" in msg and "--columns" in msg
+
+
+def test_an_enabled_filter_predicate_is_a_caveat_naming_its_policy():
+    """RT-HS2 offline: a security policy's filter predicate hides rows from
+    this login, so the rows it hides differ unseen. The live test needs a
+    server; here the catalog is canned - one table, visible policies, one
+    enabled filter predicate on it - and the caveat must name the policy. No
+    policy, no caveat."""
+
+    def answer(policies):
+        """Answer the inspection queries; `policies` for sys.security_policies."""
+
+        def reply(sql):
+            """The canned rows for one statement."""
+            if "from sys.objects o" in sql:
+                # type, memory-optimized, object_id, VIEW DEFINITION held
+                return [("U", 0, 42, 1)]
+            if "sys.security_policies" in sql:
+                return policies
+            return []
+
+        return reply
+
+    cols = [Column("v", LogicalType.INTEGER, "int")]
+    plain = _d(answer([]))
+    plain._inspect("dbo.t", "dbo", "t", cols)
+    assert not any("row-level security" in n for n in plain.caveats(cols))
+
+    filtered = _d(answer([("tenant_pol",)]))
+    filtered._inspect("dbo.t", "dbo", "t", cols)
+    notes = [n for n in filtered.caveats(cols) if "row-level security" in n]
+    assert len(notes) == 1 and "tenant_pol" in notes[0] and "dbo.t" in notes[0], notes

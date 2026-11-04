@@ -7,6 +7,7 @@ reachable, so `pytest` is useful on a laptop with only DuckDB installed.
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -23,11 +24,48 @@ def deep_examples(n: int) -> int:
     return n * DEEP
 
 
+def redact_url(url: str) -> str:
+    """`url` with its password replaced by `***` - for anything printed.
+
+    The query string is dropped too: a parameter may carry a secret (a key
+    path is harmless, a passcode is not), and nothing printed needs it.
+    """
+    try:
+        p = urlsplit(str(url))
+        netloc = p.netloc
+        if "@" in netloc:
+            user, host = netloc.rsplit("@", 1)
+            name = user.split(":", 1)[0]
+            netloc = f"{name}:***@{host}" if ":" in user else f"{name}@{host}"
+        return urlunsplit((p.scheme, netloc, p.path, "", ""))
+    except ValueError:
+        return "<unparseable url>"
+
+
+class SecretUrl(str):
+    """A connection URL that never shows its password (RT-HF11).
+
+    pytest prints a failing test's fixture arguments, and the locals of an
+    assertion, with repr(). A plain string URL there put a live Snowflake
+    password and account into the console - and would into any CI log. The
+    value is the real URL (drivers, `str()`, f-strings and `urlsplit` see it
+    whole); only repr() is masked. Never interpolate one into a message:
+    use `redact_url`.
+    """
+
+    def __repr__(self) -> str:
+        """Show the URL with its secrets redacted, so a failure report cannot leak them."""
+        return f"<url {redact_url(self)}>"
+
+
+def secret_env(name: str, default: str = "") -> SecretUrl:
+    """An environment variable holding a URL, masked from pytest's reports."""
+    return SecretUrl(os.environ.get(name, default))
+
+
 #: CLAUDE.md section 7 documents a Docker container on port 55432. A native
 #: install on 5432 is equally valid, so the endpoint is configurable.
-PG_URL = os.environ.get(
-    "PARITY_TEST_PG", "postgres://parity:parity@127.0.0.1:5432/parity"
-)
+PG_URL = secret_env("PARITY_TEST_PG", "postgres://parity:parity@127.0.0.1:5432/parity")
 
 #: Schema the tests own outright. Kept separate from `public` so a stray run
 #: against a real database cannot collide with anything a user cares about.
@@ -35,7 +73,7 @@ PG_SCHEMA = "parity_test"
 
 #: MySQL, if one is running. MySQL has no schema inside a database, so the
 #: `parity_test` database created by the setup grant is where fixtures live.
-MYSQL_URL = os.environ.get(
+MYSQL_URL = secret_env(
     "PARITY_TEST_MYSQL", "mysql://parity:parity@127.0.0.1:3306/parity_test"
 )
 
@@ -53,7 +91,7 @@ def _pg_available() -> tuple[bool, str]:
     try:
         psycopg.connect(PG_URL, connect_timeout=5).close()
     except Exception as exc:  # pragma: no cover - depends on local services
-        return False, f"no PostgreSQL at {PG_URL}: {type(exc).__name__}"
+        return False, f"no PostgreSQL at {redact_url(PG_URL)}: {type(exc).__name__}"
     return True, ""
 
 
@@ -76,14 +114,14 @@ def _mysql_available() -> tuple[bool, str]:
             connection_timeout=5,
         ).close()
     except Exception as exc:  # pragma: no cover - depends on local services
-        return False, f"no MySQL at {MYSQL_URL}: {type(exc).__name__}"
+        return False, f"no MySQL at {redact_url(MYSQL_URL)}: {type(exc).__name__}"
     return True, ""
 
 
 #: Snowflake, if one is configured. There is no local Snowflake and no free
 #: service container, so this is opt-in via an env var and skips otherwise -
 #: it never runs in CI, only when someone points it at a real account.
-SNOWFLAKE_URL = os.environ.get("PARITY_TEST_SNOWFLAKE", "")
+SNOWFLAKE_URL = secret_env("PARITY_TEST_SNOWFLAKE")
 
 
 def _snowflake_available() -> tuple[bool, str]:
@@ -109,7 +147,7 @@ def _snowflake_available() -> tuple[bool, str]:
 #: Application Default Credentials. Opt-in like Snowflake - there is no local
 #: BigQuery and no free CI project, so it never runs in CI. The tests create
 #: and drop their fixture tables in that dataset, and nowhere else.
-BIGQUERY_URL = os.environ.get("PARITY_TEST_BIGQUERY", "")
+BIGQUERY_URL = secret_env("PARITY_TEST_BIGQUERY")
 
 
 def _bigquery_available() -> tuple[bool, str]:
@@ -136,8 +174,8 @@ def _bigquery_available() -> tuple[bool, str]:
 #: (see tests/test_mssql.py). Opt-in like Snowflake: CI has no SQL Server. The
 #: login must be able to create databases - the fixtures build their own - and
 #: the optional `PARITY_TEST_MSSQL_RO` names a second, read-only login.
-MSSQL_URL = os.environ.get("PARITY_TEST_MSSQL", "")
-MSSQL_RO_URL = os.environ.get("PARITY_TEST_MSSQL_RO", "")
+MSSQL_URL = secret_env("PARITY_TEST_MSSQL")
+MSSQL_RO_URL = secret_env("PARITY_TEST_MSSQL_RO")
 
 
 def _mssql_available() -> tuple[bool, str]:
@@ -155,6 +193,31 @@ def _mssql_available() -> tuple[bool, str]:
         get_dialect(MSSQL_URL, side="A").close()
     except Exception as exc:  # pragma: no cover - depends on the server
         return False, f"no SQL Server at the configured URL: {type(exc).__name__}"
+    return True, ""
+
+
+#: Oracle, if one is configured: a URL, or `1` for the local Oracle Free
+#: container `oracle://parity:parity@127.0.0.1:1521/FREEPDB1` (see
+#: tests/test_oracle.py). Opt-in: CI has no Oracle. The login must be able to
+#: create tables in its own schema; the fixtures build their own.
+ORACLE_DEFAULT_URL = "oracle://parity:parity@127.0.0.1:1521/FREEPDB1"
+ORACLE_URL = os.environ.get("PARITY_TEST_ORACLE", "")
+if ORACLE_URL == "1":
+    ORACLE_URL = ORACLE_DEFAULT_URL
+
+
+def _oracle_available() -> tuple[bool, str]:
+    """Can we reach Oracle? Returns (yes/no, why not)."""
+    if not ORACLE_URL:
+        return False, "PARITY_TEST_ORACLE is not set"
+    try:
+        import oracledb  # noqa: F401 - importing it is the probe
+    except ImportError:  # pragma: no cover - depends on install extras
+        return False, "oracledb is not installed"
+    try:
+        get_dialect(ORACLE_URL, side="A").close()
+    except Exception as exc:  # pragma: no cover - depends on the server
+        return False, f"no Oracle at the configured URL: {type(exc).__name__}"
     return True, ""
 
 
@@ -210,6 +273,15 @@ def mssql_url() -> str:
     if not ok:
         pytest.skip(why)
     return MSSQL_URL
+
+
+@pytest.fixture(scope="session")
+def oracle_url() -> str:
+    """The Oracle endpoint, or skip if none is configured/reachable."""
+    ok, why = _oracle_available()
+    if not ok:
+        pytest.skip(why)
+    return ORACLE_URL
 
 
 @pytest.fixture(scope="session")
@@ -274,3 +346,33 @@ def open_bigquery(url: str, side: str = "A", float_scale: int = 6):
 def open_mssql(url: str, side: str = "A", float_scale: int = 6):
     """Open a SQL Server dialect (SNAPSHOT where the database allows it)."""
     return get_dialect(url, side=side, float_scale=float_scale)
+
+
+@pytest.fixture(autouse=True)
+def _sample_check_never_disagrees(request, monkeypatch):
+    """Every comparison in the suite doubles as a test of the sample check.
+
+    The independent sample check (`engine._verify`) runs in every `diff` by
+    default. Where the checksum walk is right - which is every test here that
+    does not plant a check failure on purpose - a disagreement from the check
+    is a false alarm in the check itself, or a real bug in the walk the test
+    did not know about. Either must fail the test, and so must a sample that
+    could not run. Tests that plant a disagreement opt out with the
+    `sample_check_may_disagree` marker.
+    """
+    if request.node.get_closest_marker("sample_check_may_disagree"):
+        yield
+        return
+    import parity.engine as engine
+
+    seen: list[str] = []
+    original = engine._verify
+
+    def checked(v, *args, **kwargs):
+        """Run the real check, then remember anything it objected to."""
+        original(v, *args, **kwargs)
+        seen.extend(f"sample check failure: {f}" for f in v.failures)
+
+    monkeypatch.setattr(engine, "_verify", checked)
+    yield
+    assert not seen, "\n".join(seen)

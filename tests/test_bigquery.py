@@ -397,6 +397,34 @@ def test_a_live_table_is_read_at_one_snapshot(bigquery_url, rw):
         fresh.close()
 
 
+def test_a_row_filter_combines_with_the_snapshot(bigquery_url, duck, orders, rw):
+    """`--where` on a pinned base table: `FOR SYSTEM_TIME AS OF` stays on the
+    table and the filter goes in the WHERE. The plant outside the filter (id
+    5) is not reported, the one inside (id 500) is; and a row inserted inside
+    the filter mid-run stays invisible to the pinned, filtered count."""
+    run, _, ds, _ = rw
+    planted = _planted(
+        rw,
+        orders,
+        "orders_where",
+        "update {t} set amount = amount + 1 where id = 5",
+        "update {t} set amount = amount + 1 where id = 500",
+    )
+    result = _diff(bigquery_url, duck, planted, where_a="id > 100", where_b="id > 100")
+    assert [(d.key, d.kind, d.columns) for d in result.diffs] == [
+        (500, "different", ["amount"])
+    ]
+    assert result.stats.rows_compared_a == N - 100
+    a = open_bigquery(bigquery_url)
+    try:
+        key = a.key_spec(planted, "id")
+        assert a.key_stats(planted, key, "id > 100").rows == N - 100
+        run(f"insert into {ds}.`{planted}` (id) values (999999)")
+        assert a.key_stats(planted, key, "id > 100").rows == N - 100
+    finally:
+        a.close()
+
+
 def test_a_view_is_not_pinned_and_says_so_by_behaving_live(bigquery_url, rw):
     """The documented limitation, pinned as a test: BigQuery ignores time
     travel on a view, so the dialect does not pretend to pin one. If BigQuery

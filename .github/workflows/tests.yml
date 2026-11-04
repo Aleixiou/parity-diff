@@ -106,7 +106,10 @@ jobs:
         # current figure so it catches a real regression without turning every
         # defensive branch into a mock-shaped test. Only this job can reach it:
         # the DuckDB-only job has no PostgreSQL and legitimately covers less.
-        run: pytest -v --cov=parity --cov-report=term-missing --cov-fail-under=95
+        # 90, not 95, since 0.5.0: the Oracle and SQL Server dialects are
+        # verified by their live suites, which need servers this job does not
+        # start, so their connection paths count as uncovered here (91% measured).
+        run: pytest -v --cov=parity --cov-report=term-missing --cov-fail-under=90
 
       - name: the cross-engine tests must not have silently skipped
         # A green run that skipped every PostgreSQL or MySQL test would prove

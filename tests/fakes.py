@@ -18,7 +18,7 @@ The bucket arithmetic below deliberately mirrors the SQL expression in
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any
 
 from parity.dialects.base import HASH_HEX_CHARS, NULL_SENTINEL, Dialect
@@ -166,8 +166,15 @@ class FakeDialect(Dialect):
         side: str = "A",
         float_scale: int = 6,
         key_type_override: Column | None = None,
+        predicates: dict[str, Callable[[int], bool]] | None = None,
     ):
-        """Wrap a Table so the engine can drive it as if it were a database."""
+        """Wrap a Table so the engine can drive it as if it were a database.
+
+        `predicates` stands in for SQL row filters: a `where` string the
+        engine passes is looked up here and applied to each key, and every
+        call records the filter it received in `wheres`, so a test can assert
+        that each row-reading call was filtered.
+        """
         super().__init__(float_scale=float_scale, side=side)
         self.table = table
         self.key_column = key_type_override or Column("id", LogicalType.INTEGER, "bigint")
@@ -176,6 +183,9 @@ class FakeDialect(Dialect):
         self.queries = 0
         #: Rows actually handed back, i.e. what crossed the "network".
         self.rows_served = 0
+        self.predicates = dict(predicates or {})
+        #: (method, where) for every row-reading call, in order.
+        self.wheres: list[tuple[str, str | None]] = []
 
     # -- contract ----------------------------------------------------------
 
@@ -228,10 +238,29 @@ class FakeDialect(Dialect):
 
     # -- the three operations the engine actually calls ---------------------
 
-    def key_stats(self, table: str, key: str) -> KeyStats:
+    def _keep(self, method: str, where: str | None) -> Callable[[int], bool] | None:
+        """Record the filter a call received; return it as a key test, or None
+        for no filter (so an unfiltered walk pays nothing for it)."""
+        self.wheres.append((method, where))
+        if where is None:
+            return None
+        return self.predicates[where]
+
+    @staticmethod
+    def _only(keep: Callable[[int], bool] | None, keys: Iterable[int]) -> Iterable[int]:
+        """The keys a filter keeps; all of them when there is none."""
+        return keys if keep is None else (k for k in keys if keep(k))
+
+    def key_stats(self, table: str, key: str, where: str | None = None) -> KeyStats:
         """Key range and counts. Counts as one round trip."""
         self.queries += 1
-        return self.table.key_stats()
+        keep = self._keep("key_stats", where)
+        if keep is None:
+            return self.table.key_stats()
+        keys = [k for k in self.table.all_keys() if keep(k)]
+        if not keys:
+            return KeyStats(None, None, 0, 0)
+        return KeyStats(min(keys), max(keys), len(keys), len(set(keys)))
 
     def segment_checksums(
         self,
@@ -241,6 +270,7 @@ class FakeDialect(Dialect):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> dict[int, tuple[int, int]]:
         """Row count and checksum per bucket, computed in Python.
 
@@ -248,9 +278,10 @@ class FakeDialect(Dialect):
         integer division - because a test compares the two.
         """
         self.queries += 1
+        keep = self._keep("segment_checksums", where)
         span = hi - lo
         out: dict[int, list[int]] = {}
-        for k in self.table.keys_in(lo, hi):
+        for k in self._only(keep, self.table.keys_in(lo, hi)):
             # Exactly the SQL expression: truncating integer division.
             bucket = ((k - lo) * n_segments) // span
             acc = out.setdefault(bucket, [0, 0])
@@ -271,18 +302,51 @@ class FakeDialect(Dialect):
         columns: Sequence[Column],
         lo: int,
         hi: int,
+        where: str | None = None,
     ) -> dict[int, tuple[str, ...]]:
         """Every row in [lo, hi), and the only thing that counts as downloaded."""
         self.queries += 1
+        keep = self._keep("fetch_range", where)
         index = {c.name: i for i, c in enumerate(self.table.columns)}
         out: dict[int, tuple[str, ...]] = {}
-        for k in sorted(self.table.keys_in(lo, hi)):
+        for k in sorted(self._only(keep, self.table.keys_in(lo, hi))):
             if k in out:
                 raise self._err(f"duplicate key {k} in {table}")
             values = self.table.row(k)
             out[k] = tuple(values[index[c.name]] for c in columns)
         self.rows_served += len(out)
         return out
+
+    def fetch_sample(
+        self,
+        table: str,
+        key: str,
+        columns: Sequence[Column],
+        modulus: int,
+        residue: int,
+        where: str | None = None,
+    ) -> dict[int, tuple[Any, ...]]:
+        """The independent sample: rows whose key hash is `residue` mod
+        `modulus`, as raw values. Counted apart (`samples`, `rows_sampled`),
+        so the walk's own query and download counts stay what they assert."""
+        self.samples = getattr(self, "samples", 0) + 1
+        keep = self._keep("fetch_sample", where)
+        index = {c.name: i for i, c in enumerate(self.table.columns)}
+        out: dict[int, tuple[Any, ...]] = {}
+        for k in self._only(keep, self.table.all_keys()):
+            if modulus > 1 and row_hash(str(k)) % modulus != residue:
+                continue
+            values = self.raw_row(k)
+            out[k] = tuple(values[index[c.name]] for c in columns)
+        self.rows_sampled = getattr(self, "rows_sampled", 0) + len(out)
+        return out
+
+    def raw_row(self, key: int) -> tuple[Any, ...]:
+        """A row's raw values for the sample check: its stored values, which
+        in this fake are already the text the reference rules read. A test
+        overrides this to make the raw values and the rendered text disagree,
+        which is what a dialect bug looks like."""
+        return self.table.row(key)
 
 
 __all__ = [

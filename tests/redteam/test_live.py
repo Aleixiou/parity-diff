@@ -569,6 +569,9 @@ def test_mysql_innodb_mid_walk_writes_stay_invisible(mysql_url, myw, tmp_path):
     assert found(result) == [(10, "different", ("v",))]
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 @pytest.mark.parametrize("engine", ["MyISAM", "MEMORY"])
 def test_mysql_non_transactional_table_changed_mid_walk(mysql_url, myw, tmp_path, engine):
     """The MySQL dialect's single snapshot is InnoDB's. A legacy MyISAM (or
@@ -860,16 +863,11 @@ def test_mssql_login_language_and_database_ansi_options_do_not_move_the_verdict(
     assert found(result) == [(3, "different", ("s",))]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-D6: a database with NUMERIC_ROUNDABORT ON makes every DECIMAL/FLOAT "
-    "rounding raise; the dialect does not pin it OFF and the error names no side",
-)
 def test_mssql_numeric_roundabort_database_still_diffs(mss, tmp_path):
-    """NUMERIC_ROUNDABORT is a database option the ODBC driver does *not*
-    reset. On, every `cast(x as decimal(38,6))` that drops a digit raises
-    error 8115 - so any DECIMAL with more than six places, and the FLOAT
-    rendering, cannot be compared at all."""
+    """RT-D6, fixed: NUMERIC_ROUNDABORT is a database option the ODBC driver
+    does *not* reset. On, every `cast(x as decimal(38,6))` that drops a digit
+    raised error 8115, so no DECIMAL past six places and no FLOAT could be
+    compared. The dialect now sets it OFF for its session (RT-G8)."""
     adm, url = mss
     t = _mssql_types_table(adm, MSSQL_DB, f"roundabort_{RUN}")
     adm.run("master", f"alter database [{MSSQL_DB}] set numeric_roundabort on")
@@ -917,10 +915,15 @@ def test_mssql_snapshot_mid_walk_writes_stay_invisible(mss, tmp_path):
     assert not any("READ COMMITTED" in w for w in result.warnings)
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 def test_mssql_read_committed_false_match_is_at_least_warned(mss, tmp_path):
     """Without snapshot isolation the same repair-one-break-another write reads
-    identical - a verdict true at no instant. That is the documented gap; what
-    must hold is that the run says so, naming the side."""
+    identical to the checksum walk - a verdict true at no instant. The run says
+    so, naming the side; and the independent sample check, which reads the
+    table again after the walk, now sees the broken row, so the verdict is no
+    longer identical either."""
     adm, url = mss
     t = _mssql_walk_table(adm, MSSQL_RC_DB, f"rcwalk_{RUN}")
     a = open_mssql(url(MSSQL_RC_DB))
@@ -933,8 +936,10 @@ def test_mssql_read_committed_false_match_is_at_least_warned(mss, tmp_path):
     fired = after_first_checksum(a, write)
     result = run_diff(a, open_duckdb(_duck_walk(tmp_path)), f"dbo.{t}", "main.t", **WALK)
     assert fired
-    assert result.identical  # the documented false match...
+    assert result.diffs == []  # the walk alone still reads it identical...
     assert any("side A (mssql)" in w and "READ COMMITTED" in w for w in result.warnings)
+    assert not result.identical  # ...but the sample check does not
+    assert any("key 200" in f for f in result.verification.failures)
 
 
 # -------------------------------------------------------------------- DuckDB

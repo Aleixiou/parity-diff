@@ -443,6 +443,9 @@ def test_rt_a9_mssql_trailing_nul_dropped_on_fetch(engines, other):
     assert found(r) == [(1, "different")]
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 def test_rt_a10_checksum_mismatch_with_equal_rows_reads_identical():
     """The engine-level root of RT-A9. Any lossy step between the server's hash
     and Python's `!=` - a driver dropping bytes, a decode replacing them - turns

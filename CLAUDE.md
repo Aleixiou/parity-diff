@@ -79,11 +79,13 @@ The foundation of the whole tool: fold canonical row text into an integer that
 | Snowflake | `floor(md5_number_upper64(<text>) / 16)` |
 | BigQuery | `cast(concat('0x', substr(to_hex(md5(<text>)), 1, 15)) as int64)` |
 | SQL Server | `convert(bigint, convert(varbinary(8), '0' + left(convert(varchar(32), hashbytes('MD5', <utf8>), 2), 15), 2))` |
+| Oracle | `nvl(to_number(substr(rawtohex(standard_hash(<text>, 'MD5')), 1, 15), 'XXXXXXXXXXXXXXX'), <md5('')>)`; a row that may pass 4,000 bytes: the same 15 digits of `parity_md5(<clob>)` |
 
-All six return `648541476951500027` for input `'abc'` - through six different
+All seven return `648541476951500027` for input `'abc'` (Oracle on both of its paths) - through seven different
 paths (bit-cast, hex-cast, CONV, Snowflake's top-64-bits-then-drop-4,
 BigQuery's hex-cast of `to_hex`, since its `md5` returns BYTES, and SQL
-Server's style-2 hex read back as 8 bytes behind a `0` nibble), which
+Server's style-2 hex read back as 8 bytes behind a `0` nibble, and Oracle's
+`to_number(..., 'XXX...')` of `STANDARD_HASH`'s hex), which
 is exactly why a test pins the constant on each. On SQL Server `<utf8>` is
 `cast(cast(<text> as nvarchar(max)) collate Latin1_General_100_BIN2_UTF8 as
 varchar(max))`: SQL Server holds Unicode as UTF-16, and hashing that disagrees
@@ -143,6 +145,33 @@ BigQuery's instant type is plainly `TIMESTAMP` (its naive one is `DATETIME`), th
 opposite of what that name means elsewhere, so the dialect sets
 `Column.tz_aware` explicitly instead of letting the engine infer it from the name.
 
+Round H (2026-11-04, `tests/redteam/test_round_h_bigquery.py`,
+`tests/test_bigquery_nested.py`), each verified live:
+
+- **Never `FORMAT('%t')` for a value that holds text.** It prints strings
+  unquoted, so `['a, b']` equalled `['a', 'b']`, `['']` equalled `[]`,
+  `('a, b', 'c')` equalled `('a', 'b, c')` and a NULL field equalled the
+  string `'NULL'` - false matches. ARRAY now follows the LIST rule
+  (`string_agg` over `unnest(c) with offset`, ordered), and is a LIST - so the
+  sample check reads it - when its element has a rule. STRUCT follows
+  `canonical_struct_text` (base.py: `{name\=value\,...}`, each field by its
+  own rule, read through `unnest([c])`) and stays UNKNOWN; anonymous fields
+  (views only) fall back to `TO_JSON_STRING`. GEOGRAPHY is `to_hex(st_asbinary(c))`:
+  WKT kept 15 digits. Only INTERVAL and RANGE still use `%t`.
+- **FLOAT is one `WITH(...)` expression** (1,261 characters, was 2,214, so
+  ~460 FLOAT64 columns passed the 1,024K-character query limit). WITH binds
+  eagerly, so the BIGNUMERIC is NULL outside the band that needs it - CAST
+  raises on Inf/NaN/huge, ROUND past 38 places. Byte-identical on the 1,565
+  sample at scales 0, 6, 20.
+- Hidden columns (`is_hidden`: `_PARTITIONTIME`) are not data. A `CLONE` is
+  pinned like a base table (verified); a `SNAPSHOT` is immutable, no caveat.
+  Backticked names (whole or per part) and `example.com:proj` projects are
+  parsed; a dataset in another location is named with its `?location=`.
+- A read-only *script* does run under the read-only scope (only writes are
+  refused); the dialect never sends one.
+- `current_timestamp()` is per query even under the pinned snapshot; the
+  `--where` caveat says so.
+
 **SQL Server** (verified live 2026-11-02 against SQL Server 2022 CU27 in a
 Linux container, byte-for-byte with DuckDB over 5,000 mixed-type rows, in a
 UTF-8, a Latin1 and a case-sensitive database; `tests/test_mssql.py`). Every
@@ -184,6 +213,101 @@ Decisions, not just spellings:
   because the shared map would read the first as a point in time, and adding
   `bit` there would turn PostgreSQL's bit strings into booleans.
 - SQL Server floats cannot hold Infinity or NaN, so no tokens are emitted.
+
+**Oracle** (verified live 2026-11-04 against Oracle Database 23ai Free
+23.26 and 21c XE 21.3 in containers, byte-for-byte with DuckDB over 5,000
+mixed-type rows, the conformance sweep at scales 6 and 2 (818 cells on 23ai,
+788 on 21c, which has no BOOLEAN or JSON type), and the FLOAT form on 11,576
+doubles at scales 0, 2, 6, 9 and 20; `tests/test_oracle.py`,
+`tests/test_oracle_offline.py`; the whole live suite passes on both). python-oracledb thin mode. Every value is
+VARCHAR2 in the database character set, which must be AL32UTF8 (refused
+otherwise), so its bytes *are* UTF-8:
+
+| Oracle type | Expression (inside `case when c is null then <sentinel> else ... end`) |
+|---|---|
+| `NUMBER(p,0)`, `NUMBER(*,0)`, scale <= 0 | `to_char(c, 'TM9', <period as decimal character>)` |
+| `NUMBER`, `NUMBER(p,s)`, `FLOAT(p)` (a decimal NUMBER) | `parity_dec(c, s, col)`: `round(c, s)` by TM9, leading `0` restored, fraction padded; >= 1e38 raises |
+| `BINARY_DOUBLE`, `BINARY_FLOAT` (widened) | `parity_float(x, s, col)` - see FLOAT canonical form |
+| `VARCHAR2` / `CHAR` | escaped `c` / `rtrim(c)` |
+| `NVARCHAR2` / `NCHAR` | escaped `to_char(c)` / `rtrim(to_char(c))` - never left national |
+| `CLOB` / `NCLOB` | escaped `c` / `to_clob(c)` (a CLOB) |
+| `DATE` | the TIMESTAMP rule: `to_char(c, 'MM-DD HH24:MI:SS')` and `.000000` behind the year |
+| `TIMESTAMP(p)` | `to_char(v, 'MM-DD HH24:MI:SS.FF6')` (FF6 truncates) behind the year; TZ types use `v = sys_extract_utc(...)` |
+| year | `FM0000`; Oracle has no year 0, so -1 renders `0000` and -44 renders `-43`; > 9999 raises |
+| `INTERVAL YEAR TO MONTH` / `DAY TO SECOND` | `canonical_interval_text` from EXTRACT; DS as total microseconds split into days and the rest |
+| `RAW` / `BLOB` | `BINARY_PREFIX` and `lower(rawtohex(c))` / `lower(parity_blob_hex(c))`, as a CLOB |
+| `BOOLEAN` (23ai) | `case when c then 'true' when not c then 'false' end` |
+| `JSON`, `ROWID` | UNKNOWN (escaped `json_serialize(c returning clob)`, `rowidtochar(c)`) |
+| `LONG`, `XMLTYPE`, `VECTOR`, objects | refused, naming the column |
+
+Decisions, not just spellings:
+
+- **The 4,000-byte trap.** SQL VARCHAR2 is 4,000 bytes (MAX_STRING_SIZE
+  STANDARD); a longer `||` raises ORA-01489 and `STANDARD_HASH` rejects a
+  CLOB (ORA-00902). `DBMS_CRYPTO` needs EXECUTE, which `CREATE SESSION` +
+  `SELECT` does not give (verified with exactly that login). So `hash_parts`
+  emits `case when <bound> <= 4000 then <STANDARD_HASH of the VARCHAR2 row>
+  else <parity_md5 of the CLOB row> end`, the bound summed from each part's
+  registered upper bound (`2 * lengthb` for VARCHAR2, `3 * lengthb` for
+  national text, `3 * dbms_lob.getlength` for a CLOB, constants otherwise).
+  Both branches hash the same text; a bound too small would raise ORA-01489,
+  never truncate. `parity_md5` is RFC 1321 in PL/SQL (`DBMS_LOB.CONVERTTOBLOB`
+  to AL32UTF8, 16 kB chunks), declared in the query's `WITH FUNCTION` clause
+  - no CREATE privilege, nothing stored - and equals `hashlib.md5` from 0 B to
+  600 kB, emoji across every chunk boundary included; about 0.5 MB/s.
+- **Inline functions, because Oracle parses slowly.** The FLOAT construction
+  as one SQL expression was 171 kB per column, and a 500-column checksum
+  query sat for minutes in "latch: shared pool". `parity_float` and
+  `parity_dec` hold the same arithmetic in variables. `query` prepends
+  exactly the functions a statement calls.
+- **The empty string is NULL.** Oracle cannot store `''`, so the sentinel is
+  decided by the *column* being NULL, never by the rendered text: an
+  all-space CHAR rtrims to NULL, which `||` reads as the empty text it is.
+  Oracle NULL against another engine's `''` is a reported difference, and
+  `caveats()` says so on every run with a text column. No equating mode.
+- **FLOAT.** `cast(binary_double as number)` keeps 17 significant digits
+  (3,807 of 4,000 doubles came back inexact). The exact value is
+  `m / 2^(52-e)` in NUMBER (m < 2^53 exact; 2^s exact in NUMBER up to
+  s = 130); NUMBER to BINARY_DOUBLE is correctly rounded (3,000 random
+  decimals of 15-38 digits); the 15/16/17-digit candidates with ties to even
+  then work as on SQL Server. **Any BINARY_DOUBLE operand makes the whole
+  expression BINARY_DOUBLE** - the first draft's exponent was one, and 593
+  values disagreed.
+- **Escaping runs under `collate binary` and is handed back `collate
+  using_nls_comp`**: a column collation (EXTENDED databases) could make
+  REPLACE linguistic, and text with an explicit collation cannot be appended
+  to a CLOB (ORA-43912). A CLOB takes no COLLATE at all.
+- **Session pins** (`SESSION_PINS`): language, territory, calendar (a Thai
+  Buddha calendar moves every year), numeric characters, the date and
+  timestamp formats, NLS_SORT/NLS_COMP BINARY, TIME_ZONE +00:00 (otherwise
+  inherited from the client: +01:00 seen), NLS_NCHAR_CONV_EXCP,
+  CURSOR_SHARING EXACT, QUERY_REWRITE_ENABLED off (a stale materialized view
+  must never answer for the table). A logon trigger setting all of them
+  hostile changes no row's text (`test_hostile_session_settings_...`).
+- **Keys.** Integer keys wider than 18 digits are hashed (`bisects_natively`):
+  `(k - lo) * n` past 38 digits would round silently in NUMBER. `int_div` is
+  the exact-multiple form. LOB keys are refused. Distinct keys are counted by
+  SHA-256 of their text.
+- **Snapshot.** `SET TRANSACTION READ ONLY` after the pins: one snapshot, and
+  ORA-01456 for any write (verified around `query`). A table whose
+  definition is newer than the snapshot (created, altered, truncated, or
+  given its first segment just before) raises ORA-01466 - measured always at
+  0 s, sometimes at 1.1 s, never from 1.6 s - which `query` re-raises naming
+  the side. A TIMESTAMP WITH LOCAL TIME ZONE at 9999-12-31 23:59:59.999999
+  UTC reads as year 10000 on 23ai and TO_CHAR raises ORA-01877 on it: the
+  year guard refuses it (21c renders it correctly).
+- **Julian dates.** Oracle's calendar is Julian before 1582-10-15, also in
+  arithmetic: `date '0999-12-25' + 66` is 1000-02-29 (DuckDB: 1000-03-01).
+  Values compare by their Y-M-D labels, which is what drivers and exports
+  carry; data built by date arithmetic before 1582 differs, and is reported.
+- **DBMS_CRYPTO, where granted.** `connect` probes `DBMS_CRYPTO.HASH`; when
+  the login may call it, long rows are hashed by it natively (it hashes a
+  CLOB as AL32UTF8 - verified equal to `parity_md5` and to Python on every
+  test text). Otherwise `parity_md5`. Both paths ran the full live suite.
+- **Driver binds.** python-oracledb binds a Python float as NUMBER (lossy, or
+  DPY-4003) and a timedelta of -1 us as -1 day + 23:59:59.999999; tests bind
+  BINARY_DOUBLE explicitly and intervals as `numtodsinterval`. The dialect
+  fetches NUMBER as Decimal and LOBs as str/bytes (`_output_type_handler`).
 
 **Infinity and NaN must be special-cased for FLOAT.** DuckDB cannot cast them
 to DECIMAL at all — `Could not cast value inf to DECIMAL(38,6)` kills the whole
@@ -263,6 +387,8 @@ for byte:
 | MySQL | `cast(cast(c as decimal(38,6)) as char)` (unchanged: its DECIMAL cast goes through dtoa's shortest repr) |
 | BigQuery | the first of `round(cast(c as bignumeric), n-1-e, 'ROUND_HALF_EVEN')` for n = 15, 16, 17 significant digits that casts back to `c`, then `round(.., 6)` |
 | SQL Server | the same construction from `cast(c as decimal(38,37))` below 1 and `cast(c as decimal(38,21))` up to 2^53, with ties to even built by hand (`ROUND` is half away from zero) at 16 and 17 digits; `--float-scale` capped at 18 |
+| Snowflake | the same two bands from `cast(c as number(38,q))`, candidates `round(.., n-1-e, 'HALF_TO_EVEN')` |
+| Oracle | `parity_float`: the exact value as `m / 2^(52-e)` in NUMBER, then the SQL Server candidates and ties |
 
 Every one of these was found by measurement, not by reading the docs:
 
@@ -303,9 +429,14 @@ Every one of these was found by measurement, not by reading the docs:
   string-to-float parse is not correctly rounded**: `'-5.795195809241054e+16'`
   arrives one ulp off and subnormals arrive as 0, so test doubles must travel
   as bound parameters, never literals.
-- **Snowflake is not verified** against this form (no live account): its FLOAT
-  is still `cast(c as number(38,6))`, and `float_caveat()` makes every run that
-  compares a Snowflake FLOAT column print a warning.
+- **Snowflake prints no shortest repr either** (verified live 2026-11-03): a
+  varchar cast is 15 significant digits, `TO_VARCHAR(x, 'TME')` 16, and the old
+  `cast(c as number(38,6))` rounded the exact binary value (215 of the 1,565
+  sample doubles disagreed). `cast(float as number(38, q))` *is* the exact value
+  rounded half up, and `ROUND` takes a per-row scale and a `'HALF_TO_EVEN'`
+  mode, so the BigQuery construction carries over with no hand-built tie test.
+  NUMBER holds 38 digits, hence SQL Server's two bands (37 places below 1, 21
+  up to 2^53). Agrees with the spec on 6,565 doubles at scales 0, 2, 6, 9, 20.
 
 Before this form, PostgreSQL and DuckDB disagreed on 347 of the 1,565 sample
 doubles, PostgreSQL and MySQL on 296, DuckDB and MySQL on 289; now every pair
@@ -612,7 +743,8 @@ BigQuery has no multi-statement snapshot, so every read of a **base table** uses
 `FOR SYSTEM_TIME AS OF` the server time captured by the first metadata query -
 verified live: a row inserted mid-walk stays invisible. BigQuery silently ignores
 time travel on a **view** (verified: it returned the live count), so views are read
-live at every level, as on Snowflake (READ COMMITTED only). Documented in the README,
+live at every level, as on Snowflake (READ COMMITTED only). A table **clone** honours
+time travel and is pinned (verified); a table **snapshot** cannot change. Documented in the README,
 pinned by a live test. The dialect also requests the `bigquery.readonly` OAuth scope,
 so the server itself refuses any write - verified for INSERT, DELETE, CREATE, DROP.
 
@@ -705,20 +837,278 @@ the false matches listed in the CHANGELOG. Rules that came out of it:
   `READ ONLY` with `sql_mode` pinned; a row past `max_allowed_packet` makes
   `concat_ws` return NULL, so `row_hash` falls back to hashing per-column md5s
   rather than letting the row drop out of `sum()`; non-InnoDB tables get a
-  no-snapshot caveat.
+  no-snapshot caveat - views too, through `view_table_usage` (8.0.13+), and
+  conservatively when the base tables cannot be listed (RT-HM17).
+  **Round H (2026-11-04, verified on 8.0.46, 8.0.42 native, 9.7.4):**
+  `cast(c as char)` from a legacy character set turns every character with no
+  Unicode mapping into `?`/U+FFFD and a ucs2 surrogate into SQL NULL - no
+  error, any sql_mode - so different stored characters, a real `?` and NULL
+  all compared equal (RT-HM1/HM2, false matches). Outside
+  `_LOSSLESS_CHARSETS` (utf8mb4/mb3, utf16, latin1: verified total and
+  one-to-one) a value converts back to its own charset and is compared byte
+  for byte; equal renders exactly as before (**no checksum of convertible
+  text moves**), unequal renders `parity: not convertible from <cs> 0x<HEX>`
+  - a marker, not a refusal, like SQL Server's unpaired surrogates, so keys
+  stay distinct. Column-level grants hide columns from information_schema;
+  `SELECT * ... LIMIT 0` fails exactly then (1142/1143) and the table is
+  refused (RT-HM3, false match). A `--where` holding `FOR SHARE`/`FOR
+  UPDATE`/`LOCK IN SHARE MODE`/`INTO`/`OUTFILE`/`DUMPFILE` outside quotes is
+  refused: READ ONLY does not refuse a shared locking read (RT-HM12).
+  ZEROFILL and YEAR render `c + 0` (display padding is not the value;
+  checksums move for ZEROFILL columns and YEAR 0 only); ENUM index 0 renders
+  `parity: invalid ENUM value (index 0)`, never `''` (RT-HM9); `VECTOR` is
+  hex of its bytes. The sample check reads ENUM/SET/legacy-charset text as
+  hex facts (index, stored, round-tripped, utf8mb4 bytes) and DATE/TIMESTAMP
+  as MySQL's text (the connector returns None for zero dates). MariaDB is
+  refused by name; `lc_messages` is pinned to `en_US` and the error patterns
+  no longer need English. Open: a cancel at `max_user_connections` cannot
+  KILL (the C connector has no socket to interrupt) and now warns instead of
+  failing silently (RT-HM16); JSON typed scalars (`cast(date as json)`)
+  print as strings (RT-HM8, documented); casefold column matching (RT-HM18,
+  engine).
 - **SQL Server:** unpaired surrogates render as a marker plus their bytes
   (UTF-8 conversion turned them all into U+FFFD); downloads fetch the canonical
   text as `varbinary` UTF-8 bytes; `sql_variant` renders `<BaseType>:<exact>`;
   the SELECT guard accepts one plain SELECT only.
+- **SQL Server, round H (RT-HS1-11, verified live on 2022):** a column under
+  dynamic data masking that the login cannot UNMASK
+  (`sys.masked_columns`, `HAS_PERMS_BY_NAME(..., 'UNMASK', col, 'COLUMN')`,
+  else the database grant) is refused in `normalize`, and a view reading one
+  is refused in `columns()` - masks hashed alike, a false match. An enabled
+  security-policy filter predicate (on the table, or what a view reads via
+  `sys.dm_sql_referenced_entities`, which needs VIEW DEFINITION on the view only) is a caveat; without database-level VIEW DEFINITION
+  the policies are invisible to the login, and the caveat says RLS cannot be
+  ruled out. Spatial renders `SRID=<n>;` + `AsBinaryZM()` hex (ToString has
+  no SRID). varchar/char/text in code pages 932/936/949/950 (`raw_type`
+  `varchar(cp932)`) goes through `_dbcs_safe`: bytes that do not round-trip
+  through nvarchar render a marker + hex (the round trip must be compared by
+  length too). `--where` is re-scanned as T-SQL (`]]` escapes `]` in
+  brackets) and refuses `with (`/`option (` hints and `{` braces. A
+  memory-optimized table is read `WITH (SNAPSHOT)` with the session at READ
+  COMMITTED - set with autocommit **on**: set inside mssql-python's implicit
+  transaction it is reported but the next access still fails 41332.
+  `decimal(p,s)` with `s < scale` and `p - s > 38 - scale` renders its own
+  text padded with zeros (byte-identical where the cast fits).
 - **DuckDB:** extension autoinstall/autoload are off (no network, §6);
-  HUGEINT key spans past 2^127 bucket exactly in UHUGEINT.
-- **Snowflake changes are unverified live** (no account): UTC rendering of
-  `TIMESTAMP_TZ`, `tz_aware`, `VARIANT` type tag, schema-qualified tables, the
-  exact `int_div`, telemetry off. Each needs one live query to confirm.
+  HUGEINT key spans past 2^127 bucket exactly in UHUGEINT. Round H
+  (verified on 1.3.0-2.0.0): a file is refused unless its header carries
+  `DUCK` at byte 8 (`duckdb.connect` would otherwise download
+  sqlite_scanner for a SQLite file, before any pin); a file defining a macro
+  or type named like *any* built-in is refused (stored macros win over
+  built-ins, read-only or not - `md5` as a macro made every row hash alike);
+  tables are `"catalog"."schema"."table"` and the column lookup is
+  `system.information_schema` filtered by catalog; a view is DESCRIBEd live
+  (its catalog entry is stale after an ALTER of its base table); key
+  uniqueness counts `encode(text)` (2.0 applies collations to `count
+  distinct`); `array_to_string([])` is NULL on 1.3-1.4, so lists coalesce
+  it to `''`; a fixed-size ARRAY `T[n]` is a LIST; a STRUCT/MAP/UNION/list
+  holding a UNION, TIMETZ, VARIANT or ARRAY renders part by part
+  (`DuckDBDialect._nested`: struct `{name\=v\,}`, map as entry structs in
+  stored order, union `<tag\=v>`), every other nested type keeps its
+  varchar cast so its checksum did not move; MotherDuck URLs are refused
+  and `?query` parts are cut from path errors.
+- **Snowflake changes are verified live** (2026-11-03, `tests/test_snowflake.py`):
+  UTC rendering of `TIMESTAMP_TZ`/`LTZ`, `tz_aware`, the FF6 caveat, FF9 keys,
+  exact DECIMAL keys, `VARIANT` type tag, schema-qualified tables, the exact
+  `int_div` (plain `/` rounds the quotient to 6 places - confirmed), escaping
+  under an `en-ci` collation. **Telemetry:** `CLIENT_TELEMETRY_ENABLED` is a
+  client parameter (the server does not list it); connectors probe cloud
+  metadata at login unless `SNOWFLAKE_DISABLE_PLATFORM_DETECTION` is set (the
+  dialect sets it). Connector 5.x (a Rust core) flushes a session-telemetry
+  batch at logout that no switch in 5.1.0 stops, so the extra pins
+  `>=4.0,<5`; on 4.8.1 a live test confirms only login, query and logout
+  endpoints are contacted (`test_a_session_contacts_only_the_account_...`).
+  URL parameters are whitelisted (`URL_PARAMS`), as on MySQL, SQL Server and
+  BigQuery. **Key-pair sign-in** (`?private_key_file=`, passphrase only from
+  `PARITY_SNOWFLAKE_KEY_PASSPHRASE[_A|_B]`, never the URL): parity loads the
+  PEM itself and passes DER bytes with `authenticator=SNOWFLAKE_JWT` and no
+  password, through the same `connect_kwargs` that carries the telemetry pins
+  (pinned offline in `test_snowflake_connect_offline.py`; live test gated on
+  `PARITY_TEST_SNOWFLAKE_KEYPAIR`). No browser or token authenticator.
+- **Snowflake round H** (verified live 2026-11-04, `tests/redteam/
+  test_round_h_snowflake.py`): `SESSION_PINS` adds
+  `quoted_identifiers_ignore_case = false` (else `"orders"` reads ORDERS)
+  and `strict_json_output = false` (else `[1,undefined]` prints `[1,null]`).
+  **A VARIANT double is refused when TO_JSON's 16-digit text does not read
+  back as it** (`_check_variant_doubles`, one FLATTEN scan per JSON column
+  before the first checksum): there is no exact printing of a double inside
+  a document, and adjacent doubles printed alike. DECIMAL renders as
+  `round(c, s)` padded to s places - never `cast(c as number(38, s))`, which
+  held only 38 - s integer digits; byte-identical where the cast worked.
+  NUMBER(38,0) key spans whose `(k - lo) * n` passes 38 digits bucket by
+  comparing the key with the precomputed boundaries (`bucket_expr`).
+  TIMESTAMP_TZ FF9 keys go through `convert_timezone('UTC', ...)` like
+  values. Masking and row access policies (`POLICY_REFERENCES`) are caveats,
+  as PostgreSQL RLS is - the tool cannot tell whether a conditional policy
+  masks for its role; a view's underlying policies are not visible, which is
+  a caveat too. GEOGRAPHY / GEOMETRY / VECTOR render WKB / EWKB / the
+  vector's JSON array. `check_where` refuses `//` outside quotes. Test-suite
+  URLs are `SecretUrl` (conftest): repr() masks the password.
+- **The walk is checked by a second method** (`engine._verify`,
+  `parity/reference.py`). About `verify_sample` rows, chosen by a hash of the
+  key text (`fetch_sample`), are fetched as raw driver values and compared in
+  Python by the rules - no `normalize` SQL - and must agree with the walk on
+  every sampled key; a disagreement is a failure and the result is not
+  identical. A check that was asked for and **could not run**
+  (`verification.error`) is not identical either (exit 1, "not proven"): only
+  `verify_sample=0` rests the verdict on the checksums alone, and the report
+  then says the check was off. It compares by canonical text (`canonical_text`), not by typed
+  value, because that is the walk's equality. Driver workarounds live in
+  `sample_select`/`sample_value` per dialect, never in the reference. The
+  test suite's autouse fixture `_sample_check_never_disagrees` fails any test
+  whose comparison the check contradicts, so every comparison in the suite
+  also tests the check; tests that plant a walk defect opt out with
+  `@pytest.mark.sample_check_may_disagree`.
+- **The coverage map is the evidence, not a claim** (`tests/conformance/`,
+  `docs/coverage.md`, regenerate with `tests/conformance/report.py`): every
+  logical type on every engine against `parity.reference`, at scales 6 and 2.
+  A new disagreement fails the sweep; a confirmed one is a COV-<n> strict
+  xfail until fixed. Saved runs (`tests/conformance/results/`) are not
+  committed: they can carry account identifiers.
+- **Sub-microsecond rule (COV-2):** `Column.sub_micro` is set by the engine
+  only when both sides' `holds_sub_micro` is true; then a value with digits
+  past microseconds renders nine digits on every engine, otherwise they are
+  truncated and the dialect's caveat says so.
+- **TIME, BINARY, JSON** (`canonical_time_text`, `canonical_binary_text`,
+  `canonical_json_text` in base.py): TIME `HH:MM:SS.ffffff`; BINARY `\\x` +
+  lower hex; JSON the engine's own normal form (jsonb on PostgreSQL, MySQL's
+  binary JSON, BigQuery/Snowflake by code point, DuckDB verbatim text) in one
+  layout - `{"a": 1, "b": [1, 2]}` - and one string escaping, with every
+  backslash in that SQL built by `spell_sql` (RT-D1). Cross-engine JSON is
+  exact only where normal forms coincide; `json_semantics` names both forms
+  in a warning otherwise. A NULL JSON must render the sentinel, never `null`
+  (BigQuery's TO_JSON_STRING(NULL) is `null`).
+- **BITS, INTERVAL, TIMETZ, LIST, INET, VARIANT** (`canonical_*_text` in
+  base.py, `tests/test_types_rules2.py`; verified live on PostgreSQL 18.4,
+  DuckDB 1.5.5, MySQL 8, SQL Server 2022). Rules, and why each is injective:
+  - BITS: the digits at full width (`bit(8)` b'101' is `00000101`) - what
+    PostgreSQL, DuckDB and MySQL already printed. Never merged with BOOLEAN:
+    SQL Server's `bit` keeps its own map (`map_type_mssql`).
+  - INTERVAL: `<months> mon <days> day <µs> us`, the three stored components
+    (PostgreSQL `extract` year/month, day, hour/minute/microseconds, summed in
+    numeric; DuckDB `datepart` in HUGEINT). `1 day` and `24 hours` differ
+    though both engines' `=` says equal - they print and add differently. PG
+    17's infinite intervals render `infinity`/`-infinity`. The sample reads
+    text (IntervalStyle pinned): both drivers fold a month into 30 days.
+  - TIMETZ: `canonical_time_text` of the local clock + offset `+HH:MM`, `:SS`
+    when it has seconds. **DuckDB's varchar cast of a TIMETZ is not
+    injective** (COV-7: `+05:00:30` prints `+05:30`), so DuckDB renders from
+    `datepart` and its sample reads the driver's `datetime.time`.
+  - LIST: `[` + each element by its own type's `normalize`, each followed by
+    `\,` (`LIST_TERMINATOR`), + `]`. Escaped text only ever has `\\`, `\s`
+    after a backslash, so no element forges the terminator; the text starts
+    with `[`, so it is never the sentinel. The element is rendered through a
+    stand-in column (`LIST_ELEMENT_NAME`: an `unnest ... with ordinality`
+    alias on PostgreSQL, a list-comprehension variable on DuckDB). PostgreSQL
+    reports every array as `ARRAY`, so `_with_arrays` reads the element type
+    from the catalog (`integer[]`). Ruled element types are
+    `LIST_ELEMENT_TYPES`; anything else (JSON, nested, structs) leaves the
+    list UNKNOWN. A PostgreSQL array with more than one dimension or a lower
+    bound other than 1 holds its shape in its value and `unnest` would
+    flatten it, so its `array_dims` lead, between `\=` marks
+    (`LIST_DIMS_MARK`): `[\=[1:2][1:2]\=1\,2\,3\,4\,]` - a plain list
+    cannot start `[\=`. psycopg drops lower bounds, so the PostgreSQL sample
+    reads the array's text (`parse_pg_array`). Refused loudly: a list of
+    DuckDB TIMESTAMP_NS (no caveat could reach an element) and a LIST key
+    (elements round as values do).
+  - INET: PostgreSQL's `::text` (`text(inet)`: the prefix always written, IPv6
+    by BIND's `inet_net_ntop`, reproduced in `canonical_inet_text`).
+  - VARIANT (sql_variant): `<base type>:<value>`, each base type in an exact
+    style; float/real as `0x` + IEEE bits (-0 as 0), because style 3 raised
+    on -0.0 and on negatives below 1e-99 and is not correctly rounded
+    (COV-8). mssql-python drops the base type, so the sample reads base type,
+    code page and `convert(varbinary)` of the value, decoded by
+    `_variant_value` from SQL Server's storage layouts.
+  - UHUGEINT is INTEGER, and as a key it is hashed (`bisects_natively`):
+    DuckDB silently turns UHUGEINT arithmetic with a signed operand into
+    DOUBLE. PostgreSQL `name` is STRING.
+  - Not ruled, by choice: BigQuery ARRAY (cannot be NULL or hold a NULL, so a
+    rule would only partly meet other engines') and INTERVAL; ranges,
+    structs, nested lists, arrays of JSON.
+- **Session pins are the contract for server settings** (round G): every
+  setting that changes rendering or row visibility is pinned at connect -
+  MySQL `sql_select_limit`, Snowflake `rows_per_resultset`, PostgreSQL
+  `quote_all_identifiers`, SQL Server `numeric_roundabort` - and the engine
+  checks that each side's first-level bucket counts add up to its row count,
+  so any cap not yet pinned reads unexplained, never identical. PostgreSQL
+  hashes `convert_to(text, 'UTF8')`; FLOAT is refused on SQL Server below
+  compatibility level 130 and on PostgreSQL below 12; PostgreSQL < 9.6 and
+  DuckDB < 1.3 are refused outright; RLS is a caveat.
+- **PostgreSQL, round H:** `extra_float_digits` is 3 before 12; every pin is
+  re-read after the walk (`session_drift`) and session-changing functions are
+  refused in filters; columns the login lacks SELECT on are a schema
+  difference (`unreadable_columns`); views are followed through pg_depend for
+  the RLS caveat; money renders at the login's own `lc_monetary` frac_digits;
+  unmapped base types outside pg_catalog and `TRUSTED_EXTENSION_TYPES` compare
+  as text + `` + their send hex, or are refused (no send function, or
+  nested); dates past 294276-12-31 render via `::text`; a hashed key's NULL
+  check uses `num_nulls`; `connect_timeout` defaults to 30 s.
+- **INTEGER against DECIMAL compares by value** (RT-HX2, `_integer_as_decimal`
+  in engine.py). Whether a scale-0 decimal is an integer is the engine's call:
+  Snowflake reports INT, BIGINT, NUMBER(19,0) and NUMBER(14,0) all as
+  `NUMBER` with scale 0 (measured live), so it, like Oracle, maps them
+  INTEGER, while PostgreSQL/DuckDB keep numeric(14,0) DECIMAL. No one-sided
+  mapping is right, so the engine renders the INTEGER side of such a pair
+  through the DECIMAL rule (BigQuery via `cast(.. as numeric)`: ROUND of
+  INT64 is FLOAT64). Same-type pairs are untouched. A DuckDB DECIMAL(p,p)
+  prints no leading zero (`.25`); its key text, and its value at float scale
+  38, restore it (RT-HX1).
 - **Additive checksums are not tamper-proof.** Eight crafted row changes can
   cancel in one bucket's sum (Wagner's k-tree, seconds in Python, no secret
   needed). Accidentally the odds are ~2^-60 per differing bucket. Documented,
   not defended: a keyed or non-linear checksum would be the defence.
+- **A row filter reaches every query that reads the table, or none**
+  (`--where`, 2026-11-03). Every row-reading query - `key_stats`,
+  `_segment_sql`, `fetch_range`, `fetch_sample` - names its table through
+  `Dialect.rows_from`, which puts `(<predicate>)` first in the WHERE, ANDed
+  with the tool's own bounds; a dialect overriding one of those four must
+  pass `where` through (SQL Server's `_segment_sql`/`segment_checksums` do).
+  `tests/test_where_sql.py` records every statement on all six dialects and
+  fails on one without the predicate. The engine passes `where` only when
+  set, so unfiltered SQL is byte-identical. The predicate is the user's own
+  SQL, so not a security boundary, but it must stay one read:
+  `row_filter_problem` refuses `;`, comments (incl. MySQL `#`), and what
+  engines quote differently (a backslash before a quote, `'''`, `$$`), then
+  checks quotes, `[...]` and parentheses balance, so `1=1) or (1=1` cannot
+  escape; `check_where` adds SQL Server's SELECT guard. A filtered verdict
+  covers the filtered rows only and says so in the headline, a `filtered:`
+  line, JSON `where_a`/`where_b`, `risk.filtered` and a caveat.
+- **Each level of the walk must add up to the level above** (found by the
+  `--where` work). A queued range carries both sides' (count, checksum)
+  from its parent bucket; its buckets must sum to exactly that, per side,
+  or the range is unexplained. Without it a difference seen at one level
+  could leave an unstable filter (`random()`, `clock_timestamp()`) or be
+  rewritten on an engine without one snapshot before the next level looked,
+  and the run read identical with the evidence discarded. Exact (sums are
+  exact, buckets tile the range), so a single-snapshot run never trips it.
+- **Renamed columns are re-keyed, never re-ordered** (`--map`). Side B's
+  folded column dict is re-keyed under side A's folded names
+  (`_apply_column_map`) before key resolution and column selection, so the
+  compared list, its order and the key all follow from A's names and a
+  mapped B column lands in A's position of the row text. Ambiguity is
+  refused, never guessed: a name absent on its side, one A column onto two
+  B columns or two onto one, a mapped B column a same-named column would
+  still match, a column both mapped and excluded, `--exclude`/`--columns`
+  by B's name. A swap (`x=y,y=x`) is legal and pinned by tests both ways
+  (swapped data matches except the plant; unswapped data differs on every
+  row). Differences carry A's name; `DiffResult.column_map` gives B's.
+- **A multi-pair verdict is each pair's verdict, never stronger than its
+  weakest pair** (`parity run`, `parity/batch.py`, 2026-11-04). Each pair is
+  one plain `diff` on two fresh dialects closed before the next, so no
+  snapshot or session is shared. The summary renders from each pair's
+  `to_dict` JSON (so a `--resume`d pair prints exactly like a fresh one),
+  and `batch.qualifiers` lists every line the single-pair report prints
+  before its rows - filtered, truncated, schema, unexplained, sample failure
+  / error / not run, uncovered columns, notes, every warning - in all four
+  formats; `tests/test_batch.py` checks each qualifier in each format. The
+  whole config is validated before any connection; unknown fields are
+  refused, never ignored (a misspelt `where` would compare the whole table).
+  `${NAME}` values are registered with a `Redactor` and replaced in every
+  tool message, report and the state file - never in data values. `--resume`
+  skips only pairs that finished **identical** under the same hash of
+  settings, version and a salted PBKDF2 fingerprint of each expanded
+  connection, so re-pointing a variable re-runs the pair. Exit 2 beats 1:
+  any pair error or Ctrl-C is 2. The CLI only adds the subcommand.
 
 ## 5. Architecture
 
@@ -736,6 +1126,7 @@ duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute, POSIX)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
 duckdb:///:memory:
 mssql://user:password@host:port/database?trust_server_certificate=yes   (also sqlserver://)
+oracle://user:password@host:port/service_name        (python-oracledb thin mode)
 ```
 
 The slash count carries meaning, as in sqlite and SQLAlchemy: exactly **one**
@@ -795,8 +1186,9 @@ class Dialect(ABC):
 ```
 
 Shared, non-abstract helpers on the base class build `concat_ws(...)` row text,
-the per-segment checksum query, and the small-range row fetch — so a new
-dialect is roughly 80 lines.
+the per-segment checksum query, and the small-range row fetch — so the
+required methods are short, though a verified dialect is several hundred lines
+(DuckDB, the smallest, about 570).
 
 ## 6. Engineering conventions
 
@@ -815,6 +1207,13 @@ dialect is roughly 80 lines.
   is a landmine for the next contributor.
 - Errors must name the side and the table. `"table not found"` is useless when
   you are comparing two databases.
+- **`docs/risk.md` states the error odds of every step and is updated in the
+  same commit as every change to the tool** - re-check the sections the
+  change touches, copy new coverage numbers, then re-stamp it with
+  `python tests/test_risk_doc.py --stamp`. `tests/test_risk_doc.py` fails
+  whenever `src/parity/` changed since the last stamp, or a figure there
+  disagrees with the code or `docs/coverage.md`. Never re-stamp without
+  reviewing: the file is what a client is told about trusting a verdict.
 
 ## 7. Local development environment (Windows)
 

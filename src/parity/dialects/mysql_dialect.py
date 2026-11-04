@@ -50,17 +50,54 @@ MYSQL_MAX_DECIMAL_SCALE = 30
 
 #: Leads the text a too-wide DECIMAL raises with, so `query` can recognise it.
 DECIMAL_RANGE_MARKER = "parity: DECIMAL value "
-_DECIMAL_RANGE_ERROR = re.compile(r"'(" + re.escape(DECIMAL_RANGE_MARKER) + r".*)' for")
+_DECIMAL_RANGE_ERROR = re.compile(r"'(" + re.escape(DECIMAL_RANGE_MARKER) + r".*)'")
 
 #: Leads the text a FLOAT past 2^116 raises with. Short, because MySQL cuts
 #: the quoted UUID_TO_BIN argument at 128 characters and the value and column
 #: must survive; `query` expands it to `FLOAT_OUT_OF_RANGE_MESSAGE`.
 FLOAT_RANGE_MARKER = "parity: FLOAT value "
-_FLOAT_RANGE_ERROR = re.compile(r"'" + re.escape(FLOAT_RANGE_MARKER) + r"(.*)' for")
+_FLOAT_RANGE_ERROR = re.compile(r"'" + re.escape(FLOAT_RANGE_MARKER) + r"(.*)'")
 
 #: Leads the text a value too long to render raises with (see `_binary_text`).
 TOO_LONG_MARKER = "parity: too long to render: "
-_TOO_LONG_ERROR = re.compile(r"'" + re.escape(TOO_LONG_MARKER) + r"(.*)' for")
+_TOO_LONG_ERROR = re.compile(r"'" + re.escape(TOO_LONG_MARKER) + r"(.*)'")
+
+# The three patterns above end at the *last* quote of the message, not at the
+# English " for function": error 1411 is worded in the server's lc_messages,
+# and a German server's "... fuer Funktion uuid_to_bin" let the raw error
+# through without its explanation (RT-HM10). The quoted argument is ours and
+# language independent; `connect` also pins lc_messages to English.
+
+#: Character sets in which every value MySQL can store converts to utf8mb4
+#: exactly and one to one, so `cast(c as char)` loses nothing. Verified on
+#: 8.0: all 256 latin1 bytes round-trip to 256 distinct characters, and
+#: utf16 refuses an unpaired surrogate on insert (error 1300). Every other
+#: character set takes the round-trip check in `_string_text` (RT-HM1/HM2).
+_LOSSLESS_CHARSETS = frozenset({"utf8mb4", "utf8mb3", "utf8", "utf16", "latin1"})
+
+#: Leads the canonical text of a value whose characters do not all convert to
+#: Unicode, followed by its character set and its stored bytes in hex.
+UNCONVERTIBLE_MARKER = "parity: not convertible from "
+
+#: The canonical text of MySQL's ENUM error value, index 0 (RT-HM9).
+INVALID_ENUM_TEXT = "parity: invalid ENUM value (index 0)"
+
+#: Words that let a row filter lock rows or write a file. The session is READ
+#: ONLY, which refuses FOR UPDATE but not a shared locking read, and InnoDB
+#: holds those S locks until the diff's transaction ends (RT-HM12).
+_FILTER_LOCKING = re.compile(
+    r"\b(for\s+share|for\s+update|lock\s+in\s+share\s+mode|into|outfile|dumpfile)\b",
+    re.IGNORECASE,
+)
+
+#: MySQL's quoted regions - a string literal or a quoted identifier, never a
+#: keyword. Backslash escapes before a quote are refused by the shared check
+#: before this runs, so a region ends at the next quote of its kind.
+_MYSQL_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"|`[^`]*`")
+
+#: MySQL error numbers: access denied for a table / a column.
+_ER_TABLEACCESS_DENIED = 1142
+_ER_COLUMNACCESS_DENIED = 1143
 
 #: The session sql_mode, pinned at connect: MySQL 8.0's own default, under
 #: which every rendering here was verified. A server default is not something
@@ -290,11 +327,52 @@ class MySQLDialect(Dialect):
             connection_timeout=10,
             **self._options,
         )
+        # MariaDB speaks the protocol and accepts mysql://, but it is another
+        # engine: its uca1400 default collation makes every text REPLACE an
+        # "Illegal mix of collations", it has no UUID_TO_BIN (which every
+        # DECIMAL, FLOAT and binary guard raises through), and none of the
+        # renderings here was verified on it. Refused by name (RT-HM11).
+        if "mariadb" in str(getattr(self._conn, "server_info", "") or "").lower():
+            self._conn.close()
+            raise self._err(
+                "this server is MariaDB, not MySQL. parity's MySQL dialect has "
+                "not been verified against MariaDB, whose collations, functions "
+                "and type renderings differ, so it refuses rather than compare "
+                "on guesses"
+            )
         cur = self._conn.cursor()
+        # Error texts in English, so `query` can explain the dialect's own
+        # refusals whatever the server's lc_messages (RT-HM10). A session
+        # variable any login may set; if a server refuses it, the patterns in
+        # `query` do not depend on the language anyway.
+        try:
+            cur.execute("set session lc_messages = 'en_US'")
+        except Exception:  # noqa: BLE001, S110 - best effort, see above
+            pass
         # A timestamp renders through the session time zone; pin it so two
         # servers in different zones cannot report the same instant as different.
         cur.execute("set session time_zone = '+00:00'")
         cur.execute(f"set session sql_mode = '{SQL_MODE}'")
+        # A GLOBAL, per-user or init_connect `sql_select_limit` caps the rows of
+        # every SELECT without a LIMIT - the column introspection and the
+        # checksum buckets alike - so columns past it were never compared and
+        # buckets past it read as empty on both sides: identical (RT-G1).
+        # Not `= default`: for a session variable that means the GLOBAL value,
+        # which is the cap itself. The type's maximum is MySQL's own default.
+        cur.execute("set session sql_select_limit = 18446744073709551615")
+        # MySQL 9.7 moved MD5() into the optional component_classic_hashing;
+        # without it the first checksum died naming nothing useful (RT-G13).
+        try:
+            cur.execute("select md5('')")
+            cur.fetchall()
+        except Exception as exc:
+            self._conn.close()
+            raise self._err(
+                "this MySQL server has no MD5() function, which every row hash "
+                "needs. MySQL 9.7 moved it into an optional component: a DBA "
+                "can add it with INSTALL COMPONENT "
+                "'file://component_classic_hashing'"
+            ) from exc
         # Belt and braces on top of the InnoDB default - and READ ONLY, so the
         # server itself refuses a write in this session, as it does on
         # PostgreSQL, DuckDB and BigQuery (RT-F11; CLAUDE.md section 6). A
@@ -347,9 +425,23 @@ class MySQLDialect(Dialect):
                 c.close()
             finally:
                 admin.close()
-        except Exception:  # noqa: BLE001, S110 - cancel is best effort;
-            # a failure to KILL must never mask the real error.
-            pass
+        except Exception as exc:  # noqa: BLE001 - cancel is best effort;
+            # a failure to KILL must never mask the real error - but it must
+            # not be silent either (RT-HM16). A login already at its
+            # max_user_connections cannot open the KILL connection, and the
+            # running query then goes on to its end: say so, and how to stop it.
+            import warnings
+
+            warnings.warn(
+                f"[side {self.side}: {self.name}] could not cancel the running "
+                f"query: opening a second connection to KILL it failed ({exc}). "
+                "It runs on until it finishes; a DBA can stop it with "
+                f"KILL QUERY {getattr(self._conn, 'connection_id', '?')}. A "
+                "login at its max_user_connections limit cannot be cancelled "
+                "from the client",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def close(self) -> None:
         """Close the connection, ending the snapshot."""
@@ -402,20 +494,146 @@ class MySQLDialect(Dialect):
             f"and table_name = {self.string_literal(name)}"
         )
         rows = self.query(
-            "select column_name, data_type, numeric_precision "
+            "select column_name, data_type, numeric_precision, column_type, "
+            "character_set_name "
             f"from information_schema.columns {where} order by ordinal_position"
         )
         if not rows:
             raise self._err(self._not_found(table, schema, name))
-        # The storage engine decides whether the snapshot holds at all: only
-        # InnoDB honours REPEATABLE READ. A view reports none (NULL) and reads
-        # whatever its base tables are.
-        for (engine,) in self.query(
-            f"select engine from information_schema.tables {where}"
+        self._require_every_column(table, schema, name, [str(r[0]) for r in rows])
+        self._note_snapshot(table, schema, name)
+        return [_column(str(r[0]), str(r[1]), r[2], str(r[3] or ""), r[4]) for r in rows]
+
+    def _relation(self, schema: str, name: str) -> str:
+        """`schema`.`name` quoted, or the bare name without a schema."""
+        return f"{self.quote(schema)}.{self.quote(name)}" if schema else self.quote(name)
+
+    def _probe(self, sql: str) -> int | None:
+        """Run `sql`; None if it succeeds, else the MySQL error number."""
+        import mysql.connector
+
+        cur = self._conn.cursor()
+        try:
+            cur.execute(sql)
+            cur.fetchall()
+            return None
+        except mysql.connector.Error as exc:
+            return int(exc.errno or -1)
+        finally:
+            cur.close()
+
+    def _require_every_column(
+        self, table: str, schema: str, name: str, visible: list[str]
+    ) -> None:
+        """Refuse a table this login may read only some columns of (RT-HM3).
+
+        With column-level grants (`GRANT SELECT (id, a) ON t`) MySQL lists
+        only the granted columns in information_schema.columns, so the others
+        were silently never compared: a difference in one of them read
+        identical, with no schema difference and no warning. `SELECT *` needs
+        every column, so it is refused (error 1142/1143) exactly when some
+        column is hidden - the server's own privilege check, roles included.
+        """
+        err = self._probe(f"select * from {self._relation(schema, name)} limit 0")
+        if err in (_ER_TABLEACCESS_DENIED, _ER_COLUMNACCESS_DENIED):
+            raise self._err(
+                f"this login may read only some columns of table {table} "
+                f"(column-level privileges). MySQL then lists only those - "
+                f"{visible} - and hides the rest from information_schema, so "
+                "the hidden columns would silently go uncompared. Ask for "
+                f"SELECT on the whole table {schema}.{name}"
+            )
+
+    def _note_snapshot(self, table: str, schema: str, name: str) -> None:
+        """Record every non-transactional table this relation reads (RT-D3).
+
+        The storage engine decides whether the snapshot holds at all: only
+        InnoDB honours REPEATABLE READ. A view reports no engine (NULL) and
+        reads whatever its base tables are, so its base tables are followed
+        through information_schema.view_table_usage (8.0.13+), views of views
+        included (RT-HM17). A view whose base tables cannot be listed gets
+        the caveat too: unknown is not the same as safe.
+        """
+        todo = [(schema, name, f"table {table}")]
+        seen: set[tuple[str, str]] = set()
+        while todo:
+            s, n, label = todo.pop()
+            if (s, n) in seen or len(seen) > 256:
+                continue
+            seen.add((s, n))
+            where = (
+                f"where table_schema = {self.string_literal(s)} "
+                f"and table_name = {self.string_literal(n)}"
+            )
+            for kind, engine in self.query(
+                f"select table_type, engine from information_schema.tables {where}"
+            ):
+                if engine is not None and str(engine).lower() not in _SNAPSHOT_ENGINES:
+                    self._no_snapshot[label] = str(engine)
+                if str(kind).upper() != "VIEW":
+                    continue
+                try:
+                    bases = self.query(
+                        "select table_schema, table_name "
+                        "from information_schema.view_table_usage "
+                        f"where view_schema = {self.string_literal(s)} "
+                        f"and view_name = {self.string_literal(n)}"
+                    )
+                except Exception:  # noqa: BLE001 - before 8.0.13: unknown
+                    bases = []
+                if not bases:
+                    self._no_snapshot[f"view {table}"] = "unknown"
+                for bs, bn in bases:
+                    todo.append(
+                        (str(bs), str(bn), f"view {table} (base table {bs}.{bn})")
+                    )
+
+    def _not_found(self, table: str, schema: str, name: str) -> str:
+        """Say "not found, or not granted" when MySQL cannot tell which.
+
+        MySQL hides a table the login holds no privilege on from
+        information_schema, and answers a query on it with 1142 "SELECT
+        command denied" - but it answers a table that does not exist the same
+        way, so as not to reveal which names exist. The probe therefore cannot
+        prove the table is there, only that the login may not look; the
+        message says both instead of sending the user to hunt a typo when a
+        GRANT is missing (RT-HM15). A login with privileges on the database
+        gets 1146 for a missing table, and the plain message.
+        """
+        message = super()._not_found(table, schema, name)
+        if self._probe(f"select 1 from {self._relation(schema, name)} limit 0") == (
+            _ER_TABLEACCESS_DENIED
         ):
-            if engine is not None and str(engine).lower() not in _SNAPSHOT_ENGINES:
-                self._no_snapshot[table] = str(engine)
-        return [_column(str(r[0]), str(r[1]), r[2]) for r in rows]
+            message += (
+                ". Or it exists and this login holds no privilege on it: MySQL "
+                "answers 'SELECT command denied' for a table it may not see "
+                "whether or not the table exists, and lists neither in "
+                f"information_schema. If the name is right, ask for SELECT on "
+                f"{schema}.{name}"
+            )
+        return message
+
+    def check_where(self, where: str) -> None:
+        """Refuse a row filter that locks rows or writes a file (RT-HM12).
+
+        The shared check keeps the predicate one read. On MySQL a subquery
+        can still end in `FOR SHARE` / `LOCK IN SHARE MODE` - which READ ONLY
+        does not refuse - and InnoDB then holds shared locks on every row it
+        read until the diff's transaction ends: a writer on the live legacy
+        table waits the whole run, which the tool promises never to cause
+        (CLAUDE.md 4.9). `INTO` (OUTFILE, DUMPFILE, a variable) is no part of
+        a predicate either. Matched as words outside quoted regions, so a
+        string or a backticked column that spells one is fine.
+        """
+        super().check_where(where)
+        code = _MYSQL_QUOTED.sub(" ", where)
+        found = _FILTER_LOCKING.search(code)
+        if found:
+            raise self._err(
+                f"row filter {where!r} contains {found.group(0)!r}: a locking "
+                "read would hold row locks on the live table for the whole diff, "
+                "and INTO / OUTFILE / DUMPFILE are not part of a predicate"
+            )
 
     def string_literal(self, value: str) -> str:
         r"""Quote a name as a MySQL string literal: `'` doubled and `\` doubled.
@@ -428,6 +646,106 @@ class MySQLDialect(Dialect):
         """
         return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
+    def single_precision(self, column: Column) -> bool:
+        """MySQL spells float4 `float` (and `real` is a double here only
+        under REAL_AS_FLOAT, which the pinned sql_mode does not set)."""
+        return column.raw_type.lower().split("(")[0].strip() == "float"
+
+    def sample_select(self, column: Column) -> str:
+        """Raw values for the sample check; a float4 widened to double first.
+
+        The text protocol sends a FLOAT with six significant digits -
+        16777217 arrived as 16777200.0 - so the raw value is lossy; widening
+        in the server is exact and the double travels in full. Verified live.
+        """
+        if column.logical_type is LogicalType.FLOAT and self.single_precision(column):
+            return f"cast({self.quote(column.name)} as double)"
+        c = self.quote(column.name)
+        if column.logical_type is LogicalType.JSON:
+            # The engine's own normalised text, whatever the connector does
+            # with a JSON result.
+            return f"cast({c} as char)"
+        if column.logical_type in (LogicalType.DATE, LogicalType.TIMESTAMP):
+            # The connector returns None for any date Python cannot hold -
+            # '0000-00-00', '2024-02-31' under ALLOW_INVALID_DATES - which
+            # the reference read as NULL, so the walk's correct difference
+            # against a real NULL was noted as a false alarm (RT-HM13).
+            # MySQL's own text of the value carries it exactly.
+            return f"cast({c} as char)"
+        if self._string_sampled_as_bytes(column):
+            # Facts, not a rendering: the ENUM index, the stored bytes, the
+            # bytes after a round trip through utf8mb4 and the utf8mb4 bytes,
+            # in hex; `sample_value` applies the rules to them in Python. The
+            # connector would hand back a SET as a Python set (RT-HM6), an
+            # ENUM error value as '' (RT-HM9) and an unconvertible character
+            # as '?' (RT-HM1), each indistinguishable from real text.
+            enum = f"{c} + 0" if _base(column) == "enum" else "''"
+            cs = self._lossy_charset(column)
+            back = (
+                f"ifnull(hex(convert(convert({c} using utf8mb4) using {cs})), '-')"
+                if cs
+                else f"hex({c})"
+            )
+            parts = [
+                enum,
+                f"hex({c})",
+                back,
+                f"ifnull(hex(convert({c} using utf8mb4)), '-')",
+            ]
+            return f"case when {c} is null then null else concat_ws(',', {', '.join(parts)}) end"
+        return super().sample_select(column)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """A BIT(n) arrives as an unsigned integer, which has lost the width
+        that is part of the value; restore it from the declared `bit(n)`, so
+        the reference reads the n digits the column holds. A text column
+        `sample_select` read as hex facts becomes its text by the rules."""
+        if column.logical_type is LogicalType.BITS and isinstance(value, int):
+            width = re.search(r"\((\d+)\)", column.raw_type)
+            digits = format(value, "b")
+            return digits.rjust(int(width.group(1)), "0") if width else digits
+        if value is not None and self._string_sampled_as_bytes(column):
+            text = value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+            index, stored, back, utf8 = text.split(",")
+            if _base(column) == "enum" and float(index) == 0:
+                return INVALID_ENUM_TEXT
+            cs = self._lossy_charset(column)
+            if cs and back != stored:
+                return f"{UNCONVERTIBLE_MARKER}{cs} 0x{stored.upper()}"
+            return bytes.fromhex(utf8).decode("utf-8")
+        return value
+
+    def _lossy_charset(self, column: Column) -> str | None:
+        """The column's character set, if it is one whose conversion to
+        utf8mb4 can lose characters; None for the lossless ones and for any
+        column that is not text."""
+        if column.logical_type is not LogicalType.STRING or not column.charset:
+            return None
+        cs = column.charset.lower()
+        if cs in _LOSSLESS_CHARSETS:
+            return None
+        if not re.fullmatch(r"[a-z0-9_]+", cs):
+            # Pasted into SQL as a name; information_schema never reports
+            # anything else, but say so rather than quote it.
+            raise self._err(
+                f"column {column.name!r} has an unexpected character set {cs!r}"
+            )
+        return cs
+
+    def _string_sampled_as_bytes(self, column: Column) -> bool:
+        """Whether the sample check reads this text column as hex facts."""
+        return column.logical_type is LogicalType.STRING and (
+            _base(column) in ("enum", "set") or self._lossy_charset(column) is not None
+        )
+
+    def json_semantics(self, column: Column) -> str:
+        """MySQL's JSON normal form."""
+        return (
+            "MySQL JSON: object keys ordered by length then bytes, the last "
+            "duplicate key kept, integers exact to 64 bits and every other number "
+            "a double (1.50 becomes 1.5, 1e2 becomes 100.0)"
+        )
+
     def caveats(self, columns: Sequence[Column]) -> list[str]:
         """A table on a non-transactional engine is not read at one snapshot.
 
@@ -438,14 +756,27 @@ class MySQLDialect(Dialect):
         though the tables differed throughout (RT-D3). Said in the output,
         as SQL Server's dialect does for READ COMMITTED.
         """
-        return [
-            f"table {table} uses the {engine} storage engine, which has no "
-            "transactions, so the walk is not one snapshot: each query sees the "
-            "table as of its own start, and rows written during the diff can be "
-            "reported as differences that never existed, or missed entirely. "
-            "Diff a quiet copy for a single-snapshot result"
-            for table, engine in sorted(getattr(self, "_no_snapshot", {}).items())
-        ]
+        tail = (
+            "so the walk is not one snapshot: each query sees the table as of "
+            "its own start, and rows written during the diff can be reported "
+            "as differences that never existed, or missed entirely. Diff a "
+            "quiet copy for a single-snapshot result"
+        )
+        out = []
+        for label, engine in sorted(getattr(self, "_no_snapshot", {}).items()):
+            if engine == "unknown":
+                out.append(
+                    f"{label}: its base tables could not be listed "
+                    "(information_schema.view_table_usage, MySQL 8.0.13+), so "
+                    "whether they all honour the transaction is unknown and the "
+                    f"walk may not be one snapshot. If any is not InnoDB, {tail}"
+                )
+            else:
+                out.append(
+                    f"{label} uses the {engine} storage engine, which has no "
+                    f"transactions, {tail}"
+                )
+        return out
 
     def quote(self, identifier: str) -> str:
         """Wrap an identifier in backticks, doubling any it contains.
@@ -487,7 +818,16 @@ class MySQLDialect(Dialect):
         t = column.logical_type
         raw = column.raw_type.lower().split("(")[0].strip()
         if t is LogicalType.INTEGER:
-            expr = f"cast({c} as char)"
+            # `+ 0` drops what only the display carries (RT-HM4, RT-HM7):
+            # a ZEROFILL int(8) 5 casts to '00000005' and the YEAR 0 to
+            # '0000', though their values - as the driver and every other
+            # engine read them - are 5 and 0. Only those columns change SQL,
+            # and only YEAR 0 and ZEROFILL values change text.
+            expr = (
+                f"cast({c} + 0 as char)"
+                if _display_padded(column)
+                else f"cast({c} as char)"
+            )
         elif t is LogicalType.DECIMAL:
             expr = self._decimal_text(column, c)
         elif t is LogicalType.FLOAT:
@@ -538,21 +878,85 @@ class MySQLDialect(Dialect):
         elif t is LogicalType.TIMESTAMP:
             # %f is microseconds, six digits, matching the other two engines.
             expr = f"date_format({c}, '%Y-%m-%d %H:%i:%s.%f')"
-        elif raw in _BINARY_TYPES:
+        elif t is LogicalType.TIME:
+            # TIME is a duration here, -838:59:59 .. 838:59:59; time_format's
+            # %H runs past 23 and keeps the sign (verified: `-00:00:00.500000`,
+            # `100:00:00.500000`), which is `canonical_time_text` exactly.
+            # Six digits whatever the column's fsp; the char cast printed
+            # none for time(0), so only time(6) checksums stay put.
+            expr = f"time_format({c}, '%H:%i:%s.%f')"
+        elif t is LogicalType.BINARY:
             # PostgreSQL's bytea text form (bytea_output = hex, its default):
-            # a backslash, `x`, then lower-case hex.
+            # a backslash, `x`, then lower-case hex - BINARY_PREFIX + hex.
             expr = self._binary_text(column, c, prefix=True)
+        elif t is LogicalType.JSON:
+            # MySQL stores JSON normalised - keys ordered by length then
+            # bytes, the last duplicate kept - and prints it in exactly the
+            # canonical layout and string escaping (verified against
+            # `canonical_json_text`), so the char cast is the canonical text:
+            # the SQL the unmapped fallback ran, and no checksum moves.
+            # Laying out compact JSON here would need REGEXP_REPLACE, whose
+            # global-only regexp_time_limit failed on a 400 kB document.
+            expr = self.escape_text(f"cast({c} as char)")
         elif raw in _SPATIAL_TYPES:
             # The stored bytes - SRID, then WKB - in full: exact, and
             # MySQL-to-MySQL only. ST_AsText would round the coordinates.
             expr = self._binary_text(column, c, prefix=False)
-        elif raw == "bit":
+        elif t is LogicalType.BITS:
             expr = self._bit_text(column, c)
+        elif raw == "vector":
+            # MySQL 9's VECTOR refuses `cast(.. as char)` (error 1210), which
+            # killed the first checksum naming neither column nor type
+            # (RT-HM14). Its stored bytes - little-endian float4s - as hex:
+            # exact, and MySQL-to-MySQL only, like the spatial types.
+            expr = self._binary_text(column, c, prefix=False)
+        elif t is LogicalType.STRING:
+            expr = self.escape_text(self._string_text(column, c))
         else:
             # STRING, and every unmapped type (json, time, ...) through its
             # text cast: arbitrary text, so escaped.
             expr = self.escape_text(f"cast({c} as char)")
         return f"coalesce({expr}, {self.null_sentinel_sql()})"
+
+    def _string_text(self, column: Column, c: str) -> str:
+        """A text column as utf8mb4 text, never losing a character.
+
+        `cast(c as char)` converts the column's character set to utf8mb4 and
+        replaces every character with no Unicode mapping by `?` (or U+FFFD) -
+        no error, in any sql_mode - and a ucs2 value holding a surrogate
+        becomes SQL NULL entirely. So two different Shift-JIS user-defined
+        characters, a real `?` and (for ucs2) a NULL all rendered alike: false
+        matches, MySQL to MySQL and against every engine (RT-HM1, RT-HM2).
+        Measured on 8.0: sjis loses 1,448 storable characters this way, euckr
+        1,792, gbk 712.
+
+        For a character set outside `_LOSSLESS_CHARSETS` the value converts
+        back to its own character set and is compared byte for byte with what
+        is stored. Equal means the conversion lost nothing and it renders
+        exactly as before - so no checksum of convertible text moves. Not
+        equal (or NULL) means characters were lost, and it renders as
+        `UNCONVERTIBLE_MARKER`, the character set and the stored bytes in hex:
+        distinct for distinct values, and equal to no text another engine
+        holds unless that text spells the marker itself. Only those columns
+        pay for the round trip.
+
+        An ENUM's index 0 is MySQL's error value - what an invalid value
+        becomes when written outside strict mode - and prints '', exactly as
+        a real '' member does (RT-HM9). It renders as `INVALID_ENUM_TEXT`.
+        """
+        text = f"cast({c} as char)"
+        cs = self._lossy_charset(column)
+        if cs:
+            stored = f"cast({c} as binary)"
+            back = f"cast(convert(convert({c} using utf8mb4) using {cs}) as binary)"
+            text = (
+                f"case when {back} = {stored} then {text} "
+                f"when {c} is not null "
+                f"then concat('{UNCONVERTIBLE_MARKER}{cs} 0x', hex({c})) end"
+            )
+        if _base(column) == "enum":
+            text = f"case when {c} + 0 = 0 then '{INVALID_ENUM_TEXT}' else {text} end"
+        return text
 
     def _binary_text(self, column: Column, c: str, *, prefix: bool) -> str:
         r"""Render bytes as lower-case hex, never as text.
@@ -588,6 +992,27 @@ class MySQLDialect(Dialect):
             f"convert(0x{where.hex()} using utf8mb4))) as char)"
         )
         return f"case when {c} is null then null else coalesce({text}, {refuse}) end"
+
+    def escape_text(self, expr: str) -> str:
+        """Escape text, refusing a value whose escaped text MySQL cannot hold.
+
+        Escaping lengthens text, and past max_allowed_packet MySQL's REPLACE
+        returns NULL with only warning 1301. The coalesce then made it the NULL
+        sentinel, so a long text holding one backslash equalled a NULL on the
+        other side - a false match against every engine (RT-G3). As for binary
+        (`_binary_text`), a NULL from a non-NULL value raises through
+        UUID_TO_BIN instead, and `query` names the side and the size. Text
+        that fits renders exactly as before: no checksum moves.
+        """
+        escaped = super().escape_text(expr)
+        note = b" characters of text, past max_allowed_packet once escaped"
+        refuse = (
+            f"cast(uuid_to_bin(concat('{TOO_LONG_MARKER}', char_length({expr}), "
+            f"convert(0x{note.hex()} using utf8mb4))) as char)"
+        )
+        return (
+            f"case when ({expr}) is null then null else coalesce({escaped}, {refuse}) end"
+        )
 
     def _bit_text(self, column: Column, c: str) -> str:
         """Render BIT(n) as its n binary digits, PostgreSQL's `bit(n)` text.
@@ -637,8 +1062,9 @@ class MySQLDialect(Dialect):
     def decimal_key_text(self, c: str, column: Column) -> str:
         """DECIMAL's char cast is exact and plain, at the declared scale; drop
         the trailing fractional zeros that scale adds. Zero is tested first:
-        MySQL can hold a negative zero, which would render `-0`."""
-        t = f"cast({c} as char)"
+        MySQL can hold a negative zero, which would render `-0`. A ZEROFILL
+        column's display padding is dropped by `+ 0` (RT-HM5)."""
+        t = f"cast({c} + 0 as char)" if _display_padded(column) else f"cast({c} as char)"
         return (
             f"case when {c} = 0 then '0' "
             f"when locate('.', {t}) > 0 "
@@ -744,7 +1170,24 @@ class MySQLDialect(Dialect):
         return f"coalesce(sum(cast(({expr}) as decimal(65,0))), 0)"
 
 
-def _column(name: str, data_type: str, precision: Any) -> Column:
+def _base(column: Column) -> str:
+    """The bare MySQL type name: `enum`, `int`, `year`."""
+    return column.raw_type.lower().split("(")[0].strip()
+
+
+def _display_padded(column: Column) -> bool:
+    """Whether the char cast carries display padding the value does not:
+    ZEROFILL (`int(6) unsigned zerofill`) and YEAR (0 prints `0000`)."""
+    return "zerofill" in column.declared.lower() or _base(column) == "year"
+
+
+def _column(
+    name: str,
+    data_type: str,
+    precision: Any,
+    declared: str = "",
+    charset: Any = None,
+) -> Column:
     """Build a Column from one `information_schema.columns` row.
 
     TIMESTAMP is an instant: MySQL stores it as UTC and converts it through
@@ -760,7 +1203,14 @@ def _column(name: str, data_type: str, precision: Any) -> Column:
     low = data_type.lower()
     raw = f"{data_type}({precision})" if low == "bit" and precision else data_type
     tz = {"timestamp": True, "datetime": False}.get(low)
-    return Column(name, map_type_mysql(data_type), raw, tz_aware=tz)
+    return Column(
+        name,
+        map_type_mysql(data_type),
+        raw,
+        tz_aware=tz,
+        declared=declared,
+        charset=str(charset) if charset else None,
+    )
 
 
 def map_type_mysql(raw: str) -> LogicalType:
@@ -795,6 +1245,16 @@ def map_type_mysql(raw: str) -> LogicalType:
         return LogicalType.DATE
     if t in {"datetime", "timestamp"}:
         return LogicalType.TIMESTAMP
+    if t == "time":
+        return LogicalType.TIME
+    if t in _BINARY_TYPES:
+        return LogicalType.BINARY
+    if t == "json":
+        return LogicalType.JSON
+    if t == "bit":
+        # BIT(n), a bit string of n digits - not a boolean (MySQL's BOOLEAN
+        # is TINYINT(1)), and rendered as PostgreSQL renders bit(n).
+        return LogicalType.BITS
     if t in {
         "char",
         "varchar",

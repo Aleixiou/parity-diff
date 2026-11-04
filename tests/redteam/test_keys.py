@@ -499,6 +499,9 @@ def test_rt_b7_snowflake_to_snowflake_change_on_a_near_boundary_key_is_found():
     assert _found(result) == [(k_bad, "different")]
 
 
+# The walk is fooled on purpose here; the independent sample check
+# sees past it, which is the point of that check.
+@pytest.mark.sample_check_may_disagree
 def test_rt_b7_the_old_snowflake_division_missed_the_change():
     """Control: the same walk under the old rounding division loses the row,
     so the model above is not passing vacuously."""
@@ -1480,8 +1483,10 @@ def test_live_mssql_bucket_expression_matches_bucket_bounds(mssql_rt):
             "k varbinary(16), v int",
             "k bytea, v int",
             [(b"\xff\x01", 1)],
-            [(b"\xff\x01", 1)],
-            None,  # 0x... against \x...: cross-engine binary keys never match
+            [(b"\xff\x01", 2)],
+            # One canonical binary spelling everywhere (`\\x` + lower hex):
+            # the keys line up and the planted value change is found.
+            [("\\\\xff01", "different")],
         ),
         (
             "k char(5), v int",
@@ -1512,8 +1517,8 @@ def test_live_mssql_key_shapes_against_postgres(
 ):
     """Controls: SQL Server key shapes against PostgreSQL. char(n) padding,
     a case-sensitive collation and uniqueidentifier's upper-case rendering all
-    line up; binary keys do not (different hex spellings), recorded here as
-    current behaviour - a false alarm on every row, never a false match."""
+    line up, and so do binary keys since BINARY has one canonical spelling
+    (they used to differ - 0x... against \\x... - a false alarm on every row)."""
     name = "rt_key_shape_" + ms_ddl.split()[1].split("(")[0].rstrip(",")
     ms = _mssql_table(mssql_rt, name, ms_ddl, rows_ms)
     tp = _pg_table(pg_rt, name, pg_ddl, rows_pg)

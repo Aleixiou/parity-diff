@@ -158,7 +158,11 @@ def test_no_backslash_literal_reaches_the_sql(cls):
     none may appear in rendering SQL. SQL Server keeps `N'\\N'`: T-SQL has
     no backslash escapes and no setting that adds them."""
     d = cls()
-    cols = [Column("c", t, "") for t in LogicalType if t is not LogicalType.FLOAT]
+    cols = [
+        Column("c", t, "text[]" if t is LogicalType.LIST else "")
+        for t in LogicalType
+        if t is not LogicalType.FLOAT
+    ]
     sql = d.row_text(cols) + d.null_sentinel_sql()
     if cls is SQLServerDialect:
         sql = sql.replace(f"N'{NULL_SENTINEL}'", "")

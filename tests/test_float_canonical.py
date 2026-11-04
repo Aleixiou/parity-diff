@@ -125,6 +125,7 @@ ENGINES = [
     pytest.param("duckdb", marks=pytest.mark.duckdb),
     pytest.param("mysql", marks=pytest.mark.mysql),
     pytest.param("bigquery", marks=pytest.mark.bigquery),
+    pytest.param("snowflake", marks=pytest.mark.snowflake),
 ]
 
 
@@ -139,7 +140,12 @@ def _url(request, engine: str) -> str:
     if engine == "duckdb":
         pytest.importorskip("duckdb")
         return "duckdb:///:memory:"
-    fixture = {"postgres": "pg_url", "mysql": "mysql_url", "bigquery": "bigquery_url"}
+    fixture = {
+        "postgres": "pg_url",
+        "mysql": "mysql_url",
+        "bigquery": "bigquery_url",
+        "snowflake": "snowflake_url",
+    }
     return str(request.getfixturevalue(fixture[engine]))
 
 
@@ -325,25 +331,32 @@ def test_a_change_past_the_scale_becomes_visible_at_a_finer_scale(
     assert sorted(r.key for r in result.diffs) == [*FOUND, 4, 5]
 
 
-# ------------------------------------------------------- unverified engines
+# ------------------------------------------------- the unverified-engine hook
 
 
 def test_an_unverified_float_rendering_is_warned_about_in_the_output():
-    """Snowflake's FLOAT path predates the canonical form and could not be
-    checked live, so a FLOAT column compared on it carries a warning - in the
-    result, not only the docs (CLAUDE.md section 8). Other columns do not."""
+    """A dialect whose FLOAT path is not verified against the canonical form
+    must say so on every FLOAT column - in the result, not only the docs
+    (CLAUDE.md section 8). Other columns do not. Every shipped dialect is now
+    verified live (Snowflake since 2026-11-03), so a fake carries the caveat."""
     from fakes import FakeDialect, SyntheticTable
 
+    from parity.dialects.bigquery_dialect import BigQueryDialect
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+    from parity.dialects.mssql_dialect import SQLServerDialect
+    from parity.dialects.mysql_dialect import MySQLDialect
+    from parity.dialects.postgres_dialect import PostgresDialect
     from parity.dialects.snowflake_dialect import SnowflakeDialect
     from parity.types import Column, LogicalType
 
-    assert SnowflakeDialect().float_caveat()
-    from parity.dialects.bigquery_dialect import BigQueryDialect
-    from parity.dialects.duckdb_dialect import DuckDBDialect
-    from parity.dialects.mysql_dialect import MySQLDialect
-    from parity.dialects.postgres_dialect import PostgresDialect
-
-    for cls in (PostgresDialect, DuckDBDialect, MySQLDialect, BigQueryDialect):
+    for cls in (
+        PostgresDialect,
+        DuckDBDialect,
+        MySQLDialect,
+        BigQueryDialect,
+        SQLServerDialect,
+        SnowflakeDialect,
+    ):
         assert cls().float_caveat() is None, cls.__name__
 
     class Unverified(FakeDialect):
@@ -397,8 +410,11 @@ def test_a_null_double_is_the_sentinel_on_every_engine(request, engine: str):
     d = get_dialect(_url(request, engine), side="A")
     try:
         expr = d.normalize(FLOAT_COLUMN)
+        # The alias is quoted as `normalize` quotes the column: Snowflake
+        # folds an unquoted `x` to `X`, which `"x"` would not find.
+        alias = d.quote(FLOAT_COLUMN.name)
         rows = d.query(
-            f"select {expr} from (select cast(null as {DOUBLE_TYPE[engine]}) as x) t"
+            f"select {expr} from (select cast(null as {DOUBLE_TYPE[engine]}) as {alias}) t"
         )
     finally:
         d.close()

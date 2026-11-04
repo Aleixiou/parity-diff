@@ -18,67 +18,45 @@ parity diff \
 ```
 
 ```
-✗ 5 differences in 10,000,000 rows
-  28 queries · 7,628 rows downloaded (0.04% of both tables) · 47.9s
-  1 only in A · 1 only in B · 3 different
+✗ 3 differences in 100,000 rows
+  10 queries · 18,749 rows downloaded (9.37% of both tables) · 0.6s
+  1 only in A · 2 different
 
-  only in A   key 999999999
-  only in B   key 4000
-  different   key 13             columns: note
-      note   A ''   B NULL
-  different   key 6010000        columns: amount
-      amount   A 700.010000   B 700.000000
-  different   key 8700000        columns: is_refunded
-      is_refunded   A NULL   B false
-
+  ✓ independent sample check: 10,044 sampled rows (1 in 10) re-compared from raw values - all agree
+    risk: with 99.9% confidence fewer than 0.069% of rows (at most 69 of 100,000) could differ in a way the checksums missed; a checksum collision is below 1 in 10^18
   comparing floats and decimals at 6 decimal places
+
+  only in A   key 99999
+  different   key 7              columns: status
+      status   A NULL   B ''
+  different   key 4242           columns: amount
+      amount   A 5302.500000   B 5302.510000
 ```
 
 Exit code `1`. Put it in CI and the build fails until the data agrees.
+
+**Documentation:** [reading the output][output] ·
+[troubleshooting][troubleshooting] · [engines, logins and permissions][engines] ·
+[limitations][limitations] · [error odds][risk] · [type coverage][coverage]
 
 ## How it works
 
 `parity` pushes hash aggregation **down into both engines**. It asks each side
 for one checksum per bucket of the key range, compares a handful of integers,
 recurses only into the buckets that disagree, and downloads rows only from
-ranges already proven to differ.
+ranges already proven to differ. On identical tables it downloads **zero
+rows** in **four queries**, whether the table has ten thousand rows or ten
+million.
 
-On identical tables it downloads **zero rows** and issues **four queries**,
-whether the table has ten thousand rows or ten million.
-
-## Measured
-
-10,000,000 rows per side, PostgreSQL 18.4 ↔ DuckDB 1.5.5, median of five runs
-on one developer laptop (`demo/benchmark.py`):
-
-| Scenario | Queries | Rows downloaded | Wall time |
-|---|---|---|---|
-| identical tables | **4** | **0** (0.0000%) | 25–31s |
-| 5 planted differences | **28** | **7,628** (0.0381%) | 48–55s |
-
-**The query counts and row counts are exact and hardware-independent** — they
-are properties of the algorithm, and the test suite pins them. Reproduce them
-and you should get the same integers.
-
-The wall times are a range across six runs on one developer laptop, and they
-vary by about 25% with whatever else that laptop is doing. Treat them as an
-order of magnitude, not a specification.
-
-The query count and the rows-downloaded figures are **exact and
-hardware-independent** — they are properties of the algorithm, and the test
-suite pins them. The wall times are one machine under sustained load; treat
-them as an order of magnitude, not a specification.
-
-The five planted differences — a changed decimal, a deleted row, an inserted
-row at key 999,999,999, a `NULL` turned into `''`, and a `FALSE` turned into
-`NULL` — are all found exactly, with no false positives.
-
-Cost is roughly **one full hash pass per side**. It is CPU-bound on MD5, not
-IO-bound on key lookup, which is why **an index on the key column makes no
-measurable difference** (measured at 10M: 38.8s without, 37.3s with).
-Raising
-`--bisection-factor` does not speed up the dominant first pass; it only reduces
-round trips on later levels.
+Then it **checks itself**. The checksums are only as right as the SQL that
+renders each value to text inside each engine, and a mistake there can make
+two different values look alike on both sides — the way every false match
+this tool has ever had worked. So after the walk, about 10,000 rows (all of
+them, for a table that small) are fetched again from both sides as the
+database drivers return them, and compared in plain Python by the documented
+rules, without any of that SQL. If the two methods disagree about a single
+row, the result is **not identical** and the report names the row. Cost: one
+extra pass per side that hashes the key only, plus the sample.
 
 ## Install
 
@@ -90,6 +68,7 @@ pip install "parity-diff[mysql]"      # MySQL only
 pip install "parity-diff[snowflake]"  # Snowflake only
 pip install "parity-diff[bigquery]"   # BigQuery only
 pip install "parity-diff[mssql]"      # SQL Server / Azure SQL only
+pip install "parity-diff[oracle]"     # Oracle only (thin mode: no Oracle client needed)
 ```
 
 > The PyPI distribution is `parity-diff` — plain `parity` is squatted by an
@@ -99,27 +78,82 @@ pip install "parity-diff[mssql]"      # SQL Server / Azure SQL only
 Python 3.10+. The core has no dependencies; drivers are optional extras and are
 imported lazily, so a DuckDB-only user is never made to install `psycopg`.
 
-## Usage
+## Try it in five minutes
+
+No database server needed: two DuckDB files stand in for the legacy system and
+the new warehouse.
+
+```bash
+pip install "parity-diff[duckdb]"
+```
+
+Save this as `make_tables.py` and run `python make_tables.py`. It builds the
+same 100,000-row table twice, then plants three differences in the "migrated"
+copy — a changed amount, a NULL turned into an empty string, a lost row:
+
+```python
+import duckdb
+
+for path in ("old.duckdb", "new.duckdb"):
+    con = duckdb.connect(path)
+    con.execute("drop table if exists orders")
+    con.execute("""
+        create table orders as
+        select i                                              as order_id,
+               round(i * 1.25, 2)::decimal(12, 2)             as amount,
+               case when i % 7 = 0 then null else 'shipped' end as status,
+               date '2024-01-01' + (i % 365)::int             as ordered_on
+        from range(1, 100001) t(i)
+    """)
+    con.close()
+
+# Plant three differences in the "migrated" copy.
+con = duckdb.connect("new.duckdb")
+con.execute("update orders set amount = amount + 0.01 where order_id = 4242")
+con.execute("update orders set status = '' where order_id = 7")  # was NULL
+con.execute("delete from orders where order_id = 99999")
+con.close()
+print("wrote old.duckdb and new.duckdb")
+```
+
+Now compare them:
+
+```bash
+parity diff --a duckdb:///old.duckdb --a-table orders \
+            --b duckdb:///new.duckdb --b-table orders --key order_id
+echo "exit code: $?"
+```
+
+You get the report at the top of this page — all three differences, exit
+code `1`. Only the sample line varies a little between runs (the sampled rows
+are drawn afresh each time) and the time. Compare a table with itself
+(`--b duckdb:///old.duckdb`) and you get `✓ no differences in 100,000 rows`,
+`4 queries · 0 rows downloaded`, exit code `0`. Add `--json` to see the
+machine-readable form.
+
+## Using it on your databases
 
 ```
 parity diff --a CONN --a-table TABLE --b CONN --b-table TABLE --key COL[,COL...]
-            [--columns a,b,c] [--exclude x,y]
+            [--columns a,b,c] [--exclude x,y] [--map a_col=b_col[,...]]
+            [--where SQL] [--a-where SQL] [--b-where SQL]
             [--bisection-factor 32] [--threshold 10000] [--float-scale 6]
-            [--max-diffs 10000] [--json] [--quiet]
+            [--max-diffs 10000] [--verify-sample 10000] [--json] [--quiet]
 ```
 
-**Exit codes** — this is what makes it a CI check:
-
-| Code | Meaning |
+| Option | |
 |---|---|
-| `0` | identical |
-| `1` | not proven identical: rows differ, a column exists on one side only, or the checksums disagreed in a way the downloaded rows could not explain |
-| `2` | error (bad connection string, missing table, unusable key) |
-
-An error is never `1`. A CI job can always tell "the tables differ" from "the
-tool could not run". A column added or dropped on purpose is a schema
-difference until you say so: pass it to `--exclude` (or leave it out of
-`--columns`) and it becomes a warning instead.
+| `--a`, `--b` | connection strings, one per side (below) |
+| `--a-table`, `--b-table` | the table on each side; `schema.table`, or unqualified for the engine's default schema. Matched exactly, including case |
+| `--key` | the column(s) that identify a row, on both sides (matched case-insensitively). One integer column is bisected directly; a uuid, a text key or several columns are hashed. Must be unique and non-NULL |
+| `--columns` / `--exclude` | compare only these columns / skip these. Default: every column both sides share |
+| `--map` | pair a renamed column: `a_col=b_col` (side A's name = side B's); see *Renamed columns* below |
+| `--where` / `--a-where` / `--b-where` | compare only the rows a predicate selects, on both sides or on one; the verdict then covers those rows only (see *Comparing a slice* below) |
+| `--float-scale` | decimal places at which floats and decimals are compared (default 6), always the same on both sides |
+| `--max-diffs` | stop after N differences (default 10,000; `0` for no limit). The result is then marked partial |
+| `--verify-sample` | rows for the independent sample check (default 10,000; `0` skips it, and the report says so). A check that cannot run makes the result not identical |
+| `--bisection-factor`, `--threshold` | buckets per level (32), and the range size at which rows are downloaded instead of bisected further (10,000) |
+| `--json` / `--quiet` | machine-readable output / print nothing and rely on the exit code |
 
 Connection strings:
 
@@ -129,73 +163,235 @@ mysql://user:password@host:port/database
 duckdb:///relative/path.duckdb                  (three slashes = relative)
 duckdb:////var/lib/warehouse.duckdb             (four slashes = absolute)
 duckdb:///C:/data/warehouse.duckdb              (absolute, Windows)
-duckdb:///:memory:
 snowflake://user:password@account/database/schema?warehouse=wh&role=r
+snowflake://user@account/database/schema?private_key_file=/path/key.p8   (key pair)
 bigquery://project/dataset                      (optional ?location=EU)
 mssql://user:password@host:port/database        (also sqlserver://; port 1433)
-mssql://user:password@host/database?instance=SQLEXPRESS&encrypt=strict
-mysql://user:password@host/database?ssl_mode=VERIFY_IDENTITY&ssl_ca=/path/ca.pem
+oracle://user:password@host:port/service_name   (port 1521; a service name, not a SID)
 ```
 
-Connection errors never print the password. On MySQL a password may contain
-`/ # ? :` unencoded but must spell `@` as `%40`; the URL takes the TLS options
-`ssl_mode` (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`,
-`VERIFY_IDENTITY`), `ssl_ca`, `ssl_cert`, `ssl_key`, `ssl_verify_cert`,
-`ssl_verify_identity` and `ssl_disabled`, and refuses any other option rather
-than ignore it. With `ssl_mode=REQUIRED` or stricter the run checks that the
-session really is encrypted, since the driver would otherwise fall back to
-plaintext without saying so. A BigQuery URL refuses user credentials outright.
+Each engine's options, authentication, the minimum grants for a read-only
+login, and what a run costs on a cloud warehouse are in **[engines.md][engines]**.
+Keep passwords out of shell history and logs by passing the URL through an
+environment variable — `--a "$LEGACY_URL"` — as described
+[there][passwords].
 
-Table names may be schema-qualified. Unqualified names mean `public` on
-PostgreSQL and `main` on DuckDB — always that schema, never whatever the
-session's `search_path` finds first — and on Snowflake the URL's schema (else
-`PUBLIC`). PostgreSQL materialized views can be compared like tables. On
-BigQuery they default to the dataset in the
-connection string, and a table may also be given as `dataset.table` or
-`project.dataset.table` (to read another project's data while running jobs in
-your own).
+**Exit codes** — this is what makes it a CI check:
 
-BigQuery authenticates with Application Default Credentials — a service
-account via `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default
-login`, impersonation, or the VM's identity — so no secret goes in the
-connection string. The credentials are requested with the read-only
-`bigquery.readonly` scope, under which BigQuery itself refuses any write: the
-tool cannot modify your project even by mistake. The account needs BigQuery Job
-User on the project the jobs run in, and read access to the dataset.
+| Code | Meaning |
+|---|---|
+| `0` | identical |
+| `1` | not proven identical: rows differ, a column exists on one side only, the checksums disagreed in a way the downloaded rows could not explain, the independent sample check contradicted the checksums or could not run, or the run stopped at `--max-diffs` |
+| `2` | error (bad connection string, missing table, unusable key, a refused value) |
 
-SQL Server (2019 or newer, and Azure SQL Database / Managed Instance) uses
-Microsoft's `mssql-python` driver, which needs no separately installed ODBC
-driver. Unqualified tables default to the login's own default schema (normally
-`dbo`). The connection string takes SQL authentication only so far, and a fixed
-set of options: `encrypt` (`yes`, `no`, `strict`, `mandatory`, `optional`),
-`trust_server_certificate` (`yes`/`no`), `application_intent`
-(`readonly`/`readwrite`), `login_timeout` (seconds) and `instance` (a named
-instance); anything else is refused rather than ignored, and every value is
-quoted so a `;` in a password cannot add a keyword. Encryption is on by default
-and the certificate is checked: use `trust_server_certificate=yes` only for a
-local test server with a self-signed certificate. SQL Server has no read-only
-session, so the tool issues only `SELECT`, refuses anything else before it
-reaches the server, and never commits — but **use a login that holds only
-`db_datareader`** (or `GRANT SELECT` on the tables), which makes the server
-itself refuse a write.
+An error is never `1`. A CI job can always tell "the tables differ" from "the
+tool could not run". A column added or dropped on purpose is a schema
+difference until you say so: pass it to `--exclude` (or leave it out of
+`--columns`) and it becomes a warning instead.
 
-`--json` emits the same content as a machine-readable object, including
-`identical`, `truncated`, `schema_differences`, `unexplained`, per-difference
-values, and the full stats block. Values in JSON are the exact canonical text
-the engines compared, in which a backslash is doubled and an ASCII Unit
-Separator (chr 31) is written `\s`; the human report shows them decoded, with
-text quoted and a real NULL printed bare as `NULL`.
+### Comparing a slice: `--where`
 
-### In CI
+`--where SQL` compares only the rows matching a predicate, on both sides;
+`--a-where` / `--b-where` give one side its own predicate and replace
+`--where` there. Each is that engine's own SQL over that side's own column
+names (a column renamed with `--map` keeps its side B name here). Use it to check last week, or one
+partition, without paying for a full pass over a huge BigQuery or Snowflake
+table:
+
+```
+parity diff ... --key order_id --where "created_at >= '2026-10-01'"
+```
+
+The predicate is pasted, in parentheses and ANDed with the tool's own
+conditions, into every query that reads the table: the row count and key
+checks, every checksum level, every download and the sample check. **A
+filtered verdict is about the filtered rows only**: the headline says
+`(filtered rows only)`, a `filtered: A where ...; B where ...` line follows,
+JSON carries `where_a`/`where_b`, and the risk figures count filtered rows.
+Each query evaluates the predicate afresh, so prefer fixed literals: an
+expression that changes during the run (`random()`, `clock_timestamp()`,
+or `now()` / `current_date` on an engine without one snapshot) can select
+different rows in different queries, which the run reports as unverified.
+Sessions are pinned to UTC, so a literal compared with a timezone-aware
+column is read as UTC; on PostgreSQL `search_path` is pinned to
+`pg_catalog`, so qualify any table a subquery names.
+
+It is your own SQL against your own database, so this is not a security
+boundary, but it must stay one read: a predicate containing `;`, `--`, `/*`,
+`#`, a backslash before a quote, a triple- or dollar-quoted string, or
+unbalanced quotes or parentheses is refused before any query (on SQL Server
+also `"` and the words the dialect's SELECT guard refuses). The sessions are
+read-only besides. From Python: `diff(..., where_a=..., where_b=...)`.
+
+### Renamed columns: `--map`
+
+`--map a_col=b_col` pairs a column the migration renamed: side B's `b_col`
+is compared with side A's `a_col`. Repeat it, or comma-separate pairs
+(`--map customer_name=cust_nm,amount=amt`). It works for key columns too
+(`--key id --map id=order_id`). `--key`, `--columns` and `--exclude` take
+side A's names, differences are reported under them, and the report names
+both sides (`customer_name (B: cust_nm)`; JSON `column_map` and per-row
+`b_columns`). Matching stays case-insensitive. A mapping that would pair a
+column twice — two A columns onto one B column, or a B column the map claims
+while a same-named column still matches it by name — is refused, as is a
+mapped name absent on its side (with near misses listed) and a column both
+mapped and excluded. From Python: `diff(..., column_map={"a_col": "b_col"})`.
+
+## Checking a whole migration: `parity run`
+
+A migration is rarely one table. List the pairs once in a config file and
+check all of them with one command and one summary:
+
+```toml
+# migration.toml
+[connections]
+legacy    = "${LEGACY_URL}"                       # read from the environment
+warehouse = "postgres://checker:${WH_PW}@wh-host/analytics"
+local     = "duckdb:///./new.duckdb"
+
+[defaults]                 # optional; the same defaults as `parity diff`
+float_scale   = 6
+verify_sample = 10000
+max_diffs     = 10000      # 0 = no limit
+# bisection_factor = 32, threshold = 10000
+
+[[pair]]
+name    = "orders"
+a       = "legacy"
+b       = "warehouse"
+a_table = "public.orders"
+b_table = "public.orders"
+key     = "order_id"
+
+[[pair]]
+name    = "customers"
+a       = "legacy"
+b       = "warehouse"
+table   = "public.customers"          # same name on both sides
+key     = ["region", "customer_no"]   # or "region,customer_no"
+map     = { customer_name = "cust_nm" }   # side A name = side B name
+exclude = ["etl_loaded_at"]
+
+[[pair]]
+name        = "events-october"
+a           = "legacy"
+b           = "local"
+a_table     = "public.events"
+b_table     = "main.events"
+key         = "event_id"
+where       = "created_at >= '2026-10-01'"  # or a_where / b_where per side
+float_scale = 2                             # any default can be overridden
+```
+
+```
+parity run migration.toml
+parity run migration.toml --only orders,customers
+parity run migration.toml --fail-fast
+parity run migration.toml --markdown signoff.md --junit parity.xml
+parity run migration.toml --resume state.json      # skip what already passed
+parity run migration.toml --json > run.json
+```
+
+```
+✓ orders                     1,204,332 rows · no differences · 31.2s · scale 6
+✗ customers                     88,410 rows · 2 differences · 3.1s · scale 6
+      renamed columns (A = B): customer_name = B cust_nm
+✓ events-october                10,882 rows · no differences (filtered rows only) · 0.9s · scale 2
+    ! filtered rows only: A where created_at >= '2026-10-01'; B where created_at >= '2026-10-01'
+    ! side A (postgres) is filtered by (...): ...
+
+✗ 2 of 3 pairs identical, 1 differ, 0 errors
+  ! 1 identical pair(s) carry qualifiers (filters, caveats, uncovered columns, no sample check): read their lines above
+  risk, weakest identical pair (orders): with 99.9% confidence fewer than 0.069% of rows ...
+  the differing rows are listed by --json and --markdown FILE
+  35.4s · exit 1
+```
+
+- **Each pair is one `parity diff`** with the same rules, opened on two
+  fresh connections and closed before the next pair, so no pair shares a
+  snapshot or a session with another. Pairs run one after another.
+- **The whole file is validated before anything connects**: an unknown field
+  (with a near-miss suggestion), a duplicate name, a missing field, a wrong
+  type, an unsafe row filter or an unset environment variable is refused,
+  every problem at once, each naming the file, the pair and the field. A
+  pair without `name` is called by its `a_table`.
+- **`${NAME}`** in a connection string, as the whole value or inside it,
+  reads an environment variable, so passwords stay out of the file. Nothing
+  else is special (a `$` in a literal password stays a `$`). The expanded
+  value is never printed: every error, warning, report and the resume file
+  show `${NAME}` in its place.
+- **A pair that errors is recorded and the run goes on** to the next one;
+  `--fail-fast` stops at the first pair that is not identical or errors.
+  **Ctrl-C** stops cleanly: the summary of the pairs that finished is still
+  printed and every report is still written, marked incomplete.
+- **Exit code**: `0` only if every selected pair is identical; `2` if any
+  pair errored, the run was interrupted, or the config is invalid; otherwise
+  `1` (a pair differs, or `--fail-fast` stopped after one).
+- **The summary is never stronger than its weakest pair.** Every qualifier
+  the single-pair report would print — filtered, truncated, unexplained,
+  schema differences, a sample-check failure or error, uncovered columns,
+  caveats — is printed under that pair in every format, and the run's own
+  verdict is just "every pair identical", nothing more.
+- **`--resume STATE.json`** records each finished pair as it completes. On a
+  re-run with the same file, a pair that finished **identical** with an
+  unchanged config entry (its settings, the tool version, and a salted hash
+  of both connection strings as expanded) is not run again; it is listed as
+  `from an earlier run (<timestamp>)` in every output. Every other pair runs.
+- **`--markdown FILE`** writes a sign-off report (tool version, date, the
+  config file's SHA-256, then per pair: verdict, tables, key, filters,
+  renames, float scale, risk line, caveats, uncovered columns and up to 20
+  differences); **`--junit FILE`** writes one test case per pair (a failure
+  for differences, an error for an error); **`--json`** prints the whole run
+  with each pair's full `parity diff --json` object. See
+  [docs/output.md](docs/output.md#parity-run-the-summary).
+- TOML needs Python 3.11+, or `pip install "parity-diff[toml]"` on 3.10;
+  a `.json` file with the same structure works everywhere. Relative DuckDB
+  paths are relative to the directory you run `parity` from, as with
+  `parity diff`.
+
+## Reading the output
+
+The report leads with one verdict line, then the cost, then everything that
+qualifies the verdict, then the rows:
+
+- `✓ no differences in N rows` — identical (exit 0). Still read the lines
+  under it: the float scale and any `!` caveat apply to it.
+- `✗ N differences in N rows` — listed as `only in A`, `only in B`, or
+  `different` with the changed columns and both values. A NULL prints bare as
+  `NULL`, text is quoted, so `NULL` and `''` never look alike.
+- `! at least N differences … stopped early` — the `--max-diffs` limit was hit;
+  the rest of the table was **not** checked.
+- `✗ schemas differ …`, `✗ not verified …`, `✗ not proven …` — a column
+  exists on one side only, or the tool could not account for a checksum
+  difference, was contradicted by its own sample check, or could not run that
+  check. Never identical.
+- `! …` lines — caveats: no single snapshot on this side, row-level security,
+  sub-microsecond truncation, columns of a type outside the rules, a type
+  that differs between the sides.
+
+Every line, with what to do about it, and every JSON field:
+**[docs/output.md][output]**. When something goes wrong — table not found, key
+not unique, everything reading as different — see
+**[docs/troubleshooting.md][troubleshooting]**.
+
+## In CI
 
 ```yaml
 - name: prove the migration is complete
+  env:
+    LEGACY_URL: ${{ secrets.LEGACY_URL }}
+    WAREHOUSE_URL: ${{ secrets.WAREHOUSE_URL }}
   run: |
+    pip install "parity-diff[postgres,snowflake]"
     parity diff \
       --a "$LEGACY_URL"     --a-table public.orders \
-      --b "$WAREHOUSE_URL"  --b-table analytics.orders \
+      --b "$WAREHOUSE_URL"  --b-table ANALYTICS.ORDERS \
       --key order_id --quiet
 ```
+
+The step fails with exit code `1` while the tables differ and `2` if the tool
+could not run. Drop `--quiet` to keep the report in the log, or use `--json`
+and keep it as an artifact.
 
 ## Using it from Python
 
@@ -208,7 +404,7 @@ from parity import diff, get_dialect
 
 with get_dialect("duckdb:///old.duckdb", side="A") as a, \
      get_dialect("duckdb:///new.duckdb", side="B") as b:
-    result = diff(a, b, "main.orders", "main.orders", key="id")
+    result = diff(a, b, "main.orders", "main.orders", key="order_id")
 
 if result.identical:
     print("the tables match")
@@ -220,198 +416,149 @@ print(f"{result.stats.rows_downloaded} rows crossed the network")
 print(f"truncated: {result.truncated}")
 ```
 
+On the quickstart tables:
+
 ```
-different 2 ['status'] {'status': 'ok'} {'status': 'CHANGED'}
-2 rows crossed the network
+different 7 ['status'] {'status': '\\N'} {'status': ''}
+different 4242 ['amount'] {'amount': '5302.500000'} {'amount': '5302.510000'}
+only_in_a 99999 ['amount', 'ordered_on', 'status'] {'amount': '124998.750000', 'ordered_on': '2024-12-20', 'status': 'shipped'} {}
+18749 rows crossed the network
 truncated: False
 ```
 
-`diff` takes the same options as the CLI: `columns`, `exclude`,
-`bisection_factor`, `threshold`, `max_diffs`. Pass `max_diffs=None` to lift the
-10,000 default, and `float_scale` to `get_dialect` — both sides must agree or
-the comparison is refused before it runs.
+`diff(a, b, a_table, b_table, key, columns=None, exclude=(),
+bisection_factor=32, threshold=10_000, max_diffs=10_000, verify_sample=10_000)`
+takes the same options as the CLI; pass `max_diffs=None` to lift the limit,
+`verify_sample=0` to skip the sample check, and `float_scale=` to
+`get_dialect` — both sides must agree or the comparison is refused before it
+runs. Values are the raw canonical text the engines compared (`\N` is NULL).
 
-### What you get back
-
-`DiffResult` carries:
-
-| Attribute | |
-|---|---|
-| `identical` | `True` only if no row differed, no column exists on one side only, every checksum mismatch was explained by the rows downloaded, **and** the whole key space was walked. False whenever `truncated` is set. |
-| `truncated` | The walk stopped early, so this is a partial answer. Never read a truncated result as "the rest matched". |
-| `schema_differences` | Columns one side has and the other lacks, that you did not set aside with `columns` / `exclude`. Any entry makes the result not identical. |
-| `unexplained` | Key ranges whose checksums differed although the rows downloaded from them compared equal (or a side returned a different row count than its checksum counted). The engines proved a difference the tool could not show you, so the result is not identical. |
-| `diffs` | `RowDiff` objects in key order, each with `key`, `kind` (`only_in_a`, `only_in_b`, `different`), the `columns` that moved, and `values_a` / `values_b` as raw canonical text. |
-| `columns` | The columns actually compared, after `columns` and `exclude`. |
-| `warnings` | Everything the comparison decided on your behalf: columns set aside, types that differ between sides (key types included), timezone-awareness mismatches, engine caveats such as a missing snapshot. Worth surfacing. |
-| `float_scale` | The rounding in force, so a caller can state it alongside the verdict. |
-| `stats` | `queries`, `rows_downloaded`, `rows_compared_a`, `rows_compared_b`, `segments_checked`, `seconds`. |
+`DiffResult` carries `identical`, `truncated`, `schema_differences`,
+`unexplained`, `verification` (the sample check), `verify_sample`, `diffs` (`RowDiff` with
+`key`, `kind`, `columns`, `values_a`, `values_b`), `columns`, `warnings`,
+`float_scale` and `stats`. `identical` is `True` only if no row differed, no
+column exists on one side only, every checksum mismatch was explained, the
+sample check (unless `verify_sample=0`) ran and found no contradiction, **and**
+the whole key space was walked.
+The fields are described with their JSON counterparts in
+[docs/output.md][output-json].
 
 `diff` raises `ValueError` for anything it refuses — a FLOAT key, a non-unique
 or NULL key, a missing table, mismatched float scales — and for any database
 error during the walk, which arrives as a `ValueError` naming the side and the
-table, with the driver's own exception as its `__cause__`. The message always
-names which side. The caller owns the two dialects: close them (or use `with`,
-as above) even when `diff` raises, or a PostgreSQL side keeps its snapshot
-transaction open.
+table, with the driver's own exception as its `__cause__`. The caller owns the
+two dialects: close them (or use `with`, as above) even when `diff` raises, or
+a PostgreSQL side keeps its snapshot transaction open.
 
-## Limitations — read these before trusting a result
+## How far a result can be trusted
 
-A parity tool that reports a false match is worse than useless, so these are
-stated plainly rather than buried.
+Every passing run prints two computed figures in its `risk:` line (and in
+JSON `risk`):
 
-- **Any key type, but non-integer keys are bucketed by a hash.** A single
-  integer column is bisected directly. A `uuid`, a natural string key, or
-  several columns together are hashed to 60 bits so the key space can be
-  divided — and the run says so. Rows are still matched and reported by their
-  real key, so a hash collision can only put two rows in the same bucket; it
-  can never merge them.
-- **Keys are compared exactly — never at the float scale.** A DECIMAL key
-  compares by its exact value (`1.50` and `1.5000` are the same key, and an
-  integral decimal `42` matches an integer `42`); a timestamp key keeps its
-  sub-microsecond digits where the engine holds them. A **FLOAT key is
-  refused**: no rendering of a double is both exact and identical on every
-  engine. A NULL in any key column is refused, as for an integer key. When the
-  key's type differs between the sides in a way that cannot match (integer
-  against float, a timezone-aware against a naive timestamp), the run warns
-  that every row will read as missing on one side.
-- **Text is compared exactly, including the characters the tool uses
-  internally.** Values are joined with ASCII Unit Separator and NULL is
-  spelled `\N`, so text is escaped first (`\` → `\\`, chr(31) → `\s`): the
-  string `\N` never equals NULL and a separator inside a value cannot shift
-  where a column ends. Text without either character renders exactly as
-  before.
-- **Floats and decimals are compared at 6 decimal places** by default. Two
-  values differing only in the 7th place are reported as *equal*. This is a
-  deliberate cross-engine rounding contract — the engines do not otherwise
-  agree on float text. Change it with `--float-scale`; it always applies to
-  both sides, and the scale in force is printed on every run.
-- **How a double is rounded, exactly.** Every engine renders a finite double
-  the same way: below 2^53 (about 9.0e15) its *shortest round-trip decimal* —
-  what Python's `repr` prints, and what the user most likely typed — rounded
-  half away from zero; from 2^53, where every double is an integer, its exact
-  integer value. So `2.0000005` compares as `2.000001` and `1e15+0.5` keeps
-  its `.5`; single-precision (`real`) columns are widened to double first.
-  PostgreSQL, DuckDB, MySQL and BigQuery agree byte for byte on a 1,565-value
-  adversarial sample (`demo/float_agreement.py`) and on 20,000 more random
-  doubles (10,000 on BigQuery), at several scales. PostgreSQL needs version
-  12 or newer for FLOAT columns (older servers are refused with a clear
-  error), and FLOAT columns accept `--float-scale` up to 20.
-- **Doubles of magnitude 2^116 (about 8.3e34) or more are refused**: the diff
-  stops with an error naming the value rather than rounding it approximately.
-  (This replaces the old DuckDB-only limit of 1e32, which PostgreSQL did not
-  share.)
-- **DECIMAL values too wide to render at the float scale are refused**, never
-  rounded or clamped. The limit is the engine's widest decimal minus the
-  scale: on MySQL 65 − s integer digits (59 at the default scale; MySQL also
-  caps `--float-scale` at 30 for DECIMAL columns), on DuckDB 38 − s, on
-  BigQuery the column type's own range. PostgreSQL has no limit. The error
-  names the side, the column and the value.
-- **Snowflake FLOAT columns are not verified** against that canonical form —
-  no account was available when it was defined — and every run comparing one
-  prints a warning saying so. Snowflake DECIMAL columns are unaffected.
-- **Keys must be unique.** A non-unique key is detected up front and rejected.
-  Silently collapsing duplicate rows would hide real differences.
-- **`Infinity` and `NaN`** in float columns are compared as those literal
-  tokens on both sides. Infinite dates and timestamps (PostgreSQL's and
-  DuckDB's `infinity`, common as a "valid until forever" end date) compare as
-  `infinity` / `-infinity`, never as NULL. BC dates use astronomical year
-  numbering (1 BC is year `0000`, 44 BC is `-43`), as DuckDB prints them.
-- **Wide tables are fine.** PostgreSQL caps a function call at 100 arguments,
-  so the row concatenation is built as a nested tree; tested to 500 columns.
-  Long rows are fine too: SQL Server's `CONCAT_WS` silently cuts its result at
-  4,000 characters unless an argument is `nvarchar(max)`, so every value is
-  joined as one — tested with a difference planted at character 9,500.
-- **Supported types:** integer, decimal, float, boolean, string, date,
-  timestamp. Anything else is compared as raw text and reported as a warning —
-  two engines may render the same JSON or array differently for reasons that
-  have nothing to do with the data. A few such types are rendered exactly
-  rather than lossily: MySQL binary columns as `\x` + hex (PostgreSQL's
-  `bytea` form) and `bit(n)` as its bits; SQL Server `sql_variant`, DuckDB
-  `UNION`/`VARIANT` and Snowflake `VARIANT` with their type tag, so `1` and
-  `'1'` differ. DuckDB `TIMESTAMP_NS` keeps its nanoseconds when it has any.
-- **A row wider than MySQL's `max_allowed_packet`** (64 MiB by default) is
-  hashed column by column instead of as one string, so it can never drop out
-  of a checksum; against another engine such a row is downloaded and compared
-  value by value.
-- **At most 10,000 differences are reported by default.** Each one costs about
-  715 bytes, so two tables that share nothing would need gigabytes rather than
-  producing an answer - and pointing the tool at the wrong table or the wrong
-  environment is exactly what it exists to catch. Past the limit the run is
-  flagged `truncated`, `identical` is never true, and the output says "at
-  least N". It does not mean the rest matched. `--max-diffs 0` lifts the limit.
-- **Timezone-aware timestamps are compared as instants, in UTC.** Both
-  sessions are pinned to UTC on connect, so the same instant matches whatever
-  the two servers' default timezones are. Without that pin, two sides in
-  different zones render every `timestamptz` differently and the tool reports
-  the entire table as changed.
-- **A column present on only one side is a schema difference**: the run is
-  not identical and exits `1`, even if every row matches on the columns both
-  sides share. `--exclude` it if the change was intended.
-- **A live source table is read at one snapshot on PostgreSQL, MySQL and
-  BigQuery.** PostgreSQL and MySQL run the whole diff in one REPEATABLE READ,
-  read-only transaction. BigQuery has no cross-query transaction, so every
-  query reads a base table `FOR SYSTEM_TIME AS OF` the instant of the first
-  one. **A BigQuery view is not pinned** — BigQuery silently ignores time
-  travel on views — and neither is a MySQL table on a non-transactional engine
-  (MyISAM, MEMORY); like every table on Snowflake (READ COMMITTED only), such a
-  source changing during the run can produce differences that never existed
-  at one point in time. **Every run says so** when it applies. Diff the
-  underlying table, or re-run, if the source is busy.
-- **Session settings cannot skew the result.** PostgreSQL pins the time zone,
-  float digits, `standard_conforming_strings`, `DateStyle`, `IntervalStyle`,
-  `bytea_output`, `lc_monetary`, the client encoding and `search_path` (so a
-  user function cannot shadow a built-in), and turns off the idle and
-  transaction timeouts that would otherwise kill the snapshot mid-run. MySQL
-  pins the time zone and `sql_mode`.
-- **The checksum detects accidents, not tampering.** Row hashes are summed per
-  key range, and the hash is public, so someone who can write rows on one side
-  could craft several changes whose hashes cancel and read as identical. By
-  accident this happens with odds of about 1 in 2^60 per differing range.
-  Treat a clean run as proof that a migration lost or changed nothing, not as
-  proof against a deliberate adversary.
-- **Interrupting a BigQuery run waits for the in-flight query.** Cancelling a
-  BigQuery job needs a write scope, and read-only was judged worth more.
-  The same is true of SQL Server, whose driver has no way to cancel a query.
-- **SQL Server reads one snapshot only if the database allows it.** With
-  `ALLOW_SNAPSHOT_ISOLATION ON` the diff runs in one SNAPSHOT transaction, like
-  PostgreSQL. Without it the run stays at READ COMMITTED and **every run prints
-  a warning** that it was not single-snapshot; it never falls back to
-  REPEATABLE READ, whose locks would block writers on a live system for the
-  whole diff, or to NOLOCK, whose dirty reads invent differences. A table
-  created or altered while a snapshot diff runs makes it stop with SQL Server's
-  error 3961 rather than read inconsistent data.
-- **SQL Server `datetime2(7)` and `datetimeoffset(7)` are compared at
-  microseconds**, the precision the other engines hold: the seventh digit (100
-  ns) is truncated, never rounded, so `23:59:59.9999995` stays on its day.
-  Every run comparing such a column says so. As a *key* such a column is
-  compared exactly. `datetime` (1/300 s ticks)
-  compares as its displayed milliseconds, `.003`/`.007`, which is what tools
-  export; a target that stored the exact tick (`.003333`) will differ.
-  `datetimeoffset` is compared as an instant in UTC.
-- **SQL Server `char(n)`/`nchar(n)` are compared without their trailing
-  padding**, as PostgreSQL's `char(n)` and MySQL's `CHAR` are: a `char(10)`
-  holding `abc` matches `abc` on the other side. Nothing is lost, since the
-  column cannot tell `abc` from `abc ` itself. GUIDs compare in lower case.
-- **SQL Server's own FLOAT rendering** (`float`, `real`) matches the canonical
-  form on the same 1,565-value sample and 10,000 random doubles, at scales 0–18;
-  `--float-scale` above 18 is refused for FLOAT columns there.
-- **Microsoft Fabric and Azure Synapse are not supported yet** and are refused
-  at connect, naming the engine edition: both isolate differently (Fabric
-  ignores `SET TRANSACTION ISOLATION LEVEL`; Synapse dedicated pools read
-  uncommitted by default), and neither has been verified.
+| Figure | What it bounds | Value |
+|---|---|---|
+| Checksum collision | that a key range holding a real difference still sums to the other side's checksum | at most 2⁻⁶⁰ ≈ 8.7 × 10⁻¹⁹ per differing range, for data not crafted to collide |
+| Hidden rows | the share of rows that could carry a difference both the checksums and the sample missed | below 1 − 0.001^(1/n) at 99.9% confidence for n sampled rows — 0.069% at the default 10,000; **0** when every row was compared |
+
+| `--verify-sample` | Share of rows that could hide an error | On 10M rows, at most |
+|---|---|---|
+| 1,000 | 0.69% | 68,840 |
+| 10,000 (default) | 0.069% | 6,905 |
+| 100,000 | 0.0069% | 691 |
+| ≥ table size | 0 (every row compared twice) | 0 |
+
+A larger sample costs one more pass over the key and the download of the
+sampled rows: on 1M rows PostgreSQL ↔ DuckDB, 3.5 s at 1,000 and 5.2 s at
+100,000. The rows are chosen by a hash of the key, fresh at every run, so both
+sides pick the same rows and the sample spreads over the whole table; the
+result records the choice (`modulus`, `residue`) so a run can be repeated.
+The figures cover the columns the sample check covers (listed in JSON as
+`covered_columns`); a column of a type outside the rules carries no bound.
+Nothing bounds a table changing during a run on an engine without a single
+snapshot, or a difference the rules ignore by design. **[docs/risk.md][risk]**
+states the error odds of every step of a comparison and is kept current with
+the code; it is what to show someone who asks how sure you are.
+
+## Limitations you must know
+
+These can change a verdict. Each run prints the ones that apply to it; the
+full list, with every engine-specific detail, is
+**[docs/limitations.md][limitations]**.
+
+1. **Floats and decimals are compared at 6 decimal places** by default: values
+   differing only in the 7th place are *equal*. Change it with
+   `--float-scale`; the scale is printed on every run.
+2. **Types outside the rules are compared as raw text** — BigQuery
+   ARRAY/STRUCT/INTERVAL, nested lists, structs, ranges, geometry, XML. They
+   are named in a warning, not covered by the sample check, and carry no risk
+   figure.
+3. **No single snapshot on Snowflake, BigQuery views, MySQL non-InnoDB tables,
+   or SQL Server without `ALLOW_SNAPSHOT_ISOLATION`.** A source written during
+   the run can show differences that never existed, or hide real ones. Every
+   such run says so.
+4. **What the reading login cannot see is not compared** — PostgreSQL
+   row-level security is named in a caveat; diff as a `BYPASSRLS` role.
+5. **The checksum detects accidents, not tampering.** Someone who can write
+   rows could craft changes whose hashes cancel. Accidentally the odds are
+   about 2⁻⁶⁰ per differing range.
+6. **At most 10,000 differences are reported by default.** Past it the run is
+   marked partial and says "at least N"; it does not mean the rest matched.
+   `--max-diffs 0` lifts the limit.
+7. **Keys must be unique and non-NULL**, and FLOAT keys are refused. Keys are
+   compared exactly, never at the float scale.
+8. **Sub-microsecond digits** (DuckDB `TIMESTAMP_NS`, SQL Server
+   `datetime2(7)`, Snowflake `TIMESTAMP(9)`) are truncated, not compared,
+   against an engine that holds only microseconds — with a caveat.
+
+Also by design: timezone-aware timestamps compare as instants in UTC;
+`char(n)` padding is ignored; NULL is never equal to `''` or to `false`; a
+column on one side only is a schema difference (exit 1).
 
 ## Supported engines
 
 | Engine | Status |
 |---|---|
-| PostgreSQL | supported (tested against 16 and 18) |
-| DuckDB | supported (tested against 1.5) |
-| MySQL | supported (tested against 8.0) |
-| Snowflake | supported (verified live on AWS; `pip install "parity-diff[snowflake]"`) |
-| BigQuery | supported (verified live in the EU region; `pip install "parity-diff[bigquery]"`) |
-| SQL Server / Azure SQL | supported (SQL Server 2019+; verified live against 2022; `pip install "parity-diff[mssql]"`) |
-| Redshift, Databricks, Fabric | not yet — see `CONTRIBUTING.md`, a dialect is ~80 lines |
+| PostgreSQL | supported: 9.6 or newer (12 or newer for FLOAT columns); every version 12-18 verified identical; the database must be UTF-8 or its text is hashed as UTF-8 |
+| DuckDB | supported: 1.3 or newer (1.3-2.0 verified identical; older versions are refused, as they render some values ambiguously) |
+| MySQL | supported: 8.0, 8.4 LTS and 9.x verified identical; 9.7+ needs `INSTALL COMPONENT 'file://component_classic_hashing'` (MD5) |
+| Snowflake | supported (verified live on AWS); connector 4.x, password or key-pair login |
+| BigQuery | supported (verified live in the EU region); Application Default Credentials |
+| SQL Server / Azure SQL | supported (SQL Server 2019+; 2019 and 2022 verified identical; FLOAT columns need database compatibility level 130 or more); SQL authentication |
+| Oracle | supported (19c+; 21c and 23ai verified identical; AL32UTF8 databases); password login; stores `''` as NULL, which the output says |
+| Redshift, Databricks, Fabric | not yet — a new engine is one dialect file, see `CONTRIBUTING.md` |
+
+Per-engine details: [engines.md][engines]. Which value of which type was
+verified on which engine: [coverage.md][coverage].
+
+## Measured
+
+10,000,000 rows per side, PostgreSQL 18.4 ↔ DuckDB 1.5.5, on one developer
+laptop (`demo/benchmark.py`), with the default 10,000-row sample check:
+
+| Scenario | Queries | Rows downloaded | Sample check | Wall time |
+|---|---|---|---|---|
+| identical tables | **4** | **0** (0.0000%) | 2 queries, ~20,000 rows (both sides) | 61–68s |
+| 5 planted differences | **28** | **7,628** (0.0381%) | 2 queries, ~20,000 rows | 94–101s |
+
+**The query counts and row counts are exact and hardware-independent** —
+properties of the algorithm, pinned by the test suite; reproduce them and you
+should get the same integers. The sample's row count varies by a few percent
+between runs, because the sampled rows are drawn afresh each time. The wall
+times are a range over two or three runs on a laptop that was busy with other
+work at the time, and they vary a lot with load (the same machine measured
+25–31s and 48–55s before the sample check existed, on a quieter day); treat
+them as an order of magnitude, not a specification.
+
+The five planted differences — a changed decimal, a deleted row, an inserted
+row at key 999,999,999, a `NULL` turned into `''`, and a `FALSE` turned into
+`NULL` — are all found exactly, with no false positives.
+
+Cost is roughly **one full hash pass per side**. It is CPU-bound on MD5, not
+IO-bound on key lookup, which is why **an index on the key column makes no
+measurable difference** (measured at 10M before the sample check existed:
+38.8s without, 37.3s with).
+Raising `--bisection-factor` does not speed up the dominant first pass; it
+only reduces round trips on later levels.
 
 ## Scope
 
@@ -437,11 +584,15 @@ Tests that need PostgreSQL read `PARITY_TEST_PG` (default
 server is reachable — the DuckDB and pure-Python suites still run. Snowflake
 and BigQuery have no local or CI instance, so their live suites run only when
 `PARITY_TEST_SNOWFLAKE` / `PARITY_TEST_BIGQUERY`
-(`bigquery://<project>/<dataset>`) point at a real account; the BigQuery tests
+(`bigquery://<project>/<dataset>`) point at a real account (Snowflake's
+key-pair test additionally needs `PARITY_TEST_SNOWFLAKE_KEYPAIR`, a key-pair
+URL); the BigQuery tests
 create and drop their own tables in that dataset. SQL Server's live suite runs
 when `PARITY_TEST_MSSQL` names a login that may create databases — the
 Developer-edition container works; see the top of `tests/test_mssql.py` — and
-`PARITY_TEST_MSSQL_RO`, if set, adds the read-only-login checks.
+`PARITY_TEST_MSSQL_RO`, if set, adds the read-only-login checks. Oracle's
+runs when `PARITY_TEST_ORACLE` is a URL, or `1` for the Oracle Free container
+described at the top of `tests/test_oracle.py`.
 
 A disposable PostgreSQL:
 
@@ -466,7 +617,10 @@ way it is. `ROADMAP.md` is what is done and what comes next.
 
 ## Changelog
 
-Latest release **0.4.0** — SQL Server support, and the fixes from a red-team
+Latest release **0.5.0** — Oracle support, an independent sample check on every
+run (10,000 rows, 99.9% confidence), `--where`, `--map` and `parity run` for
+many tables, and every false match found by red-team round H fixed; see
+"Upgrading from 0.4.0" in `CHANGELOG.md`. 0.4.0 added SQL Server support, and the fixes from a red-team
 campaign that found inputs on which earlier versions reported identical tables
 that were not (a text value `\N` against NULL, a separator character inside
 text, a column dropped on one side, PostgreSQL `infinity` dates, MySQL binary
@@ -479,3 +633,13 @@ check, 0.2.2 added Snowflake. See `CHANGELOG.md` for the full history.
 ## License
 
 MIT — see `LICENSE`.
+
+<!-- Absolute links: PyPI renders this README alone, without the docs/ folder. -->
+[output]: https://github.com/Aleixiou/parity-diff/blob/main/docs/output.md
+[output-json]: https://github.com/Aleixiou/parity-diff/blob/main/docs/output.md#json---json
+[troubleshooting]: https://github.com/Aleixiou/parity-diff/blob/main/docs/troubleshooting.md
+[engines]: https://github.com/Aleixiou/parity-diff/blob/main/docs/engines.md
+[passwords]: https://github.com/Aleixiou/parity-diff/blob/main/docs/engines.md#keeping-passwords-out-of-logs
+[limitations]: https://github.com/Aleixiou/parity-diff/blob/main/docs/limitations.md
+[risk]: https://github.com/Aleixiou/parity-diff/blob/main/docs/risk.md
+[coverage]: https://github.com/Aleixiou/parity-diff/blob/main/docs/coverage.md

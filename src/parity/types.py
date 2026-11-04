@@ -31,6 +31,39 @@ class LogicalType(str, Enum):
     STRING = "string"
     DATE = "date"
     TIMESTAMP = "timestamp"
+    #: Time of day, to the microsecond: `HH:MM:SS.ffffff`. MySQL's TIME is a
+    #: duration (up to +-838:59:59) and renders as one past the day; no other
+    #: engine can hold those values, so they can only match MySQL.
+    TIME = "time"
+    #: Bytes, exactly: `\\x` + lower-case hex (the escaped spelling of
+    #: PostgreSQL's bytea text, which is what PostgreSQL and MySQL rendered
+    #: before the type had a rule, so their checksums did not move).
+    BINARY = "binary"
+    #: A JSON document, as its engine's normalised serialisation laid out one
+    #: way everywhere (`canonical_json_text`). Engines normalise differently
+    #: - key order, number spelling - so cross-engine equality holds only
+    #: where their normal forms coincide, and the engine warns otherwise.
+    JSON = "json"
+    #: A bit string, as its digits at full width: `00000101` (PostgreSQL
+    #: bit/varbit, DuckDB BIT, MySQL BIT(n)). Never a boolean: `1` is not
+    #: `true`, and SQL Server's `bit` stays BOOLEAN.
+    BITS = "bits"
+    #: A calendar interval as its three exact components, `<months> mon
+    #: <days> day <microseconds> us` (`canonical_interval_text`): `1 day` and
+    #: `24:00:00` are stored differently and render differently.
+    INTERVAL = "interval"
+    #: A time of day with its UTC offset, `HH:MM:SS.ffffff+HH:MM`
+    #: (`canonical_timetz_text`): local time and offset both kept.
+    TIMETZ = "timetz"
+    #: A one-dimensional list or array: each element by its own type's rule,
+    #: each followed by a terminator, inside brackets (`canonical_list_text`).
+    LIST = "list"
+    #: A PostgreSQL inet/cidr value: its full address and prefix length,
+    #: `10.0.0.1/32` (`canonical_inet_text`).
+    INET = "inet"
+    #: A SQL Server sql_variant: `<base type>:<exact value>`
+    #: (`canonical_variant_text`). No other engine has the type.
+    VARIANT = "variant"
     UNKNOWN = "unknown"
 
 
@@ -46,6 +79,21 @@ class Column:
     #: `DATETIME`, so it sets this explicitly rather than have the engine
     #: guess from a name that means the opposite elsewhere.
     tz_aware: bool | None = None
+    #: Compare digits past microseconds. Set by the engine on a TIMESTAMP
+    #: column only when *both* sides can hold them (DuckDB TIMESTAMP_NS,
+    #: SQL Server datetime2(7), Snowflake TIMESTAMP(7-9)): then a value with
+    #: a sub-microsecond part renders all nine digits on either engine. When
+    #: one side holds microseconds only, they are truncated, as that side's
+    #: data already is, and a caveat says so (COV-2).
+    sub_micro: bool = False
+    #: The engine's full declaration where its type name leaves out what the
+    #: rendering needs: MySQL's COLUMN_TYPE (`int(6) unsigned zerofill`,
+    #: `enum('a','')`). Empty elsewhere. Not part of equality, so a Column
+    #: built from the type name alone still compares equal.
+    declared: str = field(default="", compare=False)
+    #: The character set a text column stores in, where an engine holds text
+    #: in more than one (MySQL); None elsewhere. Not part of equality.
+    charset: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -146,6 +194,78 @@ class DiffStats:
     rows_compared_a: int = 0
     rows_compared_b: int = 0
     seconds: float = 0.0
+    #: The independent sample check's own cost, kept apart so `queries` and
+    #: `rows_downloaded` still describe the checksum walk alone.
+    sample_queries: int = 0
+    rows_sampled: int = 0
+
+
+#: Confidence level of the risk figures each run prints (`max_hidden_fraction`).
+RISK_CONFIDENCE = 0.999
+
+#: Upper bound on the chance that one bucket holding a real difference still
+#: sums to the other side's checksum: row hashes are 60-bit MD5 prefixes, so
+#: for data not crafted to collide (CLAUDE.md 4.11) a differing sum matches
+#: with probability at most 2^-60, about 8.7e-19.
+CHECKSUM_COLLISION_BOUND = 2.0**-60
+
+
+@dataclass
+class Verification:
+    """The independent sample check: rows re-compared from raw driver values.
+
+    After the checksum walk, a sample of rows is downloaded from both sides as
+    the drivers return them and compared in Python by the documented rules
+    (`parity.reference`), with none of the dialects' canonical-text SQL. A
+    false match needs that SQL to render two different values alike; this
+    check cannot be fooled the same way, so a disagreement here means the walk
+    itself is wrong for these data and the tables are not called identical.
+    """
+
+    #: Rows sampled: those whose key hash is `residue` modulo `modulus`, so
+    #: about one in `modulus`; 1 means every row was compared.
+    modulus: int
+    residue: int
+    rows_a: int
+    rows_b: int
+    #: Columns compared by value, and columns whose type the reference rules
+    #: do not cover (structs, nested lists, ...) - those were not
+    #: independently checked.
+    checked: list[str] = field(default_factory=list)
+    unchecked: list[str] = field(default_factory=list)
+    #: Rows the walk called equal that the raw values say differ, or keys one
+    #: side's sample holds that the walk never reported. Any entry means the
+    #: comparison cannot be trusted for this data: never identical.
+    failures: list[str] = field(default_factory=list)
+    #: Differences the walk reported that the raw values do not show - a false
+    #: alarm in the walk or a limit of the reference; reported, not blocking.
+    notes: list[str] = field(default_factory=list)
+    #: Why the check could not run, if it could not. Blocking: the run asked
+    #: for a second method and did not get one, so the result is not proven
+    #: and never identical (switch the check off with ``verify_sample=0`` to
+    #: rest the verdict on the checksums alone, deliberately).
+    error: str | None = None
+
+    def max_hidden_fraction(self, confidence: float = RISK_CONFIDENCE) -> float | None:
+        """Upper bound on the share of rows the walk could have got wrong.
+
+        Each row is in the sample with probability 1/`modulus` (the residue is
+        drawn at random each run, and the key hash spreads keys evenly over
+        the residues). If a fraction p of rows were rendered wrongly, the
+        chance that none of the n sampled rows is one of them is (1 - p)^n;
+        so after n rows with no disagreement, p < 1 - (1 - confidence)^(1/n)
+        at that confidence - the exact binomial bound (for 95% this is the
+        "rule of three", about 3/n). 0.0 when every row was compared (modulus
+        1). None when the check failed, could not run, or sampled nothing.
+        """
+        if self.failures or self.error:
+            return None
+        if self.modulus == 1:
+            return 0.0
+        n = min(self.rows_a, self.rows_b)
+        if n == 0:
+            return None
+        return float(1.0 - (1.0 - confidence) ** (1.0 / n))
 
 
 @dataclass
@@ -176,16 +296,44 @@ class DiffResult:
     #: comparison (a driver dropping bytes, a lossy decode, a live table
     #: changing between queries) lost it. Never a reason to say "identical".
     unexplained: list[str] = field(default_factory=list)
+    #: The independent sample check, or None when it was switched off
+    #: (``verify_sample=0``) or the walk stopped early.
+    verification: Verification | None = None
+    #: The row filter each side was read through (`--where`), or None for
+    #: the whole table. A filtered verdict covers the filtered rows only, so
+    #: the output always states both - a filtered "identical" must never be
+    #: read as one about the whole table.
+    where_a: str | None = None
+    where_b: str | None = None
+    #: Renamed columns (`--map`), side A's stored name to side B's, for the
+    #: compared and key columns that were paired by the map rather than by
+    #: name. Differences are reported under side A's name.
+    column_map: dict[str, str] = field(default_factory=dict)
+
+    #: The sample size the run asked for (``verify_sample``); 0 means the
+    #: check was deliberately switched off, which the output says. None when
+    #: the result was not built by ``diff``.
+    verify_sample: int | None = None
+
+    @property
+    def filtered(self) -> bool:
+        """Whether either side was read through a row filter."""
+        return bool(self.where_a or self.where_b)
 
     @property
     def identical(self) -> bool:
         """Proven to match: no differences, the whole key space walked, every
-        column on both sides compared, and every checksum mismatch explained."""
+        column on both sides compared, every checksum mismatch explained, and
+        the independent sample check - when it ran - neither contradicting the
+        walk nor failing to run. A check that was asked for and could not run
+        leaves the result unproven, not identical."""
         return (
             not self.diffs
             and not self.truncated
             and not self.schema_differences
             and not self.unexplained
+            and not (self.verification and self.verification.failures)
+            and not (self.verification and self.verification.error)
         )
 
     def by_kind(self, kind: str) -> list[RowDiff]:

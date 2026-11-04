@@ -542,6 +542,9 @@ def test_no_shared_columns_still_checks_key_presence():
     assert any("no comparable columns" in w for w in result.warnings)
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_type_mismatch_between_sides_is_called_out():
     """A schema difference that would report every row as changed is named as one."""
     a_cols = [Column("amount", LogicalType.DECIMAL, "decimal(12,2)")]
@@ -984,6 +987,9 @@ def test_two_columns_differing_only_in_case_are_refused():
 # ---------------------------------------------------------------------------
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
     """RT-A10, count variant: a side whose fetch drops a row its own checksum
     counted. The surviving rows compare equal, so without the count check the
@@ -1006,6 +1012,9 @@ def test_a_fetch_that_loses_rows_is_unexplained_not_identical():
     assert "side B (b.t) counted" in note and "returned" in note
 
 
+# The planted defect is in the walk's own download or in a fake whose
+# declared types do not match its rendering; the sample check sees past it.
+@pytest.mark.sample_check_may_disagree
 def test_a_lossy_fetch_is_named_with_both_tables_and_the_range():
     """RT-A10: rows compare equal after a mismatched checksum - the result
     names both tables and the key range, and is not identical. A real planted
@@ -1077,16 +1086,18 @@ def test_a_key_named_twice_in_two_cases_is_one_key():
 @pytest.mark.parametrize(
     "key_b, warned",
     [
-        (Column("id", LogicalType.DECIMAL, "decimal(18,0)"), True),
+        # A decimal key renders its minimal exact text, `1` like the integer
+        # (RT-HX2); it used to render 1.000000 and was warned about.
+        (Column("id", LogicalType.DECIMAL, "decimal(18,0)"), False),
         (Column("id", LogicalType.FLOAT, "double"), True),
         (Column("id", LogicalType.STRING, "varchar"), False),
         (Column("id", LogicalType.INTEGER, "integer"), False),
     ],
 )
 def test_a_key_type_that_cannot_match_is_named(key_b, warned):
-    """RT-A14/B8/E6: an integer key against a decimal or float key renders
-    '1' against '1.000000', so nothing can match. Text against an integer can
-    ('42' is '42'), so it is not warned about."""
+    """RT-A14/B8/E6: an integer key against a float key cannot match (a
+    FLOAT key is refused outright). Text against an integer can ('42' is
+    '42'), and so can a decimal key, so neither is warned about."""
     a = FakeDialect(SyntheticTable(10), side="A")
     b = FakeDialect(SyntheticTable(10, deleted=[3]), side="B", key_type_override=key_b)
     result = diff(a, b, "a.t", "b.t", "id")
@@ -1098,7 +1109,7 @@ def test_a_key_type_that_cannot_match_is_named(key_b, warned):
 
 def test_enum_against_text_is_not_predicted_to_differ():
     """RT-C13: an enum (UNKNOWN) renders its label, exactly the text on the
-    other side; no "will very likely all differ". The planted change is found."""
+    other side; no "expect differences". The planted change is found."""
     a = FakeDialect(
         DictTable(
             [Column("v", LogicalType.UNKNOWN, "USER-DEFINED")], {1: ("x",), 2: ("y",)}
@@ -1111,7 +1122,46 @@ def test_enum_against_text_is_not_predicted_to_differ():
     )
     result = diff(a, b, "a.t", "b.t", "id")
     assert kinds(result) == [(2, "different")]
-    assert not any("very likely all differ" in w for w in result.warnings)
+    assert not any("expect differences" in w for w in result.warnings)
+
+
+def test_a_type_mismatch_warning_says_what_actually_happens(tmp_path):
+    """VARCHAR '1' against BIGINT 1 renders `1` on both sides and compares
+    equal - the warning must not predict that every row differs. It says
+    values match where the texts coincide, and the planted difference (a
+    decimal-looking text that no integer renders) is still found."""
+    from conftest import duckdb_write
+
+    from parity.dialects.duckdb_dialect import DuckDBDialect
+
+    paths = {}
+    for side, ddl, rows in (
+        ("a", "id bigint, v varchar", "(1, '1'), (2, '20'), (3, '3.0')"),
+        ("b", "id bigint, v bigint", "(1, 1), (2, 20), (3, 3)"),
+    ):
+        paths[side] = str(tmp_path / f"{side}.duckdb")
+        con = duckdb_write(paths[side])
+        con.execute(f"create table t ({ddl}); insert into t values {rows}")
+        con.close()
+    a, b = DuckDBDialect(side="A"), DuckDBDialect(side="B")
+    a.connect(f"duckdb:///{paths['a']}")
+    b.connect(f"duckdb:///{paths['b']}")
+    try:
+        result = diff(a, b, "t", "t", "id")
+    finally:
+        a.close()
+        b.close()
+    assert [(d.key, d.kind, d.columns) for d in result.diffs] == [(3, "different", ["v"])]
+    (warning,) = [w for w in result.warnings if w.startswith("column 'v'")]
+    assert warning == (
+        "column 'v' is VARCHAR on side A but BIGINT on side B; values are "
+        "compared as text: a row matches only where both types render the same "
+        "text (integer 1 and text '1' both render 1 and compare equal; decimal "
+        "1.5 renders 1.500000 against text '1.5' and differs), so expect "
+        "differences wherever the spellings diverge, and a match does not mean "
+        "the type change is harmless"
+    )
+    assert "very likely all differ" not in warning
 
 
 def test_a_dialect_closes_itself_as_a_context_manager():

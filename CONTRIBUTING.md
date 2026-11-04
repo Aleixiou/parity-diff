@@ -1,7 +1,9 @@
 # Contributing
 
 The most valuable contribution is **a new dialect**. The architecture exists to
-make that a single file of roughly eighty lines that touches nothing else.
+make that a single file that touches nothing else. Expect it to grow: the
+shipped dialects run from about 570 lines (DuckDB) to about 1,240 (SQL Server),
+most of it the comments and special cases each engine's traps demanded.
 
 ## Adding a dialect
 
@@ -49,9 +51,10 @@ returns limitations of *this* comparison for the engine to print as warnings.
 Each default emits exactly the old SQL. A dialect may also set
 `Column.tz_aware` when its type names do not say `with time zone`.
 
-That comes to roughly 70–85 lines. Read
-`src/parity/dialects/duckdb_dialect.py` first — it is the shortest complete
-example.
+The required methods alone are a short file; a dialect that is verified
+against every logical type, as the shipped ones are, is several hundred lines.
+Read `src/parity/dialects/duckdb_dialect.py` first — at about 570 lines it is
+the shortest complete example.
 
 ### The things that will bite you
 

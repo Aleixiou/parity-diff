@@ -18,8 +18,11 @@ wraps to negative and the two engines disagree.
 
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, TypeVar
 
@@ -95,6 +98,477 @@ def decode_canonical_field(field: str) -> str | None:
             out.append(field[i])
             i += 1
     return "".join(out)
+
+
+# ------------------------------------------------- BINARY, TIME and JSON
+#
+# The three most common types that used to fall to UNKNOWN and compare
+# through an unchecked text cast. Each has an exact rule now; these functions
+# are its executable spec, which every dialect's SQL and `parity.reference`
+# are tested against (tests/test_types_rules.py, tests/conformance).
+
+#: What every BINARY value's canonical text starts with: two backslashes and
+#: `x`. That is PostgreSQL's bytea text (`\x00ff`) as escaped text, which is
+#: exactly how PostgreSQL bytea and MySQL binary rendered when they were
+#: unmapped (bytea through `::text`, MySQL through `_binary_text`), so their
+#: checksums do not move. It can never equal the NULL sentinel.
+BINARY_PREFIX = "\\\\x"
+
+
+def canonical_binary_text(value: bytes) -> str:
+    """A BINARY value's canonical text: `BINARY_PREFIX` + lower-case hex.
+
+    Bytes compare exactly - no padding is trimmed, no encoding is read -
+    because every engine stores bytes as given (MySQL `binary(n)` and SQL
+    Server `binary(n)` store their zero padding, and so render it).
+    """
+    return BINARY_PREFIX + bytes(value).hex()
+
+
+def canonical_time_text(micros: int) -> str:
+    """A TIME value's canonical text, from its microseconds since midnight.
+
+    `HH:MM:SS.ffffff`, always six fractional digits, as TIMESTAMP's clock
+    part. Hours are at least two digits and run past 23 only for values no
+    time-of-day type holds: PostgreSQL and DuckDB accept `24:00:00` itself,
+    and MySQL's TIME is a duration (-838:59:59 .. 838:59:59), whose negative
+    values carry a leading minus - exactly what MySQL's `time_format` prints,
+    so a MySQL duration still renders exactly and only ever matches MySQL.
+    Digits past the microsecond are not part of the rule: an engine holding
+    more (SQL Server time(7), Snowflake TIME(9)) truncates them, and says so.
+    """
+    sign = "-" if micros < 0 else ""
+    m = abs(micros)
+    seconds, frac = divmod(m, 1_000_000)
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{sign}{hours:02d}:{minute:02d}:{sec:02d}.{frac:06d}"
+
+
+#: JSON's control-character escapes as every engine but one spells them:
+#: the six named ones, and `\u00xx` in lower case for the rest of C0.
+_JSON_NAMED = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n"}
+_JSON_NAMED.update({"\r": "\\r", "\t": "\\t"})
+
+
+def json_string_literal(value: str) -> str:
+    r"""A JSON string as the canonical text spells it.
+
+    `"` and `\` escaped, `\b \f \n \r \t` by name, the rest of U+0000..U+001F
+    as `\u00xx` in lower case, and *every other character raw* - `/`, U+007F,
+    U+2028, non-ASCII, astral characters as themselves rather than surrogate
+    pairs. That is PostgreSQL jsonb's, MySQL's and BigQuery's output exactly
+    (verified live); Snowflake escapes U+007F and its dialect undoes it.
+    """
+    out = ['"']
+    for ch in value:
+        esc = _JSON_NAMED.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ch < " ":
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+class _JsonNumber(str):
+    """A JSON number token, kept exactly as the engine spelled it."""
+
+
+def _json_number(token: str) -> _JsonNumber:
+    """`json.loads` hook: keep a number's text instead of converting it."""
+    return _JsonNumber(token)
+
+
+#: One token of JSON text: a string, a run of whitespace, a structural `,` or
+#: `:`, or anything else (brackets, numbers, literals). The string alternative
+#: comes first, so a `,` or a space inside a string is never mistaken for one
+#: outside it - the same alternation every dialect's SQL uses.
+_JSON_LAYOUT = re.compile(
+    r'("(?:[^"\\]|\\.)*")|([ \t\n\r]+)|([,:])|([^", :\t\n\r]+)', re.S
+)
+
+
+def json_layout(text: str) -> str:
+    """JSON text laid out canonically, tokens otherwise untouched.
+
+    Insignificant whitespace removed, then one space after every structural
+    comma and colon: `{"a": [1, 2]}`, PostgreSQL jsonb's and MySQL's own
+    layout. Strings, numbers and key order pass through verbatim.
+    """
+    out: list[str] = []
+    for m in _JSON_LAYOUT.finditer(text):
+        string, space, sep, other = m.groups()
+        if string is not None:
+            out.append(string)
+        elif sep is not None:
+            out.append(sep + " ")
+        elif other is not None:
+            out.append(other)
+    return "".join(out)
+
+
+def canonical_json_text(text: str, *, verbatim: bool = False) -> str:
+    """A JSON document's canonical text, from its engine's serialisation.
+
+    The engines normalise JSON on the way in, each its own way: PostgreSQL
+    jsonb and MySQL order object keys by length and then bytes and keep the
+    last of duplicate keys, BigQuery and Snowflake order them by code point
+    (BigQuery keeps the first duplicate, Snowflake refuses them), and numbers
+    are exact decimals on PostgreSQL and Snowflake but doubles on MySQL and
+    BigQuery. That normal form *is* each engine's JSON value, so key order,
+    duplicates and number spellings are taken from it as given. What the
+    rule fixes is everything else: the layout (`json_layout`) and every
+    string's escaping (`json_string_literal`), so two engines whose normal
+    forms agree render byte-identical text whatever their output style.
+
+    `verbatim` is for an engine that stores JSON as text without normalising
+    it (DuckDB): only the layout is canonical, and strings, numbers, key
+    order and duplicates are compared exactly as stored - an escape spelled
+    `\\u00e9` stays different from `é`. Stricter than JSON equality, never
+    looser, so it can report two equal documents as different but cannot
+    call two different ones equal.
+
+    Raises ValueError on text that is not JSON.
+    """
+    if verbatim:
+        json.loads(text)  # refuse anything that is not JSON at all
+        return json_layout(text)
+    parsed = json.loads(
+        text,
+        object_pairs_hook=_JsonObject,
+        parse_float=_json_number,
+        parse_int=_json_number,
+        parse_constant=_json_number,
+    )
+    return _json_serialise(parsed)
+
+
+class _JsonObject(list):  # type: ignore[type-arg]
+    """A parsed JSON object: its (key, value) pairs in the engine's order,
+    duplicates included - so `{}` is never mistaken for `[]`."""
+
+
+def _json_serialise(value: Any) -> str:
+    """Serialise what `canonical_json_text` parsed, in the canonical layout."""
+    if isinstance(value, _JsonNumber):
+        return str(value)
+    if isinstance(value, str):
+        return json_string_literal(value)
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, _JsonObject):
+        pairs = (f"{json_string_literal(k)}: {_json_serialise(v)}" for k, v in value)
+        return "{" + ", ".join(pairs) + "}"
+    return "[" + ", ".join(_json_serialise(v) for v in value) + "]"
+
+
+# ------------------------- BITS, INTERVAL, TIMETZ, LIST, INET and VARIANT
+#
+# The second batch of types that used to fall to UNKNOWN. Same contract as
+# above: each function is the executable spec its dialects' SQL and
+# `parity.reference` are held to (tests/test_types_rules2.py, tests/conformance).
+# Every one renders from a fixed alphabet or escaped text, so none holds
+# chr(31), and none can equal the NULL sentinel.
+
+
+def canonical_bits_text(digits: str) -> str:
+    """A bit string's canonical text: its digits, every one, at full width.
+
+    `bit(8)` b'101' is `00000101`, never `101` and never `5`: the width is
+    part of the value (PostgreSQL `B'101' = B'0101'` is false), and the
+    digits are exactly what PostgreSQL bit/varbit, DuckDB BIT and MySQL BIT(n)
+    rendered before the type had a rule, so their checksums do not move. A
+    varbit may be empty, which renders as the empty text - still distinct
+    from NULL. Raises ValueError on anything but 0 and 1.
+    """
+    if digits.strip("01"):
+        raise ValueError(f"not a bit string: {digits!r}")
+    return digits
+
+
+#: An infinite interval (PostgreSQL 17+), as its date/timestamp infinities.
+INTERVAL_INFINITY = "infinity"
+INTERVAL_NEG_INFINITY = "-infinity"
+
+
+def canonical_interval_text(months: int, days: int, micros: int) -> str:
+    """An interval's canonical text: its three stored components, exactly.
+
+    `<months> mon <days> day <microseconds> us`, each a signed integer. That
+    is how PostgreSQL and DuckDB *store* an interval - months, days and
+    microseconds, never normalised into one another - so `1 day`, `24:00:00`
+    and `1 mon` against `30 days` render differently. Both engines' `=` calls
+    `1 day` equal to `24 hours`, but they are different values: added to a
+    timestamp across a DST change they give different instants, and they
+    print differently. So two engines that agree on the components agree on
+    the text, and two different stored intervals never share one (the rule
+    is stricter than `=`, never looser: a false alarm at worst).
+    """
+    return f"{months} mon {days} day {micros} us"
+
+
+def canonical_timetz_text(micros: int, offset_seconds: int) -> str:
+    """A time-with-time-zone value's canonical text: local time, then offset.
+
+    The local time as `canonical_time_text` (`24:00:00` included) and the
+    offset east of UTC as `+HH:MM`, with `:SS` only when it has seconds
+    (PostgreSQL and DuckDB accept offsets to the second). The offset is part
+    of the value: `12:00+05:45` and `06:15+00` are the same instant of
+    different days' clocks, and PostgreSQL's own `=` calls them different.
+    """
+    sign = "-" if offset_seconds < 0 else "+"
+    hours, rest = divmod(abs(offset_seconds), 3600)
+    minutes, seconds = divmod(rest, 60)
+    offset = f"{sign}{hours:02d}:{minutes:02d}"
+    if seconds:
+        offset += f":{seconds:02d}"
+    return canonical_time_text(micros) + offset
+
+
+#: What follows every element of a list: a backslash and a comma. No element
+#: text can contain it - an escaped text's backslashes are always followed by
+#: `\` or `s`, the sentinel is `\N`, and every other rule's alphabet has no
+#: backslash - so a list's text splits into its elements one way only.
+LIST_TERMINATOR = "\\,"
+
+#: Element types a list can hold and still have a rule. JSON is left out (its
+#: sample path reads text a list cannot carry), nested lists and every
+#: UNKNOWN type too: such a list is UNKNOWN, as it always was.
+LIST_ELEMENT_TYPES = frozenset(
+    {
+        LogicalType.INTEGER,
+        LogicalType.DECIMAL,
+        LogicalType.FLOAT,
+        LogicalType.BOOLEAN,
+        LogicalType.STRING,
+        LogicalType.DATE,
+        LogicalType.TIMESTAMP,
+        LogicalType.TIME,
+        LogicalType.BINARY,
+        LogicalType.BITS,
+        LogicalType.INTERVAL,
+        LogicalType.TIMETZ,
+        LogicalType.INET,
+    }
+)
+
+
+#: Brackets the dimensions of a PostgreSQL array that is not one-dimensional
+#: from 1 (`canonical_list_text`). No element text can hold it, and a plain
+#: list's text cannot start `[\=`, so the two forms never meet.
+LIST_DIMS_MARK = "\\="
+
+
+@dataclass(frozen=True)
+class ShapedList:
+    """A PostgreSQL array that is not one-dimensional from 1, as the sample
+    check reads it: its dimensions as `array_dims` prints them
+    (`[1:2][1:2]`, `[0:1]`) and its elements in storage (row-major) order."""
+
+    dims: str
+    items: tuple[Any, ...]
+
+
+def canonical_list_text(elements: Sequence[str], dims: str | None = None) -> str:
+    r"""A list's canonical text, from its elements' canonical texts.
+
+    `[` + each element followed by `LIST_TERMINATOR` + `]`: `[]` is empty,
+    `[\,]` holds one empty string, `[\N\,]` one NULL, `[a,b\,]` one string
+    with a comma and `[a\,b\,]` two strings. Each element is rendered by its
+    own type's rule (a NULL as the sentinel, text escaped), so the text is
+    injective: it starts with `[`, so it never equals the sentinel, and no
+    element can forge a terminator. Element order is part of the value.
+
+    A PostgreSQL array with more than one dimension or a lower bound other
+    than 1 carries that shape in its value (`'[0:1]={1,2}'` is not `'{1,2}'`,
+    nor `'{{1,2}}'`), so its `dims` come first, between `LIST_DIMS_MARK`s:
+    `[\=[1:2][1:2]\=1\,2\,3\,4\,]`. No other engine holds such a value.
+    """
+    head = "[" if dims is None else "[" + LIST_DIMS_MARK + dims + LIST_DIMS_MARK
+    return head + "".join(e + LIST_TERMINATOR for e in elements) + "]"
+
+
+#: Between a struct field's name and its value: a backslash and `=`. Like the
+#: terminator, no field name (escaped) or value text can hold it.
+STRUCT_FIELD_MARK = "\\="
+
+
+def canonical_struct_text(fields: Sequence[tuple[str, str]]) -> str:
+    r"""A struct's canonical text, from its fields' names and value texts.
+
+    `{` + per field, in declared order: the name escaped as text, then
+    `STRUCT_FIELD_MARK`, then the value by its own type's rule (NULL as the
+    sentinel), then `LIST_TERMINATOR`; then `}`. So `('a, b', 'c')` is
+    `{x\=a, b\,y\=c\,}` and never `('a', 'b, c')`'s `{x\=a\,y\=b, c\,}`, a
+    NULL field is `\N` and the string 'NULL' is `NULL`, and a renamed field
+    differs. For a given struct type the text decodes one way only: it
+    starts with `{`, so it is never the sentinel, and no name or value can
+    forge a mark or a terminator. Rendered by BigQuery (RT-HB2); a STRUCT
+    stays UNKNOWN to the engine - the sample check does not read it - and
+    is compared only against a struct rendered by the same rule.
+    """
+    return (
+        "{"
+        + "".join(
+            escape_canonical_text(name) + STRUCT_FIELD_MARK + text + LIST_TERMINATOR
+            for name, text in fields
+        )
+        + "}"
+    )
+
+
+def canonical_inet_text(packed: bytes, prefix: int) -> str:
+    """A PostgreSQL inet/cidr value's canonical text: `address/prefix`.
+
+    PostgreSQL's own `::text` (not its output function, which drops a full
+    `/32`): every byte of the address, then the prefix length, so
+    `10.0.0.1/32` and `10.0.0.1/8` differ, as they do in PostgreSQL. IPv4 is
+    dotted; IPv6 is lower-case hex groups with the longest run of two or more
+    zero groups - the first, on a tie - written `::`, and the last 32 bits
+    dotted when the address is IPv4-compatible or IPv4-mapped (BIND's
+    `inet_net_ntop`, which PostgreSQL uses). An inet and a cidr holding the
+    same network render alike, as PostgreSQL's `=` holds them equal.
+    """
+    if len(packed) == 4:
+        return ".".join(str(b) for b in packed) + f"/{prefix}"
+    if len(packed) != 16:
+        raise ValueError(f"not an IPv4 or IPv6 address: {packed!r}")
+    words = [packed[i] << 8 | packed[i + 1] for i in range(0, 16, 2)]
+    best_base, best_len, cur_base, cur_len = -1, 0, -1, 0
+    for i, w in enumerate(words):
+        if w == 0:
+            if cur_base == -1:
+                cur_base, cur_len = i, 1
+            else:
+                cur_len += 1
+        elif cur_base != -1:
+            if best_base == -1 or cur_len > best_len:
+                best_base, best_len = cur_base, cur_len
+            cur_base = -1
+    if cur_base != -1 and (best_base == -1 or cur_len > best_len):
+        best_base, best_len = cur_base, cur_len
+    if best_base != -1 and best_len < 2:
+        best_base = -1
+    out = ""
+    for i, w in enumerate(words):
+        if best_base != -1 and best_base <= i < best_base + best_len:
+            if i == best_base:
+                out += ":"
+            continue
+        if i:
+            out += ":"
+        if (
+            i == 6
+            and best_base == 0
+            and (
+                best_len == 6
+                or (best_len == 7 and words[7] != 1)
+                or (best_len == 5 and words[5] == 0xFFFF)
+            )
+        ):
+            out += ".".join(str(b) for b in packed[12:])
+            break
+        out += f"{w:x}"
+    if best_base != -1 and best_base + best_len == 8:
+        out += ":"
+    return f"{out}/{prefix}"
+
+
+#: sql_variant base types whose value is an integer (or bit), a decimal at its
+#: own scale, or text, rendered by SQL Server's default conversion.
+_VARIANT_INTEGERS = frozenset({"tinyint", "smallint", "int", "bigint", "bit"})
+_VARIANT_TEXTS = frozenset({"char", "varchar", "nchar", "nvarchar"})
+
+
+def _ns_clock(ns: int, digits: int) -> str:
+    """`HH:MM:SS.fff...` from nanoseconds since midnight, `digits` places."""
+    seconds, frac = divmod(ns, 1_000_000_000)
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    text = f"{hours:02d}:{minute:02d}:{sec:02d}"
+    if digits:
+        text += "." + f"{frac:09d}"[:digits]
+    return text
+
+
+def canonical_variant_text(base: str, value: Any) -> str:
+    """A SQL Server sql_variant's canonical text: `<base type>:<exact value>`.
+
+    The base type leads, so int 1, bigint 1, N'1' and 1.5 as float against
+    decimal never meet; the value follows in an exact spelling of that base
+    type (escaped, since it can be text). `value` is the base type's value
+    as Python holds it:
+
+    - tinyint/smallint/int/bigint/bit: int - its digits;
+    - decimal/numeric: Decimal at its declared scale - `1.50` stays `1.50`;
+    - float/real: float - the IEEE bits in hex, `0x3FF8000000000000` (real:
+      eight digits), with -0.0 as 0.0. SQL Server prints no exact decimal
+      for a double: style 3 is not correctly rounded (1626983080611305.75
+      printed ...057, not ...058) and raised "Arithmetic overflow" for any
+      negative value past e-100 and for -0.0, so the bits are the value;
+    - money/smallmoney: Decimal - four places, `-1.5000`;
+    - date: datetime.date - `YYYY-MM-DD`;
+    - datetime, smalldatetime, datetime2: (date, nanoseconds since midnight) -
+      datetime as its displayed milliseconds (`.003`, `.007`), smalldatetime
+      to the second, datetime2 to seven places;
+    - datetimeoffset: (local date, local nanoseconds, offset minutes) -
+      seven places and ` +HH:MM`;
+    - time: nanoseconds since midnight - seven places;
+    - binary/varbinary: bytes - `0x` and upper-case hex;
+    - uniqueidentifier: uuid.UUID - lower case;
+    - char/varchar/nchar/nvarchar: str, exactly (a char keeps its padding).
+
+    Raises ValueError for any other base type.
+    """
+    import struct
+    import uuid
+
+    b = base.lower()
+    if b in _VARIANT_INTEGERS:
+        text = str(int(value))
+    elif b in ("decimal", "numeric"):
+        text = format(Decimal(value), "f")
+    elif b in ("float", "real"):
+        x = float(value)
+        if x == 0:
+            x = 0.0  # -0.0: equal to 0.0 in SQL Server, so one value
+        fmt = ">d" if b == "float" else ">f"
+        text = "0x" + struct.pack(fmt, x).hex().upper()
+    elif b in ("money", "smallmoney"):
+        text = format(Decimal(value).quantize(Decimal("0.0001")), "f")
+    elif b == "date":
+        d = value
+        text = f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+    elif b in ("datetime", "smalldatetime", "datetime2"):
+        d, ns = value
+        digits = {"datetime": 3, "smalldatetime": 0, "datetime2": 7}[b]
+        text = f"{d.year:04d}-{d.month:02d}-{d.day:02d} {_ns_clock(ns, digits)}"
+    elif b == "datetimeoffset":
+        d, ns, offset = value
+        sign = "-" if offset < 0 else "+"
+        hh, mm = divmod(abs(offset), 60)
+        text = (
+            f"{d.year:04d}-{d.month:02d}-{d.day:02d} {_ns_clock(ns, 7)} "
+            f"{sign}{hh:02d}:{mm:02d}"
+        )
+    elif b == "time":
+        text = _ns_clock(int(value), 7)
+    elif b in ("binary", "varbinary"):
+        text = "0x" + bytes(value).hex().upper()
+    elif b == "uniqueidentifier":
+        text = str(uuid.UUID(str(value))).lower()
+    elif b in _VARIANT_TEXTS:
+        text = str(value)
+    else:
+        raise ValueError(f"sql_variant base type {base!r} has no rule")
+    return f"{b}:{escape_canonical_text(text)}"
 
 
 # Number of MD5 hex characters folded into the row hash. 15 nibbles = 60 bits.
@@ -245,6 +719,119 @@ def sql_literal(value: str) -> str:
     """Quote a string literal. Only ever used for schema and table names read
     back from `information_schema`, never for user data."""
     return "'" + value.replace("'", "''") + "'"
+
+
+# ---------------------------------------------------------------------------
+# Row filters (`--where`)
+# ---------------------------------------------------------------------------
+#
+# A row filter is the user's own SQL, run against the user's own database, so
+# this is not a security boundary - the user can already run any SQL they
+# like there. What it must guarantee is that the tool's read stays one read:
+# the predicate is pasted, parenthesised, into the WHERE clause of every query
+# that reads the table, so it must not be able to end that statement (`;`),
+# hide the rest of it (a comment), or close the parentheses it is wrapped in
+# and so escape the bucket bounds it is ANDed with (`1=1) or (1=1`). The
+# sessions are read-only besides (CLAUDE.md 4.9, 4.11), which is what keeps
+# a predicate that calls a writing function from writing.
+
+#: Quote characters a predicate may use: string literals everywhere, quoted
+#: identifiers (`"` standard, `` ` `` MySQL and BigQuery). A quote of one kind
+#: ends only at the same kind; doubling it (`'it''s'`) closes and reopens, on
+#: every engine alike.
+_FILTER_QUOTES = {"'": "'", '"': '"', "`": "`"}
+
+#: `[` is read two ways: on SQL Server it opens an identifier that runs to the
+#: first `]` (`]]` inside it closes and reopens, which ends in the same place)
+#: and quotes nothing else, so `[it's]` is one name; everywhere else it is an
+#: array literal or a subscript, and a quote inside it opens a string. The
+#: scan runs once per reading and refuses what either reading finds (RT-HB6:
+#: reading only the first let `[']']` end its "identifier" inside a BigQuery
+#: string literal, and the predicate escape its parentheses).
+_FILTER_BRACKET_READINGS = (True, False)
+
+#: Text that changes where a quoted region ends on some engines and not on
+#: others, so the scan below could disagree with an engine about which
+#: parentheses are code: a backslash before a quote (an escape on MySQL,
+#: BigQuery and Snowflake, a plain character elsewhere), BigQuery's
+#: triple-quoted strings, and dollar quoting (`$$...$$`, `$tag$...$tag$`) on
+#: PostgreSQL and Snowflake.
+_FILTER_AMBIGUOUS = re.compile(r"""\\['"`]|'''|\"\"\"|\$\w*\$""")
+
+
+def _filter_scan(predicate: str, bracket_identifiers: bool) -> str | None:
+    """Find what would let `predicate` escape its parentheses, or None.
+
+    One left-to-right pass: every quoted region is skipped as the engines
+    skip it - whatever could make them disagree is refused first
+    (`_FILTER_AMBIGUOUS`) - and parentheses are counted only outside them.
+    `bracket_identifiers` picks SQL Server's reading of `[` (an identifier
+    to the first `]`) or every other engine's (code, so quotes inside it
+    are strings). Run under both, the parentheses counted are the ones
+    every engine parses as code.
+    """
+    quotes = dict(_FILTER_QUOTES)
+    if bracket_identifiers:
+        quotes["["] = "]"
+    depth = 0
+    close = ""
+    for ch in predicate:
+        if close:
+            if ch == close:
+                close = ""
+        elif ch in quotes:
+            close = quotes[ch]
+        elif ch == "#":
+            # MySQL reads `#` to the end of the line as a comment.
+            return "contains '#' outside a quoted string (MySQL reads it as a comment)"
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return (
+                    "closes a parenthesis it never opened, which would let it "
+                    "escape the parentheses it is wrapped in"
+                )
+    if close:
+        return f"has an unterminated quote (no closing {close})"
+    if depth:
+        return "has an unclosed parenthesis"
+    return None
+
+
+def row_filter_problem(predicate: str) -> str | None:
+    """Why `predicate` cannot be used as a row filter, or None if it can.
+
+    A sanity check, not a parser: it refuses what could end or escape the
+    statement the predicate is pasted into, and anything engines tokenise
+    differently. It is deliberately stricter than SQL - `;` or `--` inside a
+    string literal is refused too - because a refusal is an inconvenience
+    and a predicate read differently from how it was checked is not.
+    """
+    if not predicate.strip():
+        return "is empty"
+    if any(ord(c) < 32 and c not in "\t\n\r" for c in predicate):
+        return "contains a control character"
+    if ";" in predicate:
+        return "contains ';' (one predicate, not a statement; refused even in a string)"
+    for marker in ("--", "/*", "*/"):
+        if marker in predicate:
+            return f"contains {marker!r}, a SQL comment marker (refused even in a string)"
+    found = _FILTER_AMBIGUOUS.search(predicate)
+    if found:
+        return (
+            f"contains {found.group(0)!r}, which engines quote differently (a "
+            "backslash before a quote, a triple-quoted or a dollar-quoted "
+            "string); spell the value another way, with chr() for instance"
+        )
+    for bracket_identifiers in _FILTER_BRACKET_READINGS:
+        problem = _filter_scan(predicate, bracket_identifiers)
+        if problem:
+            if not bracket_identifiers:
+                problem += " when `[` is read as code, not as a SQL Server identifier"
+            return problem
+    return None
 
 
 class Dialect(ABC):
@@ -534,6 +1121,30 @@ class Dialect(ABC):
         """
         return []
 
+    def unreadable_columns(self, table: str) -> list[str]:
+        """Columns of `table` that exist but this login cannot read, or [].
+
+        Called by the engine after `columns`. A catalog filtered by privilege
+        (PostgreSQL's information_schema under column-level grants) leaves
+        such a column out of `columns` altogether, and a column nobody read
+        must never pass as compared (RT-HP1). Default: none.
+        """
+        return []
+
+    def session_drift(self) -> list[str]:
+        """Session settings the walk's own queries changed, or [].
+
+        Called by the engine once after the walk; anything returned makes the
+        result unexplained, never identical. Default: nothing pinned to check.
+        """
+        return []
+
+    def key_not_null_sql(self, column: Column) -> str:
+        """SQL true when a key column's value is not SQL NULL. `is not null`,
+        which PostgreSQL overrides: there a composite is `not null` only when
+        every field is (RT-HP8)."""
+        return f"{self.quote(column.name)} is not null"
+
     # --------------------------------------------------- SQL spelling hooks
     #
     # The shared queries below are standard SQL that every engine before
@@ -762,14 +1373,114 @@ class Dialect(ABC):
         )
 
     def check_key(self, table: str, key: KeySpec) -> None:
-        """Refuse a key that cannot be matched exactly, naming side and table."""
+        """Refuse a key that cannot be matched exactly, naming side and table.
+
+        A FLOAT key, and a LIST key: its elements render by the value rules,
+        which round DECIMAL and FLOAT elements to the float scale, so two
+        distinct list keys could merge into one row.
+        """
         for c in key.columns:
             if c.logical_type is LogicalType.FLOAT:
                 raise self._err(f"in {table}: {float_key_refusal(c)}")
+            if c.logical_type is LogicalType.LIST:
+                raise self._err(
+                    f"in {table}: list column {c.name!r} cannot be used as a key. "
+                    "Its elements are compared by the value rules, which round "
+                    "decimals and floats, so distinct keys could merge into one row"
+                )
+
+    def bisects_natively(self, column: Column) -> bool:
+        """Whether a single INTEGER key column can be bucketed as itself.
+
+        The bucket expression widens the key with `wide_int` before any
+        arithmetic. An integer type as wide as that widening cannot be: DuckDB
+        UHUGEINT holds 2^128 - 1, which no signed 128-bit type holds, and
+        mixing it with a signed operand silently turns DuckDB arithmetic into
+        DOUBLE. Such a key is hashed instead, as any non-integer key is - its
+        exact decimal text, hashed, then matched by that text. True by
+        default.
+        """
+        return True
+
+    # ------------------------------------------------------------- lists
+
+    #: The name an element is bound to while its own rule renders it: a list
+    #: comprehension variable on DuckDB, an `unnest` alias on PostgreSQL. It
+    #: shadows a column of the same name inside the element expression only.
+    LIST_ELEMENT_NAME = "__parity_element"
+
+    def list_element(self, column: Column) -> Column:
+        """The element of a LIST column, as a column its rule can render.
+
+        Its raw type is the list's without the trailing `[]` - `INTEGER[]` on
+        DuckDB, `integer[]` as the PostgreSQL dialect spells an array.
+        """
+        suffix = _ARRAY_SUFFIX.search(column.raw_type)
+        if not suffix:
+            raise self._err(f"column {column.name!r} ({column.raw_type}) is not a list")
+        inner = column.raw_type[: suffix.start()]
+        return Column(self.LIST_ELEMENT_NAME, map_type(inner), inner)
+
+    def list_element_text(self, column: Column) -> str:
+        """The element's canonical text, by its own type's rule, null-safe.
+
+        Refuses an element whose engine holds more than the rule compares
+        (DuckDB TIMESTAMP_NS): a scalar column of it carries a caveat, and a
+        list's element could not, so the digits would vanish silently.
+        """
+        element = self.list_element(column)
+        if element.logical_type not in LIST_ELEMENT_TYPES:
+            raise self._err(f"list column {column.name!r} has no element rule")
+        if self.holds_sub_micro(element):
+            raise self._err(
+                f"list column {column.name!r} holds {element.raw_type} elements, "
+                "whose digits past the microsecond a list cannot compare; "
+                "leave it out with --exclude"
+            )
+        # A refusal inside the element's rule (a FLOAT past 2^116) names the
+        # column it renders; make that the list's, not the stand-in variable.
+        where = sql_literal(float_range_where(element))
+        named = sql_literal(f" in an element of column {column.name!r}")
+        return self.normalize(element).replace(where, named)
+
+    def list_terminator_sql(self) -> str:
+        r"""SQL for `LIST_TERMINATOR` (`\,`), the backslash from its code point."""
+        return self.concat_sql(self.backslash_sql(), "','")
+
+    def list_dims_mark_sql(self) -> str:
+        r"""SQL for `LIST_DIMS_MARK` (`\=`), the backslash from its code point."""
+        return self.concat_sql(self.backslash_sql(), "'='")
 
     # ------------------------------------------------------------- queries
 
-    def key_stats(self, table: str, key: KeySpec) -> KeyStats:
+    def check_where(self, where: str) -> None:
+        """Refuse a row filter this side cannot run as one read (`--where`).
+
+        Called by the engine before any query. The shared check
+        (`row_filter_problem`) refuses what could end or escape the statement;
+        a dialect with its own guard on what it runs (SQL Server) adds to it.
+        """
+        problem = row_filter_problem(where)
+        if problem:
+            raise self._err(f"row filter {where!r} {problem}")
+
+    def rows_from(self, table: str, where: str | None, *conditions: str) -> str:
+        """`from <table> where (<filter>) and <conditions...>`.
+
+        The one place a query that reads the table's rows names it, so a row
+        filter reaches every such query - the key stats, every checksum level,
+        every download and the sample - or none. The filter is parenthesised
+        and comes first, ANDed with the tool's own conditions, so `a or b`
+        cannot widen the bucket bounds. With no filter the text is exactly
+        what the queries always emitted, so no unfiltered SQL changed.
+        """
+        conds = ([f"({where.strip()})"] if where else []) + list(conditions)
+        sql = f"from {self.qualify(table)}"
+        if conds:
+            sql += " where " + " and ".join(conds)
+        return sql
+
+    def key_stats(self, table: str, key: KeySpec, where: str | None = None) -> KeyStats:
         """Key range plus row and distinct-key counts, in one scan.
 
         The range is over the *bucketing* value, which is the column itself for
@@ -796,16 +1507,14 @@ class Dialect(ABC):
         # whose every key column is non-NULL, and the engine refuses the rest
         # exactly as it refuses a NULL integer key.
         if key.hashed:
-            all_set = " and ".join(
-                f"{self.quote(c.name)} is not null" for c in key.columns
-            )
+            all_set = " and ".join(self.key_not_null_sql(c) for c in key.columns)
             non_null_sql = self.count(f"case when {all_set} then 1 end")
         else:
             non_null_sql = self.count(identity)
         sql = (
             f"select min({bucket}), max({bucket}), {self.count()}, "
             f"{non_null_sql}, {self.count_distinct_key(key, identity)} "
-            f"from {self.qualify(table)}"
+            f"{self.rows_from(table, where)}"
         )
         lo, hi, rows, non_null, distinct = self.query(sql)[0]
         if lo is None:
@@ -830,6 +1539,7 @@ class Dialect(ABC):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> dict[int, tuple[int, int]]:
         """Return ``{segment_index: (row_count, checksum)}`` for ``[lo, hi)``.
 
@@ -840,7 +1550,7 @@ class Dialect(ABC):
         return {
             int(seg): (int(count), int(checksum or 0))
             for seg, count, checksum in self.query(
-                self._segment_sql(table, key, columns, lo, hi, n_segments)
+                self._segment_sql(table, key, columns, lo, hi, n_segments, where)
             )
         }
 
@@ -852,6 +1562,7 @@ class Dialect(ABC):
         lo: int,
         hi: int,
         n_segments: int,
+        where: str | None = None,
     ) -> str:
         """The checksum query. Split out so its shape can be tested directly."""
         k = self.key_bucket(key)
@@ -892,11 +1603,14 @@ class Dialect(ABC):
         content = self.hash_parts(
             [*self._key_parts(key), *(self.normalize(c) for c in columns)]
         )
+        in_range = (
+            f"{k} >= {self.int_literal(lo)}",
+            f"{k} <= {self.int_literal(hi - 1)}",
+        )
         return (
             f"select {bucket} as seg, {self.count()}, "
             f"{self.sum_wide(content)} "
-            f"from {self.qualify(table)} "
-            f"where {k} >= {self.int_literal(lo)} and {k} <= {self.int_literal(hi - 1)} "
+            f"{self.rows_from(table, where, *in_range)} "
             f"group by {self.group_by(1, bucket)}"
         )
 
@@ -931,6 +1645,7 @@ class Dialect(ABC):
         columns: Sequence[Column],
         lo: int,
         hi: int,
+        where: str | None = None,
     ) -> dict[int | str, tuple[str, ...]]:
         """Download canonical text for every row in ``[lo, hi)``.
 
@@ -952,9 +1667,11 @@ class Dialect(ABC):
         # Inclusive upper bound, for the same reason as the checksum query:
         # `hi` is `max_key + 1`, which for a table holding the largest bigint is
         # one past what the column type can represent.
+        in_range = (f"{bucket} >= {lo}", f"{bucket} <= {hi - 1}")
         sql = (
-            f"select {identity}{exprs} from {self.qualify(table)} "
-            f"where {bucket} >= {lo} and {bucket} <= {hi - 1} order by {bucket}"
+            f"select {identity}{exprs} "
+            f"{self.rows_from(table, where, *in_range)} "
+            f"order by {bucket}"
         )
         out: dict[int | str, tuple[str, ...]] = {}
         for row in self.query(sql):
@@ -970,6 +1687,160 @@ class Dialect(ABC):
                     f"unique, so rows cannot be compared one-to-one"
                 )
             out[rk] = tuple(row[1:])
+        return out
+
+    # ------------------------------------------------ the independent sample
+
+    def sample_select(self, column: Column) -> str:
+        """How the sample check selects one column: its raw value.
+
+        Deliberately *not* `normalize` - the point of the check is to compare
+        what the driver hands back, reduced by `parity.reference`, so that a
+        mistake in this dialect's canonical-text SQL cannot hide itself. A
+        dialect overrides this only where its driver cannot carry a value
+        faithfully (PostgreSQL's infinite dates, DuckDB's tz-aware stamps).
+        """
+        return self.quote(column.name)
+
+    def sample_value(self, column: Column, value: Any) -> Any:
+        """Turn one value `sample_select` returned into what
+        `reference_token` reads. Identity by default."""
+        return value
+
+    def holds_sub_micro(self, column: Column) -> bool:
+        """Whether a TIMESTAMP column can hold digits past microseconds.
+        False by default; the engines that can override it."""
+        return False
+
+    def single_precision(self, column: Column) -> bool:
+        """Whether a FLOAT column is float4, which the reference widens the
+        way the engines do. `real`/`float4` everywhere; MySQL and DuckDB
+        spell float4 `float` too and override this."""
+        return column.raw_type.lower().split("(")[0].strip() in ("real", "float4")
+
+    def padded_char(self, column: Column) -> bool:
+        """Whether a STRING column is fixed-width CHAR, whose trailing
+        spaces every engine's canonical text drops (CLAUDE.md 4.2)."""
+        t = column.raw_type.lower().split("(")[0].strip()
+        return t in ("char", "nchar", "character", "bpchar")
+
+    # ------------------------------------------------- BINARY, TIME and JSON
+
+    def binary_prefix_sql(self) -> str:
+        r"""SQL for `BINARY_PREFIX` (`\\x`), the backslashes from code points."""
+        bs = self.backslash_sql()
+        return self.concat_sql(self.concat_sql(bs, bs), "'x'")
+
+    def spell_sql(self, text: str) -> str:
+        r"""`text` as a SQL string expression with no backslash literal.
+
+        Regular expressions need backslashes, and RT-D1 bans them from
+        rendering SQL - what a literal backslash means is a session setting
+        on PostgreSQL and MySQL. So each backslash is `backslash_sql()` and
+        each control character `chr(n)` (BigQuery's plain literals cannot
+        hold a newline), joined by `concat_sql`; the rest is literal text,
+        which must hold no quote.
+        """
+        if "'" in text:
+            raise ValueError("spell_sql takes no quotes")
+        pieces: list[str] = []
+        lit = ""
+        for ch in text:
+            if ch == "\\" or ch < " ":
+                if lit:
+                    pieces.append(f"'{lit}'")
+                    lit = ""
+                pieces.append(self.backslash_sql() if ch == "\\" else f"chr({ord(ch)})")
+            else:
+                lit += ch
+        if lit or not pieces:
+            pieces.append(f"'{lit}'")
+        out = pieces[0]
+        for p in pieces[1:]:
+            out = self.concat_sql(out, p)
+        return out
+
+    def json_verbatim(self, column: Column) -> bool:
+        """Whether this engine stores a JSON column as unnormalised text, so
+        `canonical_json_text` compares it verbatim (DuckDB). False: the
+        engine's JSON is a normalised value."""
+        return False
+
+    def json_semantics(self, column: Column) -> str:
+        """How this engine normalises a JSON value, for a reader.
+
+        Two sides whose descriptions differ can render equal documents
+        differently - key order, duplicates, number spelling - and the engine
+        prints both descriptions as a warning. A false alarm only: equal
+        canonical text always means the same document, whatever the engine.
+        Empty for an engine without a JSON type.
+        """
+        return ""
+
+    def json_compact_layout(self, expr: str) -> str:
+        """Lay out *compact* JSON text canonically (`json_layout`).
+
+        BigQuery, Snowflake and DuckDB print JSON without spaces, the
+        canonical layout has one after every structural `,` and `:`, and
+        only a regular expression can tell those from a comma inside a
+        string. The engines with no conditional replacement do it in three
+        steps, which every one of them can spell:
+
+        1. `regexp_replace(t, '("(\\.|[^"\\])*"|[^",:]*)([,:]?)', '\1\3' + chr(1))`
+           puts chr(1) after every token - a whole string, or a run of
+           anything else - and its separator, if it has one;
+        2. `,` + chr(1) becomes `, `, and `:` + chr(1) becomes `: ` - only a
+           structural separator can be followed by chr(1), because a string
+           token ends in `"` and the other run excludes `,` and `:`;
+        3. every remaining chr(1) is removed.
+
+        chr(1) cannot already be in the text: JSON escapes every control
+        character inside a string, and none can stand outside one. Verified
+        live on BigQuery, Snowflake and DuckDB against `json_layout`. A
+        dialect whose engine prints JSON spaced already never calls this.
+        """
+        raise self._err("this engine has no compact JSON layout to fix")
+
+    def fetch_sample(
+        self,
+        table: str,
+        key: KeySpec,
+        columns: Sequence[Column],
+        modulus: int,
+        residue: int,
+        where: str | None = None,
+    ) -> dict[int | str, tuple[Any, ...]]:
+        """Raw values of the rows whose key hash is `residue` modulo `modulus`.
+
+        The selection is a hash of the key's exact text, so both sides pick the
+        same keys and the sample spreads over the whole table rather than one
+        key range; `modulus` 1 takes every row. The hash is of the key only,
+        never the row, so it costs a fraction of a checksum pass. Rows are
+        matched by the same identity `fetch_range` uses.
+        """
+        identity = self.key_identity(key)
+        if key.hashed:
+            identity = self.fetch_text(identity)
+        exprs = "".join(", " + self.sample_select(c) for c in columns)
+        chosen: list[str] = []
+        if modulus > 1:
+            h = self.hash_expr(self._concat(self._key_parts(key)))
+            rem = f"(({h}) - {self.int_div(h, str(modulus))} * {modulus})"
+            chosen.append(f"{rem} = {residue}")
+        # Filtered like every other read: a sampled row outside the filter
+        # would be one the walk never saw, and read as a contradiction.
+        sql = f"select {identity}{exprs} {self.rows_from(table, where, *chosen)}"
+        out: dict[int | str, tuple[Any, ...]] = {}
+        for row in self.query(sql):
+            rk: int | str = self.fetched(row[0]) if key.hashed else int(row[0])
+            if rk in out:
+                raise self._err(
+                    f"duplicate key {rk!r} in {table}: key {key.label} is not "
+                    f"unique, so rows cannot be compared one-to-one"
+                )
+            out[rk] = tuple(
+                self.sample_value(c, v) for c, v in zip(columns, row[1:], strict=True)
+            )
         return out
 
 
@@ -1008,10 +1879,14 @@ def get_dialect(
         from parity.dialects.mssql_dialect import SQLServerDialect
 
         dialect = SQLServerDialect(float_scale=float_scale, side=side)
+    elif scheme in ("oracle",):
+        from parity.dialects.oracle_dialect import OracleDialect
+
+        dialect = OracleDialect(float_scale=float_scale, side=side)
     else:
         raise ValueError(
             f"[side {side}] no dialect for scheme {scheme!r}. "
-            f"Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql."
+            f"Supported: duckdb, postgres, mysql, snowflake, bigquery, mssql, oracle."
         )
     try:
         dialect.connect(connection_string)
@@ -1044,8 +1919,25 @@ def require_matching_scales(a: Dialect, b: Dialect) -> None:
         )
 
 
+#: A list's type suffix: `[]`, or DuckDB's fixed-size ARRAY `[n]`.
+_ARRAY_SUFFIX = re.compile(r"\[\d*\]$")
+
+
 def map_type(raw: str) -> LogicalType:
     """Map an engine's type name onto a logical category."""
+    suffix = _ARRAY_SUFFIX.search(raw)
+    if suffix:
+        # A list (DuckDB `INTEGER[]`) or array (PostgreSQL, whose dialect
+        # spells the element type the same way, `integer[]`), or a DuckDB
+        # fixed-size ARRAY (`VARCHAR[2]`), whose elements are a list's.
+        # Checked before the `(` split, or `DECIMAL(10,2)[]` would read as a
+        # decimal and `ENUM('a', 'b')[2]` as a string (RT-HD8, HD9: the
+        # array was then rendered by the scalar rule, or by a varchar cast
+        # that printed its strings unquoted before DuckDB 2.0, RT-HD5).
+        # Ruled only when its element is (`LIST_ELEMENT_TYPES`); a nested
+        # list, a list of structs or of JSON stays UNKNOWN.
+        element = map_type(raw[: suffix.start()])
+        return LogicalType.LIST if element in LIST_ELEMENT_TYPES else LogicalType.UNKNOWN
     t = raw.lower().split("(")[0].strip()
     if t in {
         "int",
@@ -1057,6 +1949,10 @@ def map_type(raw: str) -> LogicalType:
         "smallint",
         "tinyint",
         "hugeint",
+        # DuckDB's unsigned 128-bit integer: its varchar cast is the exact
+        # decimal, as every integer's is. It cannot be widened into HUGEINT
+        # for bucketing, so as a key it is hashed (`bisects_natively`).
+        "uhugeint",
         "utinyint",
         "usmallint",
         "uinteger",
@@ -1065,7 +1961,11 @@ def map_type(raw: str) -> LogicalType:
         "bigserial",
     }:
         return LogicalType.INTEGER
-    if t in {"decimal", "numeric"}:
+    if t in {"decimal", "numeric", "money"}:
+        # PostgreSQL `money` is exact cents. Its `::text` is locale-formatted
+        # (`$1,234.56`, by lc_monetary), so as an unmapped type it never
+        # matched a migrated decimal; as DECIMAL it renders through
+        # `round(c::numeric, s)`, exact, like SQL Server's money.
         return LogicalType.DECIMAL
     if t in {"float", "float4", "float8", "double", "real", "double precision"}:
         return LogicalType.FLOAT
@@ -1075,6 +1975,28 @@ def map_type(raw: str) -> LogicalType:
         return LogicalType.DATE
     if t.startswith(("timestamp", "datetime")):
         return LogicalType.TIMESTAMP
+    # Exactly these spellings: `time with time zone` (PostgreSQL timetz,
+    # DuckDB TIMETZ) carries an offset, which TIMETZ keeps; DuckDB's TIME_NS
+    # has not been verified and stays unmapped.
+    if t in {"time", "time without time zone"}:
+        return LogicalType.TIME
+    if t in {"time with time zone", "timetz"}:
+        return LogicalType.TIMETZ
+    if t == "interval":
+        return LogicalType.INTERVAL
+    # PostgreSQL bit(n) and bit varying (information_schema says `bit` and
+    # `bit varying`), DuckDB BIT. SQL Server's and MySQL's `bit` have their
+    # own maps: a boolean and a BIT(n) there.
+    if t in {"bit", "bit varying", "varbit"}:
+        return LogicalType.BITS
+    if t in {"inet", "cidr"}:
+        return LogicalType.INET
+    # PostgreSQL bytea; DuckDB BLOB (BYTEA, VARBINARY and BINARY are aliases
+    # it reports as BLOB).
+    if t in {"bytea", "blob"}:
+        return LogicalType.BINARY
+    if t in {"json", "jsonb"}:
+        return LogicalType.JSON
     if t in {
         "text",
         "varchar",
@@ -1084,6 +2006,12 @@ def map_type(raw: str) -> LogicalType:
         "character",
         "string",
         "uuid",
+        # DuckDB reports an enum column as `ENUM('a', 'b')`; its varchar cast
+        # is the label, exactly the text a STRING column holding it renders.
+        "enum",
+        # PostgreSQL's 63-byte identifier type: its `::text` is the name, as
+        # a text column holding it renders (and rendered, unmapped, before).
+        "name",
     }:
         return LogicalType.STRING
     return LogicalType.UNKNOWN

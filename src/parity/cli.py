@@ -14,14 +14,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from typing import Any, TextIO
 
 from parity import __version__
-from parity.dialects.base import decode_canonical_field
-from parity.engine import DEFAULT_MAX_DIFFS
-from parity.types import DiffResult, LogicalType, RowDiff
+from parity.dialects.base import decode_canonical_field, row_filter_problem
+from parity.engine import DEFAULT_MAX_DIFFS, DEFAULT_VERIFY_SAMPLE
+from parity.types import (
+    CHECKSUM_COLLISION_BOUND,
+    RISK_CONFIDENCE,
+    DiffResult,
+    LogicalType,
+    RowDiff,
+)
 
 #: Exit codes. `1` means "differences found", not "crashed" - a CI job can tell
 #: an honest disagreement from a broken connection string.
@@ -50,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "exit codes: 0 identical, 1 not identical (row differences, a "
-            "column only one side has, or a checksum mismatch the rows could "
-            "not explain), 2 error. "
+            "column only one side has, a checksum mismatch the rows could "
+            "not explain, or a sample check that could not run), 2 error. "
             "Connection strings look like postgres://user:pw@host/db or "
             "duckdb:///path/to.duckdb"
         ),
@@ -83,6 +90,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare only these columns (default: every column both sides share)",
     )
     d.add_argument("--exclude", metavar="x,y", help="skip these columns")
+    d.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="A_COL=B_COL[,...]",
+        help="pair a renamed column: side B's B_COL holds what side A calls "
+        "A_COL (repeatable, or comma-separated). --key, --columns and "
+        "--exclude take side A's names, and differences are reported under "
+        "them. Matching stays case-insensitive.",
+    )
+    d.add_argument(
+        "--where",
+        metavar="SQL",
+        help="compare only the rows matching this SQL predicate, on both sides "
+        "(e.g. \"created_at >= '2026-10-01'\"). Each engine runs it as its "
+        "own SQL, inside every query that reads the table. The result is "
+        "about the filtered rows only, and says so. Refused if it contains "
+        "';', a comment, or unbalanced quotes or parentheses.",
+    )
+    d.add_argument(
+        "--a-where",
+        metavar="SQL",
+        help="row filter for side A only, in side A's SQL; replaces --where there",
+    )
+    d.add_argument(
+        "--b-where",
+        metavar="SQL",
+        help="row filter for side B only, in side B's SQL; replaces --where there",
+    )
     d.add_argument(
         "--bisection-factor",
         type=int,
@@ -117,11 +153,62 @@ def build_parser() -> argparse.ArgumentParser:
         f"difference costs memory, so two tables that share nothing would "
         f"otherwise exhaust it rather than answering.",
     )
+    d.add_argument(
+        "--verify-sample",
+        type=_non_negative_int,
+        default=DEFAULT_VERIFY_SAMPLE,
+        metavar="N",
+        help=f"after the comparison, re-compare about N rows (default: "
+        f"{DEFAULT_VERIFY_SAMPLE:,}; 0 to skip) from the raw values each "
+        f"driver returns, by the documented rules in Python - an independent "
+        f"check that a mistake in the tool's own SQL cannot fool. Tables of N "
+        f"rows or fewer are re-compared in full. Any contradiction, or a check "
+        f"that cannot run, means not identical.",
+    )
     d.add_argument("--json", action="store_true", help="machine-readable output")
     d.add_argument(
         "--quiet",
         action="store_true",
         help="print nothing; rely on the exit code",
+    )
+
+    r = sub.add_parser(
+        "run",
+        help="compare every table pair listed in a config file",
+        description="Compare every table pair a config file (TOML or JSON) lists, "
+        "one after another, and print one summary. The config is validated in "
+        "full before any connection is opened.",
+        epilog="exit codes: 0 every pair identical, 1 a pair is not identical "
+        "(or --fail-fast stopped after one), 2 a pair errored, the run was "
+        "interrupted, or the config is invalid.",
+    )
+    r.add_argument("config", metavar="CONFIG", help="the config file (.toml or .json)")
+    r.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME[,NAME...]",
+        help="run only these pairs (repeatable, or comma-separated)",
+    )
+    r.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop at the first pair that is not identical or errors",
+    )
+    r.add_argument(
+        "--resume",
+        metavar="STATE.json",
+        help="record each finished pair here as it completes; on a re-run, "
+        "skip pairs that finished identical with an unchanged config entry",
+    )
+    r.add_argument(
+        "--json", action="store_true", help="print the whole run as one JSON object"
+    )
+    r.add_argument("--markdown", metavar="FILE", help="write a sign-off report here")
+    r.add_argument(
+        "--junit", metavar="FILE", help="write JUnit XML here, one test per pair"
+    )
+    r.add_argument(
+        "--quiet", action="store_true", help="print nothing; rely on the exit code"
     )
     return parser
 
@@ -142,6 +229,29 @@ def _non_negative_int(value: str) -> int:
             f"must be 0 (no limit) or a positive number, got {n}"
         )
     return n
+
+
+def _column_map(values: Sequence[str]) -> dict[str, str]:
+    """Parse every `--map a=b[,a2=b2]` into `{a: b}`.
+
+    Malformed pairs are refused here; pairings that conflict (one A column
+    onto two B columns, two onto one) are refused by the engine, which also
+    sees the case-insensitive collisions this cannot.
+    """
+    out: dict[str, str] = {}
+    for value in values:
+        for pair in _split(value):
+            a_name, sep, b_name = pair.partition("=")
+            a_name, b_name = a_name.strip(), b_name.strip()
+            if not sep or not a_name or not b_name or "=" in b_name:
+                raise ValueError(f"--map takes A_COL=B_COL pairs, got {pair!r}")
+            if out.get(a_name, b_name) != b_name:
+                raise ValueError(
+                    f"--map pairs side A's {a_name!r} with two side B columns: "
+                    f"{out[a_name]!r} and {b_name!r}"
+                )
+            out[a_name] = b_name
+    return out
 
 
 def _split(value: str | None) -> list[str]:
@@ -249,6 +359,12 @@ _BARE_TYPES = frozenset(
         LogicalType.BOOLEAN,
         LogicalType.DATE,
         LogicalType.TIMESTAMP,
+        LogicalType.TIME,
+        LogicalType.BINARY,  # `\x` + hex, printed as PostgreSQL prints bytea
+        LogicalType.INTERVAL,  # `0 mon 1 day 0 us`
+        LogicalType.TIMETZ,
+        LogicalType.INET,
+        # Not BITS: an empty bit string would print as nothing at all.
     }
 )
 
@@ -324,6 +440,14 @@ def render_human(result: DiffResult, out: TextIO) -> None:
         headline = (
             f"{sym['bad']} {_plural(len(result.diffs), 'difference')} in {total:,} rows"
         )
+    elif result.verification and result.verification.failures:
+        # The walk found nothing, but raw values contradict it: the tool's own
+        # rendering hid a difference for these data. Never the all-clear.
+        headline = (
+            f"{sym['bad']} not verified: the independent sample check found "
+            f"{_plural(len(result.verification.failures), 'row')} the checksum "
+            f"comparison called equal"
+        )
     elif result.unexplained:
         headline = (
             f"{sym['bad']} not verified: checksums differ in "
@@ -337,8 +461,22 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             f"{sym['bad']} schemas differ: no row differences in {total:,} rows, "
             f"but not every column could be compared"
         )
+    elif result.verification and result.verification.error:
+        # The run asked for a second method and did not get one: the checksums
+        # alone found nothing, but that is not the proof that was requested.
+        headline = (
+            f"{sym['bad']} not proven: the independent sample check could not "
+            f"run: {_escape(result.verification.error)}"
+        )
+    elif total == 0:
+        # Two empty sides are identical, but "no differences" over nothing is
+        # how a mistyped filter or the wrong table reads (RT-HS10): say it.
+        headline = f"{sym['ok']} no differences - 0 rows compared, both sides are empty"
     else:
         headline = f"{sym['ok']} no differences in {total:,} rows"
+    if result.filtered:
+        # The headline is the line people quote: it must carry the filter.
+        headline += " (filtered rows only)"
     w.line(headline)
 
     dot = f" {sym['dot']} "
@@ -358,10 +496,19 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             w.line(f"  {dot.join(counts).strip()}")
 
     w.line()
+    if result.filtered:
+        w.line(f"  filtered: {_filter_text(result)}")
+    if result.column_map:
+        pairs = ", ".join(
+            f"{_escape(a_name)} = B {_escape(b_name)}"
+            for a_name, b_name in result.column_map.items()
+        )
+        w.line(f"  renamed columns (A = B): {pairs}")
     for schema in result.schema_differences:
         w.line(f"  {sym['bad']} schema: {_escape(schema)}")
     for note in result.unexplained:
         w.line(f"  {sym['bad']} unverified {_escape(note)}")
+    _render_verification(result, w, sym)
     w.line(f"  comparing floats and decimals at {result.float_scale} decimal places")
     for warning in result.warnings:
         w.line(f"  ! {_escape(warning)}")
@@ -374,7 +521,7 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             for d in result.by_kind(kind):
                 if shown >= DISPLAY_LIMIT:
                     break
-                _render_diff(d, w, quoted)
+                _render_diff(d, w, quoted, result.column_map)
                 shown += 1
         if len(result.diffs) > DISPLAY_LIMIT:
             w.line(
@@ -383,7 +530,129 @@ def render_human(result: DiffResult, out: TextIO) -> None:
             )
 
 
-def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
+def _filter_text(result: DiffResult) -> str:
+    """`A where <...>; B where <...>`, naming an unfiltered side as such."""
+    return "; ".join(
+        f"{side} where {_escape(where)}" if where else f"{side} whole table"
+        for side, where in (("A", result.where_a), ("B", result.where_b))
+    )
+
+
+def _risk_line(result: DiffResult) -> str:
+    """The run's two measurable risk figures, in words (see `risk_figures`)."""
+    r = risk_figures(result)
+    if r["max_hidden_fraction"] is None:
+        return "not computed"
+    conf = f"{r['confidence'] * 100:g}%"
+    collision = "a checksum collision is below 1 in 10^18"
+    if r["max_hidden_fraction"] == 0.0:
+        if result.filtered:
+            return (
+                f"every filtered row was compared by both methods, so no "
+                f"filtered row can hide a rendering error; {collision}"
+            )
+        return (
+            f"every row was compared by both methods, so no row can hide a "
+            f"rendering error; {collision}"
+        )
+    # A filtered run's counts are of the filtered rows, and its bound covers
+    # nothing outside them.
+    rows = "filtered rows" if result.filtered else "rows"
+    return (
+        f"with {conf} confidence fewer than {r['max_hidden_fraction']:.3%} of {rows} "
+        f"(at most {r['max_hidden_rows']:,} of {r['rows']:,}) could differ in a way "
+        f"the checksums missed; {collision}"
+    )
+
+
+def risk_figures(result: DiffResult) -> dict[str, Any]:
+    """What a run can state about its own residual risk, as numbers.
+
+    - `checksum_collision_bound`: the chance that a bucket holding a real
+      difference still matches, at most 2^-60 for data not crafted to collide.
+    - `max_hidden_fraction` / `max_hidden_rows`: from the independent sample,
+      the most rows that could carry a difference both the checksums *and*
+      the second method missed in the sample, at `confidence` (the exact
+      binomial bound; 0 when every row was compared). Valid for the columns
+      the check covers (`verification.checked`); `unchecked` ones carry no
+      such bound.
+    """
+    v = result.verification
+    rows = max(result.stats.rows_compared_a, result.stats.rows_compared_b)
+    frac = v.max_hidden_fraction() if v is not None else None
+    hidden = None
+    if frac is not None:
+        hidden = 0 if frac == 0.0 else max(1, math.ceil(frac * rows))
+    return {
+        "confidence": RISK_CONFIDENCE,
+        "checksum_collision_bound": CHECKSUM_COLLISION_BOUND,
+        "max_hidden_fraction": frac,
+        "max_hidden_rows": hidden,
+        "rows": rows,
+        # True when `rows` counts only the rows a `--where` selected: the
+        # bound then says nothing about the rest of the table.
+        "filtered": result.filtered,
+        "covered_columns": [] if v is None else v.checked,
+        "uncovered_columns": [] if v is None else v.unchecked,
+    }
+
+
+def _render_verification(result: DiffResult, w: _Writer, sym: dict[str, str]) -> None:
+    """The independent sample check, in a line or two - every failure listed."""
+    v = result.verification
+    if v is None:
+        if result.verify_sample == 0:
+            # Switched off on purpose: say so, so a reader knows the verdict
+            # rests on the checksums alone and that no risk line was computed.
+            w.line(
+                "  ! independent sample check off (--verify-sample 0): the verdict "
+                "rests on the checksums alone; risk: not computed"
+            )
+        return
+    if v.error:
+        w.line(
+            f"  {sym['bad']} not proven: the independent sample check could not "
+            f"run: {_escape(v.error)}"
+        )
+        w.line(
+            "    risk: not computed; fix the cause and re-run, or pass "
+            "--verify-sample 0 to rest the verdict on the checksums alone"
+        )
+        return
+    rows = max(v.rows_a, v.rows_b)
+    scope = (
+        "every row" if v.modulus == 1 else f"{rows:,} sampled rows (1 in {v.modulus:,})"
+    )
+    if v.failures:
+        w.line(
+            f"  {sym['bad']} independent sample check: {scope} re-compared from raw values"
+        )
+        for failure in v.failures:
+            w.line(f"  {sym['bad']} sample {_escape(failure)}")
+        w.line(
+            "    the checksum comparison is not trustworthy for these data; "
+            "please report this"
+        )
+    else:
+        w.line(
+            f"  {sym['ok']} independent sample check: {scope} re-compared from raw "
+            f"values - all agree"
+        )
+        w.line(f"    risk: {_risk_line(result)}")
+    if v.unchecked:
+        w.line(
+            f"  ! not covered by the sample check (type outside its rules): {v.unchecked}"
+        )
+    for note in v.notes:
+        w.line(f"  ! sample: {_escape(note)}")
+
+
+def _render_diff(
+    d: RowDiff,
+    w: _Writer,
+    quoted: dict[str, bool],
+    renamed: dict[str, str] | None = None,
+) -> None:
     """Write one difference.
 
     A changed row shows both values side by side, which is far easier to scan
@@ -396,7 +665,12 @@ def _render_diff(d: RowDiff, w: _Writer, quoted: dict[str, bool]) -> None:
         w.line(f"  {label:<11} key {shown_key}")
         return
 
-    cols = {c: _escape(c) for c in d.columns}
+    # A renamed column is named on both sides, `name (B: other)`, so the
+    # reader can look it up in either table.
+    renamed = renamed or {}
+    cols = {
+        c: _escape(f"{c} (B: {renamed[c]})" if c in renamed else c) for c in d.columns
+    }
     w.line(f"  {label:<11} key {shown_key:<14} columns: {', '.join(cols.values())}")
     name_w = max((len(c) for c in cols.values()), default=0)
 
@@ -449,9 +723,35 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
         # Key ranges whose checksums differ but whose downloaded rows could
         # not account for it. Non-empty means not identical.
         "unexplained": result.unexplained,
+        # The independent sample check; null when skipped. Non-empty
+        # `failures`, or an `error` (the check could not run), means not
+        # identical.
+        "verification": None
+        if result.verification is None
+        else {
+            "modulus": result.verification.modulus,
+            "residue": result.verification.residue,
+            "rows_a": result.verification.rows_a,
+            "rows_b": result.verification.rows_b,
+            "checked": result.verification.checked,
+            "unchecked": result.verification.unchecked,
+            "failures": result.verification.failures,
+            "notes": result.verification.notes,
+            "error": result.verification.error,
+        },
+        # The sample size asked for; 0 means the check was switched off.
+        "verify_sample": result.verify_sample,
+        # The run's measurable residual risk; see `risk_figures`.
+        "risk": risk_figures(result),
         "difference_count": len(result.diffs),
         "float_scale": result.float_scale,
         "columns_compared": [c.name for c in result.columns],
+        # The row filter of each side, null for the whole table. A filtered
+        # `identical` is about the filtered rows only.
+        "where_a": result.where_a,
+        "where_b": result.where_b,
+        # Renamed columns, side A's name to side B's (`--map`).
+        "column_map": result.column_map,
         "warnings": result.warnings,
         "stats": {
             "queries": stats.queries,
@@ -465,12 +765,17 @@ def to_dict(result: DiffResult) -> dict[str, Any]:
                 (100 * stats.rows_downloaded / moveable) if moveable else 0.0, 4
             ),
             "seconds": round(stats.seconds, 3),
+            "sample_queries": stats.sample_queries,
+            "rows_sampled": stats.rows_sampled,
         },
         "differences": [
             {
                 "key": d.key,
                 "kind": d.kind,
                 "columns": d.columns,
+                # Side B's names for the same columns: differs from
+                # `columns` only where `--map` renamed one.
+                "b_columns": [result.column_map.get(c, c) for c in d.columns],
                 "a": d.values_a,
                 "b": d.values_b,
             }
@@ -495,6 +800,16 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
     from parity.dialects.base import get_dialect
     from parity.engine import diff
 
+    # Parsed before either side is opened: a malformed pair, or a filter
+    # that could end or escape its statement, is a usage error.
+    column_map = _column_map(args.map)
+    # A per-side filter replaces --where on its side.
+    where_a = args.where if args.a_where is None else args.a_where
+    where_b = args.where if args.b_where is None else args.b_where
+    for label, where in (("A", where_a), ("B", where_b)):
+        problem = None if where is None else row_filter_problem(where)
+        if problem:
+            raise ValueError(f"[side {label}] row filter {where!r} {problem}")
     a = b = None
     try:
         # Each side is opened separately so a failure can name which one.
@@ -514,6 +829,10 @@ def _run_diff(args: argparse.Namespace, out: TextIO) -> int:
             threshold=args.threshold,
             # 0 is the documented way to ask for no limit at all.
             max_diffs=args.max_diffs or None,
+            verify_sample=args.verify_sample,
+            where_a=where_a,
+            where_b=where_b,
+            column_map=column_map,
         )
     finally:
         for side in (a, b):
@@ -557,6 +876,11 @@ def main(
         return EXIT_ERROR
 
     try:
+        if args.command == "run":
+            # Imported here so `parity diff` never loads it.
+            from parity.batch import run_command
+
+            return run_command(args, out, err)
         return _run_diff(args, out)
     except KeyboardInterrupt:  # pragma: no cover
         print("parity: interrupted", file=err)

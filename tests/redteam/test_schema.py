@@ -277,7 +277,8 @@ def test_mysql_utf8_valid_binary_differences_are_still_found(my, mysql_url):
         my.execute(f"insert into {t} values (1, {v})")
     result = _run(mysql_url, mysql_url, "rt_sch_ok_a", "rt_sch_ok_b", "id")
     assert _found(result) == [(1, "different", ["v"])]
-    assert any("unmapped" in w and "'v'" in w for w in result.warnings)
+    # BINARY has a rule now: the sample check compares it by its bytes.
+    assert "v" in result.verification.checked
 
 
 def test_mysql_invisible_column_is_compared(my, mysql_url):
@@ -939,9 +940,7 @@ def test_enum_against_text_does_not_predict_every_row_differs(pg, tmp_path, enum
     b = _duck(tmp_path, "b", dk, "insert into en values (1, 'happy'), (2, 'sad')")
     result = _run(PG_URL, f"duckdb:///{b}", f"{PG_SCHEMA}.en", "en", "id")
     assert _found(result) == [(2, "different", ["v"])]
-    assert not [w for w in result.warnings if "very likely all differ" in w], (
-        result.warnings
-    )
+    assert not [w for w in result.warnings if "expect differences" in w], result.warnings
 
 
 # ===================================================== generated columns, held
