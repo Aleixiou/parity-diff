@@ -272,3 +272,114 @@ with `--verify-sample 1000`, reflowed.)
 
 With `--quiet` nothing is printed at all; rely on the exit code. Errors still
 go to stderr.
+
+## `parity run`: the summary
+
+`parity run CONFIG` (see the [README](../README.md#checking-a-whole-migration-parity-run))
+runs one ordinary comparison per pair. The summary adds nothing to a pair's
+verdict and takes nothing away: **a multi-pair verdict is each pair's
+verdict**, and the run is identical only when every selected pair is.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | every selected pair identical |
+| `1` | no pair errored and the run finished, but at least one pair is not identical (or `--fail-fast` stopped after one) |
+| `2` | a pair errored, the run was interrupted (Ctrl-C), the config or the `--resume` file is invalid, or a report file could not be written |
+
+### Human output
+
+One block per pair, printed as each finishes, then the totals:
+
+```
+✓ orders                     1,204,332 rows · no differences · 31.2s · scale 6
+✗ customers                     88,410 rows · 2 differences · 3.1s · scale 6
+      renamed columns (A = B): customer_name = B cust_nm
+! payments                 error: [side A: postgres] table not found: public.payment ...
+✓ events                        10,882 rows · no differences (filtered rows only) · 0.9s · scale 2 · from an earlier run (2026-11-03T22:10:04Z)
+    ! filtered rows only: A where created_at >= '2026-10-01'; B whole table
+- refunds                  not run (interrupted)
+
+✗ 2 of 5 pairs identical, 1 differ, 1 error, 1 not run
+  ! 1 identical pair(s) carry qualifiers (filters, caveats, uncovered columns, no sample check): read their lines above
+  ! 1 pair(s) not re-run: verdict from an earlier run recorded in state.json: events
+  risk, weakest identical pair (events): every filtered row was compared by both methods, ...
+  ! INCOMPLETE: interrupted; pairs marked 'not run' were not checked and the run proves nothing about them
+  the differing rows are listed by --json and --markdown FILE
+  36.1s · exit 2
+```
+
+- The mark is `✓` identical, `✗` not identical, `!` error, `-` not run.
+- The words after the row count are the single-pair headline: `no
+  differences`, `N differences`, `at least N differences (stopped early)`,
+  `not verified (sample check failed)`, `not proven (sample check could not
+  run)`, `not verified (unexplained checksums)`, `schemas differ`, each with
+  `(filtered rows only)` when a filter applied.
+- Under the line, indented, come **every** qualifying line the single-pair
+  report would print before its rows: `✗` lines (schema, unverified ranges,
+  sample-check contradictions, a sample check that could not run, stopped
+  early) and `!` lines (the filter, a sample check that was off or did not
+  run, columns the sample check
+  does not cover, sample notes, and every warning and caveat). The rows
+  themselves are in `--json` and `--markdown`.
+- `from an earlier run (<time>)`: carried over by `--resume`, not re-checked.
+- `risk, weakest identical pair`: the risk line of the identical pair with
+  the weakest bound (a pair with no computed figure counts as weakest). No
+  run-wide figure is stronger than this.
+- `INCOMPLETE: interrupted` after Ctrl-C: the pairs marked `not run` were
+  not checked and the run proves nothing about them.
+
+### `--json`
+
+```json
+{
+  "identical": false, "complete": true, "interrupted": false,
+  "stopped_by_fail_fast": false, "exit_code": 1,
+  "parity_version": "0.4.0", "config": "migration.toml",
+  "config_sha256": "075e…", "started_at": "2026-11-04T00:12:01Z",
+  "finished_at": "2026-11-04T00:12:37Z", "seconds": 35.4,
+  "totals": {"pairs": 3, "identical": 2, "differ": 1, "error": 0, "not_run": 0,
+             "from_earlier_run": 0, "identical_with_qualifiers": 1},
+  "pairs": [
+    {"name": "orders", "status": "identical", "identical": true,
+     "a": "legacy", "b": "warehouse", "a_table": "public.orders", "b_table": "public.orders",
+     "settings": {"key": ["order_id"], "where_a": null, "float_scale": 6, "…": "…"},
+     "seconds": 31.2, "finished_at": "…", "from_earlier_run": false,
+     "not_run_reason": null, "config_hash": null,
+     "qualifiers": [],
+     "error": null,
+     "result": {"identical": true, "…": "exactly what `parity diff --json` prints"}}
+  ]
+}
+```
+
+| Field | |
+|---|---|
+| `identical` | `true` only if every selected pair is identical and none was left unrun. |
+| `complete`, `interrupted`, `stopped_by_fail_fast` | whether every selected pair has a verdict, and why not. |
+| `pairs[].status` | `identical`, `differ`, `error` or `not_run` (`not_run_reason`: `--fail-fast` or `interrupted`). |
+| `pairs[].result` | the pair's `parity diff --json` object (see [JSON](#json---json)); `null` for an error or a pair not run. |
+| `pairs[].qualifiers` | every qualifying line as `{"severity": "bad" \| "warn" \| "info", "text": …}`: `bad` is why the pair is not identical, `warn` qualifies an identical one. |
+| `pairs[].from_earlier_run` | carried over by `--resume`; `finished_at` is when that earlier verdict was reached. |
+| `pairs[].config_hash` | with `--resume`: the hash that must be unchanged for the verdict to be carried over. |
+
+### `--markdown FILE`
+
+A sign-off report: a header (verdict, totals, tool version, start and end
+time, the config file and its SHA-256, how many pairs were carried over from
+an earlier run), a table of every pair (verdict, rows, differences, seconds,
+qualifier tags), then a section per pair: its tables and key, filters,
+renamed columns, float scale, compared columns, the risk line, uncovered
+columns, the cost, every qualifier and caveat in full, and up to 20
+differences with both values (NULL bare, text quoted, as in the terminal).
+Data is escaped so that a value cannot add Markdown formatting.
+
+### `--junit FILE`
+
+One `<testcase>` per pair, named by the pair: `<failure>` when it is not
+identical (message: the headline; body: the first differences), `<error>`
+when it errored, `<skipped>` when it was not run. Every qualifier is a
+`<property>` of the test case (`bad`, `warn` or `info`) and a line of its
+`<system-out>`, with the tables, the float scale and the risk line, so a CI
+page never shows a bare pass for a filtered or caveated pair.

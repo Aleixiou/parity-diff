@@ -171,6 +171,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print nothing; rely on the exit code",
     )
+
+    r = sub.add_parser(
+        "run",
+        help="compare every table pair listed in a config file",
+        description="Compare every table pair a config file (TOML or JSON) lists, "
+        "one after another, and print one summary. The config is validated in "
+        "full before any connection is opened.",
+        epilog="exit codes: 0 every pair identical, 1 a pair is not identical "
+        "(or --fail-fast stopped after one), 2 a pair errored, the run was "
+        "interrupted, or the config is invalid.",
+    )
+    r.add_argument("config", metavar="CONFIG", help="the config file (.toml or .json)")
+    r.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME[,NAME...]",
+        help="run only these pairs (repeatable, or comma-separated)",
+    )
+    r.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop at the first pair that is not identical or errors",
+    )
+    r.add_argument(
+        "--resume",
+        metavar="STATE.json",
+        help="record each finished pair here as it completes; on a re-run, "
+        "skip pairs that finished identical with an unchanged config entry",
+    )
+    r.add_argument(
+        "--json", action="store_true", help="print the whole run as one JSON object"
+    )
+    r.add_argument("--markdown", metavar="FILE", help="write a sign-off report here")
+    r.add_argument(
+        "--junit", metavar="FILE", help="write JUnit XML here, one test per pair"
+    )
+    r.add_argument(
+        "--quiet", action="store_true", help="print nothing; rely on the exit code"
+    )
     return parser
 
 
@@ -833,6 +872,11 @@ def main(
         return EXIT_ERROR
 
     try:
+        if args.command == "run":
+            # Imported here so `parity diff` never loads it.
+            from parity.batch import run_command
+
+            return run_command(args, out, err)
         return _run_diff(args, out)
     except KeyboardInterrupt:  # pragma: no cover
         print("parity: interrupted", file=err)

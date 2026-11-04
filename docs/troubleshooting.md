@@ -15,6 +15,7 @@ from the code; `…` marks where your own names and values appear.
 - [Everything reads as different](#everything-reads-as-different)
 - [The run says it is not single-snapshot](#the-run-says-it-is-not-single-snapshot)
 - [Slow runs](#slow-runs)
+- [Config file errors (`parity run`)](#config-file-errors-parity-run)
 
 ## Table not found
 
@@ -253,3 +254,37 @@ base table instead of a view, or re-run and see whether the differences move.
 - **Interrupting** (Ctrl-C) cancels the running queries on PostgreSQL, MySQL
   and DuckDB; on Snowflake, BigQuery and SQL Server it waits for the query in
   flight.
+
+## Config file errors (`parity run`)
+
+`parity run` validates the whole file before it connects anywhere, and lists
+every problem at once, each naming the file, the pair (by name and position)
+and the field:
+
+```
+parity: migration.toml: 3 problems in the config:
+  - pair 'orders' (#1): unknown field 'kye' - did you mean 'key'?
+  - pair 'orders' (#1): missing field 'key' (the column or columns that identify a row)
+  - pair 'customers' (#2): field 'b': no connection named 'warehous' in [connections] - did you mean 'warehouse'?
+```
+
+| Message (start) | Cause and fix |
+|---|---|
+| `unknown field 'x'` | A misspelt or unsupported key. It is refused rather than ignored, because a misspelt `exclude` or `where` would silently compare something else. Top level: `connections`, `defaults`, `pair`. `[defaults]`: `float_scale`, `verify_sample`, `max_diffs`, `bisection_factor`, `threshold`. `[[pair]]`: `name`, `a`, `b`, `table` or `a_table` + `b_table`, `key`, `columns`, `exclude`, `map`, `where`, `a_where`, `b_where`, and any default. |
+| `missing field 'a'` / `'key'` / `'b_table' (or 'table' for both)` | Every pair needs both connections, both tables and a key. |
+| `field 'b': no connection named 'x' in [connections]` | `a` and `b` name entries of `[connections]`, not connection strings. |
+| `duplicate name: pair #1 is also called 'orders'` | Names select pairs for `--only` and `--resume`, so they must be unique. A pair without `name` takes its `a_table`, so two pairs reading the same A table need names. |
+| `field 'float_scale' must be a whole number` / `must be at least N` | Numbers unquoted; `max_diffs = 0` is no limit, `bisection_factor` at least 2, `threshold` at least 1. |
+| `field 'where': row filter '…' contains ';'` (and the other `--where` refusals) | The same check as `--where`, see [Comparing a slice](../README.md#comparing-a-slice---where). |
+| `field 'where' is replaced on both sides by a_where and b_where` | Remove `where`, or one of the per-side filters. |
+| `connection 'legacy': environment variable LEGACY_URL is not set` | Export the variable before running. Only the connections of the selected pairs (`--only`) are expanded. |
+| `'${…}' is not an environment variable name` | `${NAME}` takes letters, digits and `_`, not starting with a digit. |
+| `the config file must end in .toml or .json` / `not valid TOML: …` / `not valid JSON: …` | The parser's message carries the line and column. |
+| `reading TOML needs Python 3.11 or newer, or the 'tomli' package` | On Python 3.10: `pip install "parity-diff[toml]"`, or write the same structure as JSON. |
+| `--only names no pair called 'x' - did you mean 'y'?` | `--only` takes pair names, comma-separated or repeated. |
+| `…: not a parity --resume state file` / `cannot read the --resume state file` | The file passed to `--resume` is not one `parity run` wrote (or is from another format version). Delete it or pass another path. |
+
+A pair that fails while running (a table not found, a key not unique, a
+connection refused) is not a config error: it is recorded as that pair's
+error, with the usual `[side A: …]` message from this page, and the run goes
+on to the next pair. The run's exit code is then `2`.
