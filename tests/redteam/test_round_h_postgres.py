@@ -53,6 +53,7 @@ def _exec(url: str, *stmts: str) -> list:
 
 
 def _diff(url_a: str, ta: str, url_b: str, tb: str, key: str = "id", **kw):
+    """Diff two tables, closing both dialects whatever happens."""
     a = get_dialect(url_a, side="A")
     try:
         b = get_dialect(url_b, side="B")
@@ -91,6 +92,7 @@ def _role(name: str) -> str:
 
 
 def test_rt_hp1_column_grant_hides_a_differing_column(schema):
+    """A column hidden by column-level grants is never silently left out."""
     role = _role(f"rth_postgres_cg_{RUN}")
     _exec(
         ADMIN,
@@ -123,6 +125,7 @@ def test_rt_hp1_column_grant_hides_a_differing_column(schema):
 
 @pytest.mark.parametrize("kind", ["security_invoker", "owner_subject_to_rls"])
 def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
+    """A view over an RLS table draws the row-level security caveat."""
     reader = f"rth_postgres_vr_{RUN}"
     owner = f"rth_postgres_vo_{RUN}"
     url = _role(reader)
@@ -173,6 +176,7 @@ def test_rt_hp4_view_over_rls_table_is_not_silent(schema, kind):
 
 
 def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
+    """A DATE past the timestamp range is compared, not a crash."""
     for t in "ab":
         _exec(
             ADMIN,
@@ -194,6 +198,7 @@ def test_rt_hp3_date_past_timestamp_range_is_compared(schema):
     ],
 )
 def test_rt_hp5_pg11_floats_inside_unmapped_types(typ, v1, v2):
+    """On PostgreSQL 11 floats inside unmapped types are told apart."""
     s = f"rth_postgres_{RUN}_f11"
     _exec(
         PG11,
@@ -229,6 +234,7 @@ def test_pg18_floats_inside_unmapped_types_are_found(schema):
 
 
 def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
+    """A --where calling set_config() is refused or cannot move the verdict."""
     for t in "ab":
         _exec(ADMIN, f"create table {schema}.{t} (id int primary key, f float8)")
     _exec(
@@ -257,6 +263,7 @@ def test_rt_hp6_where_with_set_config_cannot_undo_a_pin(schema):
     ],
 )
 def test_rt_hp6_session_changing_filters_are_refused(schema, w):
+    """Filters calling session-changing functions are refused, however spelled."""
     _exec(ADMIN, f"create table {schema}.a (id int primary key)")
     with pytest.raises(ValueError, match="row filter"):
         _diff(ADMIN, f"{schema}.a", ADMIN, f"{schema}.a", where_a=w, where_b=w)
@@ -284,6 +291,7 @@ def test_rt_hp6_set_config_out_of_sight_is_never_identical(schema):
 
 
 def test_rt_hp1_excluded_unreadable_column_is_a_note(schema):
+    """An unreadable column set aside with --exclude is a note, not a difference."""
     role = _role(f"rth_postgres_cx_{RUN}")
     _exec(
         ADMIN,
@@ -315,6 +323,7 @@ def test_rt_hp1_excluded_unreadable_column_is_a_note(schema):
 
 
 def test_inheritance_children_draw_a_caveat(schema):
+    """A parent table's inheritance children are named in a caveat."""
     _exec(
         ADMIN,
         f"create table {schema}.p (id int primary key, x text)",
@@ -371,6 +380,7 @@ def test_where_and_map_postgres_quoting(schema):
 
 
 def test_rt_hp7_unreachable_server_fails_within_a_minute():
+    """An unreachable server fails within a minute, naming the side."""
     import subprocess
     import sys
 
@@ -398,6 +408,7 @@ def test_rt_hp7_unreachable_server_fails_within_a_minute():
 
 
 def test_rt_hp8_composite_key_with_a_null_field_is_a_key(schema):
+    """row(1, NULL) is a valid composite key."""
     _exec(
         ADMIN,
         f"create type {schema}.c as (a int, b text)",
@@ -452,6 +463,7 @@ def test_rt_hp9_untrusted_type_is_compared_by_its_send_bytes(schema, monkeypatch
 
 
 def test_rt_hp9_unmapped_type_whose_text_is_lossy(schema):
+    """Two seg values that print alike are found or refused, never equal."""
     _exec(
         ADMIN,
         "create extension if not exists seg",
@@ -715,6 +727,7 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
     original, fired = b.segment_checksums, []
 
     def wrapped(*args, **kw):
+        """Run the real checksum query, then write to the table once."""
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
@@ -738,6 +751,7 @@ def test_hot_standby_reads_one_snapshot_while_the_primary_writes(schema):
 
 
 def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
+    """600 columns, odd identifiers and a 10 MB value find their planted changes."""
     s = schema
     cols = ", ".join(f"c{i} int" for i in range(600))
     names = ", ".join(f"c{i}" for i in range(600))
@@ -793,6 +807,7 @@ def test_wide_table_odd_identifiers_and_a_toasted_value(schema):
 
 
 def test_partitions_generated_columns_and_missing_grants(schema):
+    """Partitions, generated columns and a missing grant behave."""
     s = schema
     _exec(
         ADMIN,
@@ -836,6 +851,7 @@ def test_partitions_generated_columns_and_missing_grants(schema):
     ],
 )
 def test_cli_connection_errors_never_print_the_password(url, schema):
+    """Connection errors from the CLI never print the password."""
     import subprocess
     import sys
 
@@ -862,6 +878,7 @@ def test_cli_connection_errors_never_print_the_password(url, schema):
 
 
 def test_live_writer_mid_walk_is_invisible_then_seen(schema):
+    """A writer mid-walk is invisible to the snapshot, then seen by a new run."""
     s = schema
     _exec(
         ADMIN,
@@ -882,6 +899,7 @@ def test_live_writer_mid_walk_is_invisible_then_seen(schema):
     original, fired = b.segment_checksums, []
 
     def wrapped(*args, **kw):
+        """Run the real checksum query, then write to the table once."""
         out = original(*args, **kw)
         if not fired:
             fired.append(True)
@@ -960,6 +978,7 @@ def test_non_utf8_server_encodings_against_duckdb(encoding, tmp_path):
 
 
 def test_pg95_is_refused_naming_the_version():
+    """PostgreSQL 9.5 is refused, naming the version."""
     pg_connect(PG95).close()
     with pytest.raises(ValueError, match=r"side A.*9\.5.*not supported"):
         get_dialect(PG95, side="A")
@@ -1038,6 +1057,7 @@ def test_distinct_values_of_exotic_types_are_found(schema, typ, v1, v2):
 
 
 def test_rt_hp2_money_in_a_zero_decimal_locale(pg_url, tmp_path):
+    """Yen money is read at the login's own frac_digits."""
     import duckdb
 
     table = f"rth_postgres_money_{RUN}"
