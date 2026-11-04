@@ -467,34 +467,47 @@ class BigQueryDialect(Dialect):
             # From 2^53 every double is an integer, rebuilt exactly from two
             # INT64s; past 2^116 the high half overflows and ERROR() refuses.
             # Inf/NaN cannot reach BIGNUMERIC, so they become the fixed tokens.
+            #
+            # The whole is one WITH expression, so each piece is written - and
+            # computed - once. Spelt out inline it was ~2,200 characters a
+            # column (r15 and r16 twice each, the exponent five times), and
+            # ~460 FLOAT64 columns passed BigQuery's 1,024K-character query
+            # limit (RT-HB9). WITH binds eagerly, so the BIGNUMERIC is NULL
+            # outside the band that needs it: CAST raises on Inf, NaN and
+            # magnitudes past BIGNUMERIC, and ROUND past 38 places, which the
+            # CASE used to keep out of reach. The text is unchanged - verified
+            # on the 1,565-value sample at scales 0, 6 and 20.
             self.float_scale_for(column)  # BIGNUMERIC's 38 places bound it
-            xb = f"abs(cast({c} as bignumeric))"
-            e = (
-                f"(case when {xb} >= 1 then length(cast(trunc({xb}) as string)) - 1 "
-                f"else -1 - length(regexp_extract(cast({xb} as string), r'^0[.](0*)')) end)"
-            )
-            r15, r16, r17 = (
-                f"round(cast({c} as bignumeric), {n - 1} - {e}, 'ROUND_HALF_EVEN')"
-                for n in (15, 16, 17)
-            )
-            shortest = (
-                f"case when cast({r15} as float64) = {c} then {r15} "
-                f"when cast({r16} as float64) = {c} then {r16} else {r17} end"
-            )
             two53 = f"{FLOAT_EXACT_INT_FROM}"
-            hi = f"trunc({c} / {two53})"
+            tiny = float_tiny_sql(s)
+            # WITH variables shadow columns; only the first binding reads one.
+            x, b, a, e, h = "_fx", "_fb", "_fa", "_fe", "_fh"
+            r15, r16, r17 = "_f15", "_f16", "_f17"
+            rounds = ", ".join(
+                f"{r} as round({b}, {n - 1} - {e}, 'ROUND_HALF_EVEN')"
+                for r, n in ((r15, 15), (r16, 16), (r17, 17))
+            )
             expr = (
-                f"case when is_inf({c}) then (case when {c} > 0 then 'Infinity' "
+                f"with({x} as {c}, "
+                f"{b} as if(abs({x}) >= {tiny} and abs({x}) < {two53}, "
+                f"cast({x} as bignumeric), null), "
+                f"{a} as abs({b}), "
+                f"{e} as case when {a} >= 1 then length(cast(trunc({a}) as string)) - 1 "
+                f"else -1 - length(regexp_extract(cast({a} as string), r'^0[.](0*)')) end, "
+                f"{rounds}, "
+                f"{h} as trunc({x} / {two53}), "
+                f"case when is_inf({x}) then (case when {x} > 0 then 'Infinity' "
                 f"else '-Infinity' end) "
-                f"when is_nan({c}) then 'NaN' "
-                f"when abs({c}) < {float_tiny_sql(s)} then '{float_zero_text(s)}' "
-                f"when abs({c}) < {two53} "
-                f"then format({fmt}, round({shortest}, {s})) "
-                f"when abs({c}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as float64) "
-                f"then format({fmt}, cast(cast({hi} as int64) as bignumeric) * {two53} "
-                f"+ cast({c} - {hi} * {two53} as int64)) "
-                f"when {c} is not null then error(concat('{FLOAT_OUT_OF_RANGE_MESSAGE}', "
-                f"cast({c} as string))) end"
+                f"when is_nan({x}) then 'NaN' "
+                f"when abs({x}) < {tiny} then '{float_zero_text(s)}' "
+                f"when abs({x}) < {two53} then format({fmt}, round(case "
+                f"when cast({r15} as float64) = {x} then {r15} "
+                f"when cast({r16} as float64) = {x} then {r16} else {r17} end, {s})) "
+                f"when abs({x}) < cast('{FLOAT_MAX_MAGNITUDE_SQL}' as float64) "
+                f"then format({fmt}, cast(cast({h} as int64) as bignumeric) * {two53} "
+                f"+ cast({x} - {h} * {two53} as int64)) "
+                f"when {x} is not null then error(concat('{FLOAT_OUT_OF_RANGE_MESSAGE}', "
+                f"cast({x} as string))) end)"
             )
         elif t is LogicalType.BOOLEAN:
             # `when not`, never `else`: an `else` sends NULL to 'false'.

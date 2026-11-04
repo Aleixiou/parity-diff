@@ -209,16 +209,26 @@ def test_float_branch_structure():
     from 2^53, and the loud refusal past 2^116. The values themselves are
     checked live against the Python spec in test_float_canonical.py."""
     sql = _d().normalize(_col("c", LogicalType.FLOAT))
+    # One WITH expression (RT-HB9): the column is read once, and the
+    # BIGNUMERIC is bound only inside the band that needs it, because WITH
+    # binds eagerly and the cast raises on Inf, NaN and huge magnitudes.
     assert sql.startswith(
-        "coalesce(case when is_inf(`c`) then (case when `c` > 0 then 'Infinity' "
-        "else '-Infinity' end) when is_nan(`c`) then 'NaN' "
-        "when abs(`c`) < 1e-7 then '0.000000' when abs(`c`) < 9007199254740992 "
+        "coalesce(with(_fx as `c`, _fb as if(abs(_fx) >= 1e-7 and "
+        "abs(_fx) < 9007199254740992, cast(_fx as bignumeric), null), "
     )
-    for n in (14, 15, 16):  # n - 1 for 15, 16, 17 significant digits
-        assert f"round(cast(`c` as bignumeric), {n} - (case" in sql
-    assert sql.count("'ROUND_HALF_EVEN'") == 5  # r15 twice, r16 twice, r17
-    assert "cast(trunc(`c` / 9007199254740992) as int64)" in sql
+    assert sql.count("`c`") == 1
+    assert (
+        "case when is_inf(_fx) then (case when _fx > 0 then 'Infinity' "
+        "else '-Infinity' end) when is_nan(_fx) then 'NaN' "
+        "when abs(_fx) < 1e-7 then '0.000000' when abs(_fx) < 9007199254740992 "
+    ) in sql
+    for r, n in (("_f15", 14), ("_f16", 15), ("_f17", 16)):  # n - 1 significant digits
+        assert f"{r} as round(_fb, {n} - _fe, 'ROUND_HALF_EVEN')" in sql
+    assert sql.count("'ROUND_HALF_EVEN'") == 3  # each candidate written once
+    assert "cast(cast(_fh as int64) as bignumeric)" in sql
+    assert "_fh as trunc(_fx / 9007199254740992)" in sql
     assert "error(concat('parity: FLOAT value out of the comparable range" in sql
+    assert len(sql) < 1300  # ~800 FLOAT64 columns inside the 1,024K limit
 
 
 def test_float_scale_reaches_every_float_and_decimal_rounding():
@@ -226,8 +236,9 @@ def test_float_scale_reaches_every_float_and_decimal_rounding():
     the final rounding and the format, or the scale would be applied twice."""
     d = BigQueryDialect(side="A", float_scale=2)
     sql = d.normalize(_col("c", LogicalType.FLOAT))
-    assert "abs(`c`) < 1e-3 then '0.00'" in sql
-    assert "'ROUND_HALF_EVEN') end, 2))" in sql
+    assert "abs(_fx) < 1e-3 then '0.00'" in sql
+    assert "abs(_fx) >= 1e-3" in sql
+    assert "else _f17 end, 2))" in sql
     assert "'%.2f'" in sql and "'%.6f'" not in sql
     assert "round(`c`, 2)" in d.normalize(_col("c", LogicalType.DECIMAL))
 

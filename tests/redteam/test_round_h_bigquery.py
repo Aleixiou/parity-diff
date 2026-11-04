@@ -746,12 +746,6 @@ def test_cli_end_to_end_json_exit_code_and_no_credentials(bigquery_url, bq, tmp_
         assert secret not in blob
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RT-HB9: each FLOAT64 column's rendering is ~2,200 characters, so a "
-    "table of 500 FLOAT64 columns exceeds BigQuery's 1,024K-character query "
-    "limit and cannot be compared at all",
-)
 def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path):
     run, name, ds, _ = bq
     n = 500
@@ -771,10 +765,11 @@ def test_a_table_of_500_float_columns_can_be_compared(bigquery_url, bq, tmp_path
 
 
 def test_the_rendering_length_that_breaks_the_query_limit():
-    """The arithmetic behind RT-HB9, offline: the FLOAT64 expression alone is
-    over 2,000 characters, so ~460 columns reach 1,024K."""
+    """The arithmetic behind RT-HB9, offline: the FLOAT64 expression was over
+    2,000 characters, so ~460 columns reached 1,024K. As one WITH expression
+    it is under 1,300, so ~800 fit."""
     d = BigQueryDialect()
-    assert len(d.normalize(_column("f499", "FLOAT64"))) > 2000
+    assert len(d.normalize(_column("f499", "FLOAT64"))) < 1300
 
 
 @pytest.mark.parametrize(
